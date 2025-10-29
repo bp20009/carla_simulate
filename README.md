@@ -62,3 +62,13 @@ By default, results are saved inside the specified `--output-dir` (or `outputs` 
 - `trajectories.png`: Optional plot generated when `--plot-trajectories` is provided.
 
 Each run creates or reuses the output directory; existing files with the same names are overwritten unless the script provides rotation options. Review the generated CSV/JSON files to process trajectory data programmatically, and use the plot to quickly inspect vehicle paths.
+
+## Sending CSV data over UDP
+To stream arbitrary CSV rows to another process over UDP, use `send_data/send_udp_from_csv.py`:
+
+```bash
+python send_data/send_udp_from_csv.py data.csv --host 192.168.0.20 --port 5005 --message-column payload
+```
+
+The script treats each CSV row as a message. By default it serialises the entire row as JSON before transmitting it, but you can
+pick a specific column with `--message-column`. Use `--interval` for a fixed delay between packets or `--delay-column` to use a per-row delay value stored in the CSV.
