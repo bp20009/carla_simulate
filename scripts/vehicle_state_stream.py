@@ -1,4 +1,4 @@
-"""Stream CARLA vehicle states with stable identifiers."""
+"""Stream CARLA vehicle and pedestrian states with stable identifiers."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
 def stream_vehicle_states(
     host: str, port: int, timeout: float, interval: float, output: TextIO
 ) -> None:
-    """Continuously write vehicle transforms with stable IDs to CSV."""
+    """Continuously write vehicle and pedestrian transforms with stable IDs to CSV."""
     client = carla.Client(host, port)
     client.set_timeout(timeout)
     world = client.get_world()
@@ -64,21 +64,26 @@ def stream_vehicle_states(
     try:
         while True:
             world_snapshot = world.wait_for_tick()
-            vehicles = world.get_actors().filter("vehicle.*")
+            actors = world.get_actors()
+            tracked_actors = (
+                actor
+                for actor in actors
+                if actor.type_id.startswith(("vehicle.", "walker."))
+            )
 
             wrote_frame = False
-            for vehicle in vehicles:
-                actor_id = vehicle.id
+            for actor in tracked_actors:
+                actor_id = actor.id
                 if actor_id not in actor_to_custom_id:
                     actor_to_custom_id[actor_id] = next(id_sequence)
 
-                transform = vehicle.get_transform()
+                transform = actor.get_transform()
                 writer.writerow(
                     [
                         world_snapshot.frame,
                         actor_to_custom_id[actor_id],
                         actor_id,
-                        vehicle.type_id,
+                        actor.type_id,
                         transform.location.x,
                         transform.location.y,
                         transform.location.z,
