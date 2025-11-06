@@ -5,11 +5,17 @@
 
 `scripts/vehicle_state_stream.py` exposes a lightweight CLI for watching the world state in an existing CARLA simulation. It assigns a stable identifier to every `vehicle.*` actor discovered in the world and writes a CSV row per vehicle for each frame received from the simulator.
 
+`scripts/plot_vehicle_trajectories.py` reads one of those CSV logs and renders a static XY plot of the actors' motion. You can filter by actor category, annotate actor IDs, and optionally save the figure to disk instead of opening an interactive window.
+
+`scripts/animate_vehicle_trajectories.py` builds on the same CSV data to generate a Matplotlib animation. The command-line tool lets you configure the playback FPS, the amount of history to retain in the position trail, and the output resolution before exporting to formats supported by your Matplotlib installation (e.g. MP4, GIF).
+
 ## Prerequisites
 - A running CARLA 0.10 server accessible from the machine executing the script.
 - Python dependencies:
-  - `carla`
-  - `matplotlib` (optional, enables trajectory plotting)
+- `carla`
+- `matplotlib` (required for the plotting and animation tools)
+- `pillow` (optional, enables GIF export in the animation script)
+- A working `ffmpeg` binary on your `PATH` for MP4 export from Matplotlib (optional but recommended)
 
 ## Usage
 Run the autopilot simulation script with the desired connection and scenario parameters:
@@ -54,6 +60,35 @@ Key options:
 - `--output`: Destination for the CSV log (`-` for `stdout`, default).
 
 Each CSV row includes the frame index reported by CARLA, the stable ID assigned by the script, the original CARLA actor ID, the vehicle blueprint, as well as its world-space location and rotation. Because the header is emitted once at startup and the writer flushes after every frame, the command can be safely redirected to a file or piped into another process.
+
+## Visualising trajectories from CSV logs
+
+### Static plots
+Use the plotting utility to quickly inspect recorded trajectories:
+
+```bash
+python scripts/plot_vehicle_trajectories.py vehicle_states.csv --only vehicle --save trajectories.png
+```
+
+Useful flags:
+- `--only vehicle` or `--only walker`: Filter by actor categories found in the CSV.
+- `--hide-ids`: Suppress text labels for actor IDs on the plot.
+- `--no-endpoints`: Do not mark the start and end points of each trajectory.
+- `--save`: Store the figure on disk instead of showing it interactively.
+
+### Animated videos
+Generate an animation that shows vehicles moving over time:
+
+```bash
+python scripts/animate_vehicle_trajectories.py vehicle_states.csv trajectories.mp4 --fps 15 --history 60
+```
+
+Useful flags:
+- `--fps`: Playback speed in frames per second.
+- `--history`: Number of past samples to keep in the trail (default: full history).
+- `--dpi`: Resolution passed to Matplotlib when rendering each frame.
+- `--only`: Filter to a subset of actor categories (e.g. only vehicles).
+- Any output format supported by your Matplotlib writers can be used by changing the file extension (e.g. `.gif`).
 
 ## Outputs
 By default, results are saved inside the specified `--output-dir` (or `outputs` if omitted):
