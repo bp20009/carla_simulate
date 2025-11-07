@@ -18,18 +18,9 @@ LOGGER = logging.getLogger(__name__)
 Row = Dict[str, str]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Send UDP packets where each payload is derived from a row in the "
-            "provided CSV file."
-        )
-    )
-    parser.add_argument(
-        "csv_path",
-        type=Path,
-        help="Path to the CSV file containing data to send",
-    )
+def configure_common_sender_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Attach CLI options shared by UDP sender utilities."""
+
     parser.add_argument(
         "--host",
         default="127.0.0.1",
@@ -51,9 +42,36 @@ def parse_args() -> argparse.Namespace:
         "--delay-column",
         help=(
             "Optional CSV column specifying the delay in seconds after "
-            "sending that row"
+            "sending each message"
         ),
     )
+    parser.add_argument(
+        "--encoding",
+        default="utf-8",
+        help="Text encoding for reading the CSV file and sending payloads",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        help="Logging verbosity (default: INFO)",
+    )
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Send UDP packets where each payload is derived from a row in the "
+            "provided CSV file."
+        )
+    )
+    parser.add_argument(
+        "csv_path",
+        type=Path,
+        help="Path to the CSV file containing data to send",
+    )
+    configure_common_sender_arguments(parser)
     parser.add_argument(
         "--message-column",
         help=(
@@ -72,20 +90,9 @@ def parse_args() -> argparse.Namespace:
         help='Quote character used in the CSV file (default: \'"\')',
     )
     parser.add_argument(
-        "--encoding",
-        default="utf-8",
-        help="Text encoding for reading the CSV file and sending payloads",
-    )
-    parser.add_argument(
         "--max-rows",
         type=int,
         help="Optional limit on the number of rows to send",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
-        help="Logging verbosity (default: INFO)",
     )
     return parser.parse_args()
 
