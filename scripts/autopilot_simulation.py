@@ -77,9 +77,13 @@ def spawn_vehicle(
     spawn_points = world.get_map().get_spawn_points()
     if not spawn_points:
         raise RuntimeError("No spawn points available for vehicles.")
-    random.shuffle(spawn_points)
 
-    for transform in spawn_points:
+    vehicle = world.try_spawn_actor(vehicle_bp, spawn_points[0])
+    if vehicle is not None:
+        vehicle.set_autopilot(True)
+        return vehicle
+
+    for transform in spawn_points[1:]:
         vehicle = world.try_spawn_actor(vehicle_bp, transform)
         if vehicle is not None:
             vehicle.set_autopilot(True)
