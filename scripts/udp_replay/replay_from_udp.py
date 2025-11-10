@@ -287,7 +287,6 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
 class EntityManager:
     def __init__(self, world: carla.World, blueprint_library: carla.BlueprintLibrary) -> None:
         self._world = world
-        self._spectator = world.get_spectator()
         self._map = world.get_map()
         self._blueprint_library = blueprint_library
         self._entities: Dict[str, EntityRecord] = {}
@@ -402,8 +401,6 @@ class EntityManager:
         if not self._entities:
             return
 
-        spectator_transform: Optional[carla.Transform] = None
-
         for record in self._entities.values():
             actor = record.actor
             if not actor.is_alive or record.target is None:
@@ -427,17 +424,9 @@ class EntityManager:
                 )
                 actor.apply_control(control)
 
-                if spectator_transform is None and distance > 0.1:
-                    spectator_transform = self._spectator_transform(current_transform)
             elif record.object_type == "pedestrian":
                 control = self._compute_pedestrian_control(record, direction_vector, distance, dt)
                 actor.apply_control(control)
-
-        if spectator_transform is not None and self._spectator is not None:
-            try:
-                self._spectator.set_transform(spectator_transform)
-            except RuntimeError:
-                LOGGER.debug("Failed to move spectator")
 
     def _compute_vehicle_control(
         self,
@@ -514,18 +503,6 @@ class EntityManager:
         control.speed = float(desired_speed)
         return control
 
-    def _spectator_transform(self, transform: carla.Transform) -> carla.Transform:
-        location = transform.location
-        yaw = transform.rotation.yaw
-        yaw_rad = math.radians(yaw)
-        offset = carla.Location(x=-6.0 * math.cos(yaw_rad), y=-6.0 * math.sin(yaw_rad), z=3.0)
-        target_location = carla.Location(
-            x=location.x + offset.x,
-            y=location.y + offset.y,
-            z=max(location.z + offset.z, location.z + 1.5),
-        )
-        rotation = carla.Rotation(pitch=-15.0, yaw=yaw)
-        return carla.Transform(target_location, rotation)
 
 
 @contextmanager
