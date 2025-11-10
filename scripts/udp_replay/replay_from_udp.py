@@ -11,7 +11,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Mapping, Optional
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import carla
 
@@ -109,6 +109,53 @@ class EntityRecord:
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
+
+
+class PIDController:
+    """Simple PID controller for throttle and steering outputs."""
+
+    def __init__(
+        self,
+        kp: float,
+        ki: float,
+        kd: float,
+        *,
+        integral_limit: Optional[float] = None,
+        output_limits: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.integral_limit = integral_limit
+        self.output_limits = output_limits
+        self._integral = 0.0
+        self._previous_error: Optional[float] = None
+
+    def reset(self) -> None:
+        self._integral = 0.0
+        self._previous_error = None
+
+    def step(self, error: float, dt: float) -> float:
+        if dt <= 0.0:
+            dt = 1e-6
+
+        self._integral += error * dt
+        if self.integral_limit is not None:
+            limit = abs(self.integral_limit)
+            self._integral = max(-limit, min(self._integral, limit))
+
+        derivative = 0.0
+        if self._previous_error is not None:
+            derivative = (error - self._previous_error) / dt
+        self._previous_error = error
+
+        output = self.kp * error + self.ki * self._integral + self.kd * derivative
+
+        if self.output_limits is not None:
+            low, high = self.output_limits
+            output = max(low, min(output, high))
+
+        return output
 
 
 def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
