@@ -95,6 +95,10 @@ class IncomingState:
     yaw: float = 0.0
 
 
+class MissingTargetDataError(ValueError):
+    """Raised when a message does not contain mandatory target coordinates."""
+
+
 @dataclass
 class TrackedActor:
     actor: carla.Actor
@@ -141,30 +145,62 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
         raise ValueError("Missing object type in message")
     object_type = TYPE_ALIASES.get(str(object_type).lower(), str(object_type).lower())
 
-    def _extract_coordinate(*keys: str) -> float:
-        for key in keys:
-            value = message.get(key)
-            if value is not None:
-                return float(value)
-        location = message.get("location")
-        if isinstance(location, Mapping):
-            for key in keys:
-                value = location.get(key)
+    def _extract_coordinate(coordinate: str) -> float:
+        candidates = (
+            coordinate,
+            f"target_{coordinate}",
+        )
+        containers = (
+            message,
+            message.get("location"),
+            message.get("target_location"),
+            message.get("target_data"),
+        )
+
+        for container in containers:
+            if not isinstance(container, Mapping):
+                continue
+            for key in candidates:
+                value = container.get(key)
                 if value is not None:
-                    return float(value)
-        raise ValueError(f"Missing coordinate value for keys: {keys}")
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Invalid numeric value '{value}' for coordinate '{key}'"
+                        ) from None
+
+        raise MissingTargetDataError(
+            f"Missing coordinate value for '{coordinate}' in message {message}"
+        )
 
     x = _extract_coordinate("x")
     y = _extract_coordinate("y")
     z = _extract_coordinate("z")
 
     def _extract_rotation(key: str) -> float:
-        value = message.get(key)
-        if value is not None:
-            return float(value)
-        rotation = message.get("rotation")
-        if isinstance(rotation, Mapping) and key in rotation:
-            return float(rotation[key])
+        candidates = (
+            key,
+            f"target_{key}",
+        )
+        containers = (
+            message,
+            message.get("rotation"),
+            message.get("target_rotation"),
+        )
+
+        for container in containers:
+            if not isinstance(container, Mapping):
+                continue
+            for candidate in candidates:
+                value = container.get(candidate)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Invalid numeric value '{value}' for rotation '{candidate}'"
+                        ) from None
         return 0.0
 
     roll = _extract_rotation("roll")
@@ -224,7 +260,7 @@ class ActorManager:
                 LOGGER.debug("Unable to disable physics for actor '%s'", state.object_id)
         return actor
 
-    def apply_state(self, state: IncomingState, timestamp: float) -> None:
+    def apply_state(self, state: IncomingState, timestamp: float) -> bool:
         tracked = self._actors.get(state.object_id)
         transform = carla.Transform(
             carla.Location(x=state.x, y=state.y, z=state.z),
@@ -234,7 +270,7 @@ class ActorManager:
         if tracked is None or not tracked.actor.is_alive:
             actor = self._spawn_actor(state)
             if actor is None:
-                return
+                return False
             tracked = TrackedActor(actor=actor, last_update=timestamp)
             self._actors[state.object_id] = tracked
         else:
@@ -242,6 +278,7 @@ class ActorManager:
 
         actor.set_transform(transform)
         tracked.last_update = timestamp
+        return True
 
     def destroy_stale(self, now: float, timeout: float) -> None:
         if timeout <= 0:
@@ -303,9 +340,11 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
     start_time = time.monotonic()
     next_cleanup = start_time
+    last_step_time = start_time
 
     try:
         with synchronous_mode(world, args.fixed_delta):
+            has_received_first_data = False
             while True:
                 now = time.monotonic()
                 if args.max_runtime and now - start_time >= args.max_runtime:
@@ -324,14 +363,28 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         for raw_message in decode_messages(payload):
                             try:
                                 state = normalise_message(raw_message)
+                            except MissingTargetDataError as exc:
+                                LOGGER.warning("Incomplete target data: %s", exc)
+                                continue
                             except (TypeError, ValueError) as exc:
                                 LOGGER.debug("Ignoring invalid message: %s", exc)
                                 continue
-                            manager.apply_state(state, time.monotonic())
+
+                            applied = manager.apply_state(state, time.monotonic())
+                            if applied and not has_received_first_data:
+                                LOGGER.info("Received first complete tracking update")
+                                has_received_first_data = True
+
+                current_time = time.monotonic()
+                elapsed = current_time - last_step_time
+                if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
+                    time.sleep(args.fixed_delta - elapsed)
+                    current_time = time.monotonic()
 
                 world.tick()
+                last_step_time = time.monotonic()
 
-                now = time.monotonic()
+                now = last_step_time
                 if now >= next_cleanup:
                     manager.destroy_stale(now, args.stale_timeout)
                     next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
