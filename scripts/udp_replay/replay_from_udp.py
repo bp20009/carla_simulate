@@ -481,6 +481,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
     start_time = time.monotonic()
     next_cleanup = start_time
+    last_step_time = start_time
 
     try:
         with synchronous_mode(world, args.fixed_delta):
@@ -515,19 +516,19 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 LOGGER.info("Received first complete tracking update")
                                 has_received_first_data = True
 
-                world.tick()
-
                 current_time = time.monotonic()
-                dt = current_time - last_step_time
-                if dt <= 0:
-                    dt = args.fixed_delta
-                last_step_time = current_time
+                elapsed = current_time - last_step_time
+                if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
+                    time.sleep(args.fixed_delta - elapsed)
+                    current_time = time.monotonic()
 
-                manager.step_all(dt)
+                world.tick()
+                last_step_time = time.monotonic()
 
-                if current_time >= next_cleanup:
-                    manager.destroy_stale(current_time, args.stale_timeout)
-                    next_cleanup = current_time + max(args.stale_timeout * 0.5, 0.5)
+                now = last_step_time
+                if now >= next_cleanup:
+                    manager.destroy_stale(now, args.stale_timeout)
+                    next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
 
     except KeyboardInterrupt:
         LOGGER.info("Interrupted by user")
