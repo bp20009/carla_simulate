@@ -111,6 +111,26 @@ class EntityRecord:
     max_speed: float = 10.0
 
 
+def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
+    if isinstance(obj, Mapping):
+        actors = obj.get("actors")
+        if isinstance(actors, list):
+            shared_data = {k: v for k, v in obj.items() if k != "actors"}
+            for actor in actors:
+                if not isinstance(actor, Mapping):
+                    LOGGER.debug("Unsupported actor entry in frame payload: %r", actor)
+                    continue
+                merged: Dict[str, object] = {**shared_data, **actor}
+                yield merged
+        else:
+            yield obj
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_message_objects(item)
+    else:
+        LOGGER.debug("Unsupported JSON payload element: %r", obj)
+
+
 def decode_messages(payload: bytes) -> Iterator[Mapping[str, object]]:
     text = payload.decode("utf-8").strip()
     if not text:
@@ -124,21 +144,12 @@ def decode_messages(payload: bytes) -> Iterator[Mapping[str, object]]:
             if not stripped:
                 continue
             try:
-                yield json.loads(stripped)
+                yield from _iter_message_objects(json.loads(stripped))
             except json.JSONDecodeError:
                 LOGGER.debug("Discarding invalid JSON fragment: %s", stripped)
         return
 
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, Mapping):
-                yield item
-            else:
-                LOGGER.debug("Unsupported list element type: %r", item)
-    elif isinstance(data, Mapping):
-        yield data
-    else:
-        LOGGER.debug("Unsupported JSON payload: %r", data)
+    yield from _iter_message_objects(data)
 
 
 def normalise_message(message: Mapping[str, object]) -> IncomingState:
