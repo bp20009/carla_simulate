@@ -115,7 +115,6 @@ class EntityRecord:
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
-    is_stationary: bool = False
 
 
 class PIDController:
@@ -336,29 +335,11 @@ class EntityManager:
             except RuntimeError:
                 LOGGER.debug("Unable to configure physics for actor '%s'", state.object_id)
 
-            throttle_pid = PIDController(
-                0.6,
-                0.05,
-                0.1,
-                integral_limit=5.0,
-                output_limits=(0.0, 1.0),
-            )
-            steering_pid = PIDController(
-                1.8,
-                0.0,
-                0.15,
-                integral_limit=4.0,
-                output_limits=(-0.7, 0.7),
-            )
+            throttle_pid = PIDController(1.0, 0.0, 0.05, integral_limit=10.0, output_limits=(0.0, 1.0))
+            steering_pid = PIDController(2.0, 0.0, 0.2, integral_limit=5.0, output_limits=(-1.0, 1.0))
             record.throttle_pid = throttle_pid
             record.steering_pid = steering_pid
             record.max_speed = 20.0 if object_type == "vehicle" else 10.0
-            try:
-                actor.apply_control(
-                    carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
-                )
-            except RuntimeError:
-                LOGGER.debug("Unable to apply initial stop control for '%s'", state.object_id)
         elif object_type == "pedestrian":
             try:
                 actor.set_simulate_physics(True)
@@ -438,60 +419,18 @@ class EntityManager:
             current_location = current_transform.location
             target = record.target
             direction_vector = target - current_location
-            planar_distance = math.hypot(direction_vector.x, direction_vector.y)
-            vertical_distance = abs(direction_vector.z)
-
-            try:
-                velocity = actor.get_velocity()
-            except RuntimeError:
-                velocity = carla.Vector3D(0.0, 0.0, 0.0)
-
-            speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
-            if record.object_type in {"vehicle", "bicycle"}:
-                stationary_distance = 0.35
-                stationary_speed = 0.2
-                resume_distance = 0.6
-            else:
-                stationary_distance = 0.25
-                stationary_speed = 0.08
-                resume_distance = 0.4
-
-            if record.is_stationary:
-                if planar_distance >= resume_distance or speed > stationary_speed * 1.5:
-                    record.is_stationary = False
-                else:
-                    self._hold_position(record)
-                    continue
-
-            if planar_distance <= stationary_distance and speed <= stationary_speed:
-                if record.throttle_pid is not None:
-                    record.throttle_pid.reset()
-                if record.steering_pid is not None:
-                    record.steering_pid.reset()
-                self._hold_position(record)
-                record.is_stationary = True
-                continue
+            distance = math.sqrt(
+                direction_vector.x ** 2 + direction_vector.y ** 2 + direction_vector.z ** 2
+            )
 
             if record.object_type in {"vehicle", "bicycle"}:
                 control = self._compute_vehicle_control(
-                    record,
-                    current_transform,
-                    direction_vector,
-                    planar_distance,
-                    vertical_distance,
-                    dt,
-                    speed,
+                    record, current_transform, direction_vector, distance, dt
                 )
                 actor.apply_control(control)
 
             elif record.object_type == "pedestrian":
-                control = self._compute_pedestrian_control(
-                    record,
-                    direction_vector,
-                    planar_distance,
-                    vertical_distance,
-                    dt,
-                )
+                control = self._compute_pedestrian_control(record, direction_vector, distance, dt)
                 actor.apply_control(control)
 
     def _compute_vehicle_control(
@@ -499,15 +438,17 @@ class EntityManager:
         record: EntityRecord,
         transform: carla.Transform,
         direction_vector: carla.Vector3D,
-        planar_distance: float,
-        vertical_distance: float,
+        distance: float,
         dt: float,
-        speed: float,
     ) -> carla.VehicleControl:
+        velocity = record.actor.get_velocity()
+        speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+
+        planar_distance = math.sqrt(direction_vector.x ** 2 + direction_vector.y ** 2)
+        desired_speed = min(planar_distance / max(dt, 1e-3), record.max_speed)
+        throttle_error = desired_speed - speed
         throttle = 0.0
         if record.throttle_pid is not None:
-            desired_speed = min(record.max_speed, planar_distance * 0.8)
-            throttle_error = max(-record.max_speed, min(desired_speed - speed, record.max_speed))
             throttle = record.throttle_pid.step(throttle_error, dt)
 
         yaw_rad = math.radians(transform.rotation.yaw)
@@ -519,73 +460,53 @@ class EntityManager:
         else:
             target_yaw = None
 
-        steer = 0.0
-        if record.steering_pid is not None and target_yaw is not None:
+        yaw_error = 0.0
+        if target_yaw is not None:
             yaw_error = math.atan2(
                 math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad)
             )
+        steer = 0.0
+        if record.steering_pid is not None:
             steer = record.steering_pid.step(yaw_error, dt)
 
         brake = 0.0
-        if planar_distance < 0.7 and speed > 0.5:
-            brake = min(1.0, (0.7 - planar_distance) * 1.5 + speed / max(record.max_speed, 1.0))
-        elif planar_distance < 0.4 and vertical_distance < 0.3:
+        hand_brake = False
+        reverse = False
+        if distance < 0.5 and speed < 0.2:
             throttle = 0.0
-            brake = 0.4
+            brake = 0.5
 
         return carla.VehicleControl(
             throttle=float(max(0.0, min(throttle, 1.0))),
-            steer=float(max(-0.7, min(steer, 0.7))),
+            steer=float(max(-1.0, min(steer, 1.0))),
             brake=float(max(0.0, min(brake, 1.0))),
-            hand_brake=False,
-            reverse=False,
+            hand_brake=hand_brake,
+            reverse=reverse,
         )
 
     def _compute_pedestrian_control(
         self,
         record: EntityRecord,
         direction_vector: carla.Vector3D,
-        planar_distance: float,
-        vertical_distance: float,
+        distance: float,
         dt: float,
     ) -> carla.WalkerControl:
         control = carla.WalkerControl()
-        if planar_distance < 0.15 and vertical_distance < 0.3:
+        if distance < 0.2:
             control.speed = 0.0
             control.direction = carla.Vector3D(0.0, 0.0, 0.0)
             return control
 
-        norm = math.hypot(direction_vector.x, direction_vector.y)
-        if norm > 0.0:
+        norm = math.sqrt(direction_vector.x ** 2 + direction_vector.y ** 2 + direction_vector.z ** 2)
+        if norm > 0:
             control.direction = carla.Vector3D(
                 direction_vector.x / norm,
                 direction_vector.y / norm,
-                0.0,
+                direction_vector.z / norm,
             )
-        desired_speed = min(record.max_speed, planar_distance * 0.6)
+        desired_speed = min(distance / max(dt, 1e-3), record.max_speed)
         control.speed = float(desired_speed)
         return control
-
-    def _hold_position(self, record: EntityRecord) -> None:
-        if record.object_type in {"vehicle", "bicycle"}:
-            try:
-                record.actor.apply_control(
-                    carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
-                )
-            except RuntimeError:
-                LOGGER.debug(
-                    "Unable to apply stationary vehicle control for '%s'", record.actor.id
-                )
-        elif record.object_type == "pedestrian":
-            control = carla.WalkerControl()
-            control.speed = 0.0
-            control.direction = carla.Vector3D(0.0, 0.0, 0.0)
-            try:
-                record.actor.apply_control(control)
-            except RuntimeError:
-                LOGGER.debug(
-                    "Unable to apply stationary walker control for '%s'", record.actor.id
-                )
 
 
 
