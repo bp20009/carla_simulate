@@ -295,24 +295,26 @@ class EntityManager:
                 LOGGER.debug("Unable to enable physics for pedestrian '%s'", state.object_id)
             record.max_speed = 3.0
 
+        return record
+
     def apply_state(self, state: IncomingState, timestamp: float) -> bool:
-        tracked = self._actors.get(state.object_id)
+        record = self._entities.get(state.object_id)
         transform = carla.Transform(
             carla.Location(x=state.x, y=state.y, z=state.z),
             carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=state.yaw),
         )
 
-        if tracked is None or not tracked.actor.is_alive:
-            actor = self._spawn_actor(state)
-            if actor is None:
+        if record is None or not record.actor.is_alive:
+            record = self._spawn_actor(state)
+            if record is None:
                 return False
-            tracked = TrackedActor(actor=actor, last_update=timestamp)
-            self._actors[state.object_id] = tracked
-        else:
-            actor = tracked.actor
+            self._entities[state.object_id] = record
+
+        actor = record.actor
 
         actor.set_transform(transform)
-        tracked.last_update = timestamp
+        record.last_update = timestamp
+        record.target = transform.location
         return True
 
     def destroy_stale(self, now: float, timeout: float) -> None:
