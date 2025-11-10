@@ -106,9 +106,11 @@ class EntityRecord:
     object_type: str
     last_update: float
     target: Optional[carla.Location] = None
+    target_rotation: Optional[carla.Rotation] = None
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
+    is_stationary: bool = False
 
 
 class PIDController:
@@ -286,7 +288,6 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
 class EntityManager:
     def __init__(self, world: carla.World, blueprint_library: carla.BlueprintLibrary) -> None:
         self._world = world
-        self._spectator = world.get_spectator()
         self._map = world.get_map()
         self._blueprint_library = blueprint_library
         self._entities: Dict[str, EntityRecord] = {}
@@ -335,6 +336,12 @@ class EntityManager:
             record.throttle_pid = throttle_pid
             record.steering_pid = steering_pid
             record.max_speed = 20.0 if object_type == "vehicle" else 10.0
+            try:
+                actor.apply_control(
+                    carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
+                )
+            except RuntimeError:
+                LOGGER.debug("Unable to apply initial stop control for '%s'", state.object_id)
         elif object_type == "pedestrian":
             try:
                 actor.set_simulate_physics(True)
@@ -357,11 +364,20 @@ class EntityManager:
                 return False
             self._entities[state.object_id] = record
 
-        actor = record.actor
+            try:
+                record.actor.set_transform(transform)
+            except RuntimeError:
+                LOGGER.debug("Failed to place new actor '%s'", state.object_id)
 
-        actor.set_transform(transform)
         record.last_update = timestamp
-        record.target = transform.location
+        record.target = carla.Location(
+            transform.location.x, transform.location.y, transform.location.z
+        )
+        record.target_rotation = carla.Rotation(
+            roll=transform.rotation.roll,
+            pitch=transform.rotation.pitch,
+            yaw=transform.rotation.yaw,
+        )
         return True
 
     def destroy_stale(self, now: float, timeout: float) -> None:
@@ -392,8 +408,6 @@ class EntityManager:
         if not self._entities:
             return
 
-        spectator_transform: Optional[carla.Transform] = None
-
         for record in self._entities.values():
             actor = record.actor
             if not actor.is_alive or record.target is None:
@@ -411,21 +425,49 @@ class EntityManager:
                 direction_vector.x ** 2 + direction_vector.y ** 2 + direction_vector.z ** 2
             )
 
+            try:
+                velocity = actor.get_velocity()
+            except RuntimeError:
+                velocity = carla.Vector3D(0.0, 0.0, 0.0)
+
+            speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
             if record.object_type in {"vehicle", "bicycle"}:
-                control = self._compute_vehicle_control(record, current_transform, direction_vector, distance, dt)
+                stationary_distance = 0.3
+                stationary_speed = 0.15
+            else:
+                stationary_distance = 0.2
+                stationary_speed = 0.05
+
+            is_stationary = distance <= stationary_distance and speed <= stationary_speed
+
+            if is_stationary:
+                if record.throttle_pid is not None:
+                    record.throttle_pid.reset()
+                if record.steering_pid is not None:
+                    record.steering_pid.reset()
+
+                if not record.is_stationary:
+                    self._hold_position(record)
+                    record.is_stationary = True
+                continue
+
+            if record.is_stationary:
+                record.is_stationary = False
+
+            if record.object_type in {"vehicle", "bicycle"}:
+                control = self._compute_vehicle_control(
+                    record,
+                    current_transform,
+                    direction_vector,
+                    distance,
+                    dt,
+                    speed,
+                )
                 actor.apply_control(control)
 
-                if spectator_transform is None and distance > 0.1:
-                    spectator_transform = self._spectator_transform(current_transform)
             elif record.object_type == "pedestrian":
                 control = self._compute_pedestrian_control(record, direction_vector, distance, dt)
                 actor.apply_control(control)
-
-        if spectator_transform is not None and self._spectator is not None:
-            try:
-                self._spectator.set_transform(spectator_transform)
-            except RuntimeError:
-                LOGGER.debug("Failed to move spectator")
 
     def _compute_vehicle_control(
         self,
@@ -434,19 +476,29 @@ class EntityManager:
         direction_vector: carla.Vector3D,
         distance: float,
         dt: float,
+        speed: float,
     ) -> carla.VehicleControl:
-        velocity = record.actor.get_velocity()
-        speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
-
-        desired_speed = min(distance / max(dt, 1e-3), record.max_speed)
+        planar_distance = math.sqrt(direction_vector.x ** 2 + direction_vector.y ** 2)
+        desired_speed = min(planar_distance / max(dt, 1e-3), record.max_speed)
         throttle_error = desired_speed - speed
         throttle = 0.0
         if record.throttle_pid is not None:
             throttle = record.throttle_pid.step(throttle_error, dt)
 
         yaw_rad = math.radians(transform.rotation.yaw)
-        target_yaw = math.atan2(direction_vector.y, direction_vector.x)
-        yaw_error = math.atan2(math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad))
+        target_yaw: Optional[float]
+        if planar_distance > 1e-3:
+            target_yaw = math.atan2(direction_vector.y, direction_vector.x)
+        elif record.target_rotation is not None:
+            target_yaw = math.radians(record.target_rotation.yaw)
+        else:
+            target_yaw = None
+
+        yaw_error = 0.0
+        if target_yaw is not None:
+            yaw_error = math.atan2(
+                math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad)
+            )
         steer = 0.0
         if record.steering_pid is not None:
             steer = record.steering_pid.step(yaw_error, dt)
@@ -490,18 +542,27 @@ class EntityManager:
         control.speed = float(desired_speed)
         return control
 
-    def _spectator_transform(self, transform: carla.Transform) -> carla.Transform:
-        location = transform.location
-        yaw = transform.rotation.yaw
-        yaw_rad = math.radians(yaw)
-        offset = carla.Location(x=-6.0 * math.cos(yaw_rad), y=-6.0 * math.sin(yaw_rad), z=3.0)
-        target_location = carla.Location(
-            x=location.x + offset.x,
-            y=location.y + offset.y,
-            z=max(location.z + offset.z, location.z + 1.5),
-        )
-        rotation = carla.Rotation(pitch=-15.0, yaw=yaw)
-        return carla.Transform(target_location, rotation)
+    def _hold_position(self, record: EntityRecord) -> None:
+        if record.object_type in {"vehicle", "bicycle"}:
+            try:
+                record.actor.apply_control(
+                    carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
+                )
+            except RuntimeError:
+                LOGGER.debug(
+                    "Unable to apply stationary vehicle control for '%s'", record.actor.id
+                )
+        elif record.object_type == "pedestrian":
+            control = carla.WalkerControl()
+            control.speed = 0.0
+            control.direction = carla.Vector3D(0.0, 0.0, 0.0)
+            try:
+                record.actor.apply_control(control)
+            except RuntimeError:
+                LOGGER.debug(
+                    "Unable to apply stationary walker control for '%s'", record.actor.id
+                )
+
 
 
 @contextmanager
@@ -581,6 +642,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                 if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
                     time.sleep(args.fixed_delta - elapsed)
                     current_time = time.monotonic()
+
+                dt = args.fixed_delta if args.fixed_delta > 0.0 else current_time - last_step_time
+                if dt <= 0.0:
+                    dt = max(args.fixed_delta, 1e-3) if args.fixed_delta > 0.0 else 1e-3
+
+                manager.step_all(dt)
 
                 world.tick()
                 last_step_time = time.monotonic()
