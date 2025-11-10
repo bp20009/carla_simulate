@@ -106,6 +106,7 @@ class EntityRecord:
     object_type: str
     last_update: float
     target: Optional[carla.Location] = None
+    target_rotation: Optional[carla.Rotation] = None
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
@@ -357,11 +358,20 @@ class EntityManager:
                 return False
             self._entities[state.object_id] = record
 
-        actor = record.actor
+            try:
+                record.actor.set_transform(transform)
+            except RuntimeError:
+                LOGGER.debug("Failed to place new actor '%s'", state.object_id)
 
-        actor.set_transform(transform)
         record.last_update = timestamp
-        record.target = transform.location
+        record.target = carla.Location(
+            transform.location.x, transform.location.y, transform.location.z
+        )
+        record.target_rotation = carla.Rotation(
+            roll=transform.rotation.roll,
+            pitch=transform.rotation.pitch,
+            yaw=transform.rotation.yaw,
+        )
         return True
 
     def destroy_stale(self, now: float, timeout: float) -> None:
@@ -412,7 +422,9 @@ class EntityManager:
             )
 
             if record.object_type in {"vehicle", "bicycle"}:
-                control = self._compute_vehicle_control(record, current_transform, direction_vector, distance, dt)
+                control = self._compute_vehicle_control(
+                    record, current_transform, direction_vector, distance, dt
+                )
                 actor.apply_control(control)
 
                 if spectator_transform is None and distance > 0.1:
@@ -438,15 +450,27 @@ class EntityManager:
         velocity = record.actor.get_velocity()
         speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
 
-        desired_speed = min(distance / max(dt, 1e-3), record.max_speed)
+        planar_distance = math.sqrt(direction_vector.x ** 2 + direction_vector.y ** 2)
+        desired_speed = min(planar_distance / max(dt, 1e-3), record.max_speed)
         throttle_error = desired_speed - speed
         throttle = 0.0
         if record.throttle_pid is not None:
             throttle = record.throttle_pid.step(throttle_error, dt)
 
         yaw_rad = math.radians(transform.rotation.yaw)
-        target_yaw = math.atan2(direction_vector.y, direction_vector.x)
-        yaw_error = math.atan2(math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad))
+        target_yaw: Optional[float]
+        if planar_distance > 1e-3:
+            target_yaw = math.atan2(direction_vector.y, direction_vector.x)
+        elif record.target_rotation is not None:
+            target_yaw = math.radians(record.target_rotation.yaw)
+        else:
+            target_yaw = None
+
+        yaw_error = 0.0
+        if target_yaw is not None:
+            yaw_error = math.atan2(
+                math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad)
+            )
         steer = 0.0
         if record.steering_pid is not None:
             steer = record.steering_pid.step(yaw_error, dt)
@@ -581,6 +605,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                 if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
                     time.sleep(args.fixed_delta - elapsed)
                     current_time = time.monotonic()
+
+                dt = args.fixed_delta if args.fixed_delta > 0.0 else current_time - last_step_time
+                if dt <= 0.0:
+                    dt = max(args.fixed_delta, 1e-3) if args.fixed_delta > 0.0 else 1e-3
+
+                manager.step_all(dt)
 
                 world.tick()
                 last_step_time = time.monotonic()
