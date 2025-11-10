@@ -11,11 +11,21 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
-from send_data.send_udp_from_csv import (
-    Row,
-    configure_common_sender_arguments,
-    iter_rows,
-)
+try:
+    from send_data.send_udp_from_csv import (
+        Row,
+        configure_common_sender_arguments,
+        iter_rows,
+    )
+except ModuleNotFoundError:  # pragma: no cover - fallback for direct execution
+    if __package__ in (None, ""):
+        from send_udp_from_csv import (  # type: ignore[import-not-found]
+            Row,
+            configure_common_sender_arguments,
+            iter_rows,
+        )
+    else:  # pragma: no cover - re-raise unexpected import errors
+        raise
 
 LOGGER = logging.getLogger(__name__)
 
