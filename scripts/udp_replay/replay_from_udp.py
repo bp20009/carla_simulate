@@ -364,8 +364,14 @@ class EntityManager:
                 LOGGER.debug("Failed to place new actor '%s'", state.object_id)
 
         record.last_update = timestamp
-        record.target = transform.location
-        record.target_rotation = transform.rotation
+        record.target = carla.Location(
+            transform.location.x, transform.location.y, transform.location.z
+        )
+        record.target_rotation = carla.Rotation(
+            roll=transform.rotation.roll,
+            pitch=transform.rotation.pitch,
+            yaw=transform.rotation.yaw,
+        )
         return True
 
     def destroy_stale(self, now: float, timeout: float) -> None:
@@ -599,6 +605,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                 if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
                     time.sleep(args.fixed_delta - elapsed)
                     current_time = time.monotonic()
+
+                dt = args.fixed_delta if args.fixed_delta > 0.0 else current_time - last_step_time
+                if dt <= 0.0:
+                    dt = max(args.fixed_delta, 1e-3) if args.fixed_delta > 0.0 else 1e-3
+
+                manager.step_all(dt)
 
                 world.tick()
                 last_step_time = time.monotonic()
