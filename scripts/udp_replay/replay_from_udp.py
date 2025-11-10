@@ -106,6 +106,7 @@ class EntityRecord:
     object_type: str
     last_update: float
     target: Optional[carla.Location] = None
+    previous_location: Optional[carla.Location] = None
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
@@ -346,10 +347,7 @@ class EntityManager:
 
     def apply_state(self, state: IncomingState, timestamp: float) -> bool:
         record = self._entities.get(state.object_id)
-        transform = carla.Transform(
-            carla.Location(x=state.x, y=state.y, z=state.z),
-            carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=state.yaw),
-        )
+        new_location = carla.Location(x=state.x, y=state.y, z=state.z)
 
         if record is None or not record.actor.is_alive:
             record = self._spawn_actor(state)
@@ -359,8 +357,24 @@ class EntityManager:
 
         actor = record.actor
 
+        actor_transform = actor.get_transform()
+        reference_location = record.target or record.previous_location or actor_transform.location
+        dx = new_location.x - reference_location.x
+        dy = new_location.y - reference_location.y
+        distance_sq = dx * dx + dy * dy
+        if distance_sq <= 1e-8:
+            heading = actor_transform.rotation.yaw
+        else:
+            heading = math.degrees(math.atan2(dy, dx))
+
+        transform = carla.Transform(
+            new_location,
+            carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=heading),
+        )
+
         actor.set_transform(transform)
         record.last_update = timestamp
+        record.previous_location = record.target
         record.target = transform.location
         return True
 
