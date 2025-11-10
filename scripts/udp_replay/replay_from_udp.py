@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import socket
 import sys
 import time
@@ -100,9 +101,14 @@ class MissingTargetDataError(ValueError):
 
 
 @dataclass
-class TrackedActor:
+class EntityRecord:
     actor: carla.Actor
+    object_type: str
     last_update: float
+    target: Optional[carla.Location] = None
+    throttle_pid: Optional[PIDController] = None
+    steering_pid: Optional[PIDController] = None
+    max_speed: float = 10.0
 
 
 def decode_messages(payload: bytes) -> Iterator[Mapping[str, object]]:
@@ -219,11 +225,13 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
     )
 
 
-class ActorManager:
+class EntityManager:
     def __init__(self, world: carla.World, blueprint_library: carla.BlueprintLibrary) -> None:
         self._world = world
+        self._spectator = world.get_spectator()
+        self._map = world.get_map()
         self._blueprint_library = blueprint_library
-        self._actors: Dict[str, TrackedActor] = {}
+        self._entities: Dict[str, EntityRecord] = {}
 
     def _select_blueprint(self, object_type: str) -> Optional[carla.ActorBlueprint]:
         filters = TYPE_FILTERS.get(object_type, [])
@@ -237,7 +245,7 @@ class ActorManager:
         LOGGER.warning("No blueprint found for type '%s'", object_type)
         return None
 
-    def _spawn_actor(self, state: IncomingState) -> Optional[carla.Actor]:
+    def _spawn_actor(self, state: IncomingState) -> Optional[EntityRecord]:
         blueprint = self._select_blueprint(state.object_type)
         if blueprint is None:
             return None
@@ -250,15 +258,31 @@ class ActorManager:
         actor = self._world.try_spawn_actor(blueprint, transform)
         if actor is None:
             LOGGER.debug("Failed to spawn actor for %s", state.object_id)
-        else:
-            LOGGER.info(
-                "Spawned %s '%s'", state.object_type, state.object_id
-            )
+            return None
+
+        LOGGER.info("Spawned %s '%s'", state.object_type, state.object_id)
+
+        object_type = state.object_type
+        record = EntityRecord(actor=actor, object_type=object_type, last_update=time.monotonic())
+
+        if object_type in {"vehicle", "bicycle"}:
             try:
-                actor.set_simulate_physics(False)
+                actor.set_autopilot(False)
+                actor.set_simulate_physics(True)
             except RuntimeError:
-                LOGGER.debug("Unable to disable physics for actor '%s'", state.object_id)
-        return actor
+                LOGGER.debug("Unable to configure physics for actor '%s'", state.object_id)
+
+            throttle_pid = PIDController(1.0, 0.0, 0.05, integral_limit=10.0, output_limits=(0.0, 1.0))
+            steering_pid = PIDController(2.0, 0.0, 0.2, integral_limit=5.0, output_limits=(-1.0, 1.0))
+            record.throttle_pid = throttle_pid
+            record.steering_pid = steering_pid
+            record.max_speed = 20.0 if object_type == "vehicle" else 10.0
+        elif object_type == "pedestrian":
+            try:
+                actor.set_simulate_physics(True)
+            except RuntimeError:
+                LOGGER.debug("Unable to enable physics for pedestrian '%s'", state.object_id)
+            record.max_speed = 3.0
 
     def apply_state(self, state: IncomingState, timestamp: float) -> bool:
         tracked = self._actors.get(state.object_id)
@@ -283,24 +307,141 @@ class ActorManager:
     def destroy_stale(self, now: float, timeout: float) -> None:
         if timeout <= 0:
             return
+
         stale_ids = [
             object_id
-            for object_id, tracked in self._actors.items()
-            if now - tracked.last_update > timeout
+            for object_id, record in self._entities.items()
+            if now - record.last_update > timeout
         ]
         for object_id in stale_ids:
-            actor = self._actors.pop(object_id).actor
+            record = self._entities.pop(object_id)
+            actor = record.actor
             if actor.is_alive:
                 LOGGER.info("Destroying stale actor '%s'", object_id)
                 actor.destroy()
 
     def destroy_all(self) -> None:
-        for object_id, tracked in list(self._actors.items()):
-            actor = tracked.actor
+        for object_id, record in list(self._entities.items()):
+            actor = record.actor
             if actor.is_alive:
                 LOGGER.info("Destroying actor '%s'", object_id)
                 actor.destroy()
-            self._actors.pop(object_id, None)
+            self._entities.pop(object_id, None)
+
+    def step_all(self, dt: float) -> None:
+        if not self._entities:
+            return
+
+        spectator_transform: Optional[carla.Transform] = None
+
+        for record in self._entities.values():
+            actor = record.actor
+            if not actor.is_alive or record.target is None:
+                continue
+
+            try:
+                current_transform = actor.get_transform()
+            except RuntimeError:
+                continue
+
+            current_location = current_transform.location
+            target = record.target
+            direction_vector = target - current_location
+            distance = math.sqrt(
+                direction_vector.x ** 2 + direction_vector.y ** 2 + direction_vector.z ** 2
+            )
+
+            if record.object_type in {"vehicle", "bicycle"}:
+                control = self._compute_vehicle_control(record, current_transform, direction_vector, distance, dt)
+                actor.apply_control(control)
+
+                if spectator_transform is None and distance > 0.1:
+                    spectator_transform = self._spectator_transform(current_transform)
+            elif record.object_type == "pedestrian":
+                control = self._compute_pedestrian_control(record, direction_vector, distance, dt)
+                actor.apply_control(control)
+
+        if spectator_transform is not None and self._spectator is not None:
+            try:
+                self._spectator.set_transform(spectator_transform)
+            except RuntimeError:
+                LOGGER.debug("Failed to move spectator")
+
+    def _compute_vehicle_control(
+        self,
+        record: EntityRecord,
+        transform: carla.Transform,
+        direction_vector: carla.Vector3D,
+        distance: float,
+        dt: float,
+    ) -> carla.VehicleControl:
+        velocity = record.actor.get_velocity()
+        speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+
+        desired_speed = min(distance / max(dt, 1e-3), record.max_speed)
+        throttle_error = desired_speed - speed
+        throttle = 0.0
+        if record.throttle_pid is not None:
+            throttle = record.throttle_pid.step(throttle_error, dt)
+
+        yaw_rad = math.radians(transform.rotation.yaw)
+        target_yaw = math.atan2(direction_vector.y, direction_vector.x)
+        yaw_error = math.atan2(math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad))
+        steer = 0.0
+        if record.steering_pid is not None:
+            steer = record.steering_pid.step(yaw_error, dt)
+
+        brake = 0.0
+        hand_brake = False
+        reverse = False
+        if distance < 0.5 and speed < 0.2:
+            throttle = 0.0
+            brake = 0.5
+
+        return carla.VehicleControl(
+            throttle=float(max(0.0, min(throttle, 1.0))),
+            steer=float(max(-1.0, min(steer, 1.0))),
+            brake=float(max(0.0, min(brake, 1.0))),
+            hand_brake=hand_brake,
+            reverse=reverse,
+        )
+
+    def _compute_pedestrian_control(
+        self,
+        record: EntityRecord,
+        direction_vector: carla.Vector3D,
+        distance: float,
+        dt: float,
+    ) -> carla.WalkerControl:
+        control = carla.WalkerControl()
+        if distance < 0.2:
+            control.speed = 0.0
+            control.direction = carla.Vector3D(0.0, 0.0, 0.0)
+            return control
+
+        norm = math.sqrt(direction_vector.x ** 2 + direction_vector.y ** 2 + direction_vector.z ** 2)
+        if norm > 0:
+            control.direction = carla.Vector3D(
+                direction_vector.x / norm,
+                direction_vector.y / norm,
+                direction_vector.z / norm,
+            )
+        desired_speed = min(distance / max(dt, 1e-3), record.max_speed)
+        control.speed = float(desired_speed)
+        return control
+
+    def _spectator_transform(self, transform: carla.Transform) -> carla.Transform:
+        location = transform.location
+        yaw = transform.rotation.yaw
+        yaw_rad = math.radians(yaw)
+        offset = carla.Location(x=-6.0 * math.cos(yaw_rad), y=-6.0 * math.sin(yaw_rad), z=3.0)
+        target_location = carla.Location(
+            x=location.x + offset.x,
+            y=location.y + offset.y,
+            z=max(location.z + offset.z, location.z + 1.5),
+        )
+        rotation = carla.Rotation(pitch=-15.0, yaw=yaw)
+        return carla.Transform(target_location, rotation)
 
 
 @contextmanager
@@ -329,7 +470,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     client.set_timeout(args.timeout)
     world = client.get_world()
     blueprint_library = world.get_blueprint_library()
-    manager = ActorManager(world, blueprint_library)
+    manager = EntityManager(world, blueprint_library)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
