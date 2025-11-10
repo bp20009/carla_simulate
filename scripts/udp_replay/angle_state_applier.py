@@ -28,15 +28,15 @@ def apply_state_angle_only(
 
     Actors that have not yet been spawned are created in the requested location, just
     like the original :meth:`EntityManager.apply_state`. For already tracked actors the
-    position target is preserved and only the rotation is refreshed so that downstream
-    PID controllers keep driving towards the existing waypoint while allowing their
-    facing direction to stay aligned with the incoming data feed.
+    physical transform is updated in-place so only the facing direction (yaw) is
+    refreshed, while navigation targets are updated separately for PID controllers to
+    pursue.
     """
 
     record = manager._entities.get(state.object_id)  # type: ignore[attr-defined]
 
     desired_location = carla.Location(x=state.x, y=state.y, z=state.z)
-    desired_rotation = carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=state.yaw)
+    desired_rotation = carla.Rotation(pitch=0.0, roll=0.0, yaw=state.yaw)
 
     if record is None or not record.actor.is_alive:
         transform = carla.Transform(desired_location, desired_rotation)
@@ -60,7 +60,12 @@ def apply_state_angle_only(
         LOGGER.debug("Unable to fetch transform for '%s'", state.object_id)
         return False
 
-    new_transform = carla.Transform(current_transform.location, desired_rotation)
+    new_rotation = carla.Rotation(
+        roll=current_transform.rotation.roll,
+        pitch=current_transform.rotation.pitch,
+        yaw=state.yaw,
+    )
+    new_transform = carla.Transform(current_transform.location, new_rotation)
     try:
         actor.set_transform(new_transform)
     except RuntimeError:
@@ -68,5 +73,6 @@ def apply_state_angle_only(
         return False
 
     record.last_update = timestamp
+    record.target = _clone_location(desired_location)
     record.target_rotation = _clone_rotation(new_transform.rotation)
     return True
