@@ -15,6 +15,11 @@ from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import carla
 
+try:
+    from .angle_state_applier import apply_state_angle_only
+except ImportError:  # pragma: no cover - support direct script execution
+    from angle_state_applier import apply_state_angle_only  # type: ignore
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -651,7 +656,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 LOGGER.debug("Ignoring invalid message: %s", exc)
                                 continue
 
-                            applied = manager.apply_state(state, time.monotonic())
+                            applied = apply_state_angle_only(
+                                manager, state, time.monotonic()
+                            )
                             if applied and not has_received_first_data:
                                 LOGGER.info("Received first complete tracking update")
                                 has_received_first_data = True
