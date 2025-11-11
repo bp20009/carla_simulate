@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -11,7 +12,8 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
 
 import carla
 
@@ -62,6 +64,16 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
         help="Logging verbosity",
+    )
+    parser.add_argument(
+        "--measure-update-times",
+        action="store_true",
+        help="Log frame and per-actor update timings during replay",
+    )
+    parser.add_argument(
+        "--timing-output",
+        default="update_timings.csv",
+        help="CSV file that stores frame and actor update timings",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -285,12 +297,108 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
 
 
 class EntityManager:
-    def __init__(self, world: carla.World, blueprint_library: carla.BlueprintLibrary) -> None:
+    def __init__(
+        self,
+        world: carla.World,
+        blueprint_library: carla.BlueprintLibrary,
+        *,
+        enable_timing: bool = False,
+        timing_output: Optional[TextIO] = None,
+    ) -> None:
         self._world = world
         self._spectator = world.get_spectator()
         self._map = world.get_map()
         self._blueprint_library = blueprint_library
         self._entities: Dict[str, EntityRecord] = {}
+        self._timing_enabled = enable_timing
+        self._frame_start_ns: Optional[int] = None
+        self._actor_timings: List[Tuple[str, int]] = []
+        self._timing_output = timing_output
+        self._timing_writer = csv.writer(timing_output) if timing_output else None
+        self._timing_header_written = False
+        self._next_frame_sequence = 1
+        self._active_frame_sequence: Optional[int] = None
+
+    @property
+    def timing_enabled(self) -> bool:
+        return self._timing_enabled
+
+    def begin_frame(self) -> None:
+        if not self._timing_enabled:
+            return
+        self._frame_start_ns = time.perf_counter_ns()
+        self._actor_timings.clear()
+        self._active_frame_sequence = self._next_frame_sequence
+        self._next_frame_sequence += 1
+
+    def end_frame(self, *, completed: bool, frame_id: Optional[int]) -> None:
+        if not self._timing_enabled or self._frame_start_ns is None:
+            return
+
+        frame_duration_ns = time.perf_counter_ns() - self._frame_start_ns
+        actor_count = len(self._actor_timings)
+        frame_sequence = self._active_frame_sequence or ""
+        carla_frame = frame_id if frame_id is not None else ""
+        if completed:
+            LOGGER.info(
+                "Frame processed in %.3f ms (%d actor updates)",
+                frame_duration_ns / 1e6,
+                actor_count,
+            )
+        else:
+            LOGGER.info(
+                "Aborted frame after %.3f ms (%d actor updates)",
+                frame_duration_ns / 1e6,
+                actor_count,
+            )
+
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            for object_id, elapsed_ns in self._actor_timings:
+                LOGGER.debug("  %s updated in %.3f ms", object_id, elapsed_ns / 1e6)
+
+        if self._timing_writer is not None:
+            if not self._timing_header_written:
+                self._timing_writer.writerow(
+                    [
+                        "frame_sequence",
+                        "carla_frame",
+                        "frame_completed",
+                        "frame_duration_ms",
+                        "actor_count",
+                        "actor_id",
+                        "actor_duration_ms",
+                    ]
+                )
+                self._timing_header_written = True
+            frame_duration_ms = frame_duration_ns / 1e6
+            self._timing_writer.writerow(
+                [
+                    frame_sequence,
+                    carla_frame,
+                    "yes" if completed else "no",
+                    f"{frame_duration_ms:.6f}",
+                    actor_count,
+                    "",
+                    "",
+                ]
+            )
+            for object_id, elapsed_ns in self._actor_timings:
+                self._timing_writer.writerow(
+                    [
+                        frame_sequence,
+                        carla_frame,
+                        "",
+                        "",
+                        "",
+                        object_id,
+                        f"{elapsed_ns / 1e6:.6f}",
+                    ]
+                )
+            self._timing_output.flush()
+
+        self._frame_start_ns = None
+        self._actor_timings.clear()
+        self._active_frame_sequence = None
 
     def _select_blueprint(self, object_type: str) -> Optional[carla.ActorBlueprint]:
         filters = TYPE_FILTERS.get(object_type, [])
@@ -348,6 +456,7 @@ class EntityManager:
     def apply_state(self, state: IncomingState, timestamp: float) -> bool:
         record = self._entities.get(state.object_id)
         new_location = carla.Location(x=state.x, y=state.y, z=state.z)
+        timing_start_ns = time.perf_counter_ns() if self._frame_start_ns is not None else None
 
         if record is None or not record.actor.is_alive:
             record = self._spawn_actor(state)
@@ -376,6 +485,11 @@ class EntityManager:
         record.last_update = timestamp
         record.previous_location = record.target
         record.target = transform.location
+
+        if timing_start_ns is not None and self._frame_start_ns is not None:
+            self._actor_timings.append(
+                (state.object_id, time.perf_counter_ns() - timing_start_ns)
+            )
         return True
 
     def destroy_stale(self, now: float, timeout: float) -> None:
@@ -544,7 +658,18 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     client.set_timeout(args.timeout)
     world = client.get_world()
     blueprint_library = world.get_blueprint_library()
-    manager = EntityManager(world, blueprint_library)
+    timing_file: Optional[TextIO] = None
+    if args.measure_update_times:
+        output_path = Path(args.timing_output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        timing_file = output_path.open("w", newline="")
+
+    manager = EntityManager(
+        world,
+        blueprint_library,
+        enable_timing=args.measure_update_times,
+        timing_output=timing_file,
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
@@ -561,54 +686,73 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         with synchronous_mode(world, args.fixed_delta):
             has_received_first_data = False
             while True:
-                now = time.monotonic()
-                if args.max_runtime and now - start_time >= args.max_runtime:
-                    LOGGER.info("Reached maximum runtime (%.1f s)", args.max_runtime)
-                    break
-
-                while True:
-                    try:
-                        payload, _ = sock.recvfrom(65535)
-                    except socket.timeout:
+                frame_completed = False
+                carla_frame_id: Optional[int] = None
+                if manager.timing_enabled:
+                    manager.begin_frame()
+                try:
+                    now = time.monotonic()
+                    if args.max_runtime and now - start_time >= args.max_runtime:
+                        LOGGER.info(
+                            "Reached maximum runtime (%.1f s)", args.max_runtime
+                        )
                         break
-                    except OSError as exc:
-                        LOGGER.error("Socket error: %s", exc)
-                        return 1
-                    else:
-                        for raw_message in decode_messages(payload):
-                            try:
-                                state = normalise_message(raw_message)
-                            except MissingTargetDataError as exc:
-                                LOGGER.warning("Incomplete target data: %s", exc)
-                                continue
-                            except (TypeError, ValueError) as exc:
-                                LOGGER.debug("Ignoring invalid message: %s", exc)
-                                continue
 
-                            applied = manager.apply_state(state, time.monotonic())
-                            if applied and not has_received_first_data:
-                                LOGGER.info("Received first complete tracking update")
-                                has_received_first_data = True
+                    while True:
+                        try:
+                            payload, _ = sock.recvfrom(65535)
+                        except socket.timeout:
+                            break
+                        except OSError as exc:
+                            LOGGER.error("Socket error: %s", exc)
+                            return 1
+                        else:
+                            for raw_message in decode_messages(payload):
+                                try:
+                                    state = normalise_message(raw_message)
+                                except MissingTargetDataError as exc:
+                                    LOGGER.warning("Incomplete target data: %s", exc)
+                                    continue
+                                except (TypeError, ValueError) as exc:
+                                    LOGGER.debug("Ignoring invalid message: %s", exc)
+                                    continue
 
-                current_time = time.monotonic()
-                elapsed = current_time - last_step_time
-                if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
-                    time.sleep(args.fixed_delta - elapsed)
+                                applied = manager.apply_state(
+                                    state, time.monotonic()
+                                )
+                                if applied and not has_received_first_data:
+                                    LOGGER.info(
+                                        "Received first complete tracking update"
+                                    )
+                                    has_received_first_data = True
+
                     current_time = time.monotonic()
+                    elapsed = current_time - last_step_time
+                    if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
+                        time.sleep(args.fixed_delta - elapsed)
+                        current_time = time.monotonic()
 
-                world.tick()
-                last_step_time = time.monotonic()
+                    carla_frame_id = world.tick()
+                    frame_completed = True
+                    last_step_time = time.monotonic()
 
-                now = last_step_time
-                if now >= next_cleanup:
-                    manager.destroy_stale(now, args.stale_timeout)
-                    next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
+                    now = last_step_time
+                    if now >= next_cleanup:
+                        manager.destroy_stale(now, args.stale_timeout)
+                        next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
+                finally:
+                    if manager.timing_enabled:
+                        manager.end_frame(
+                            completed=frame_completed, frame_id=carla_frame_id
+                        )
 
     except KeyboardInterrupt:
         LOGGER.info("Interrupted by user")
     finally:
         manager.destroy_all()
         sock.close()
+        if timing_file is not None:
+            timing_file.close()
 
     return 0
 
