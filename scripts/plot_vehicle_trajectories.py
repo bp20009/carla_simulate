@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Tuple
@@ -41,9 +42,19 @@ def load_trajectories(
     trajectories: Dict[int, List[Point]] = defaultdict(list)
     actor_types: Dict[int, str] = {}
 
+    required_fields = ("frame", "location_x", "location_y", "type", "id")
+
     with csv_path.open(newline="") as fh:
         reader = csv.DictReader(_strip_null_bytes(fh))
         for row in reader:
+            missing = [field for field in required_fields if not row.get(field)]
+            if missing:
+                print(
+                    f"Skipping malformed row (missing: {', '.join(missing)}): {row}",
+                    file=sys.stderr,
+                )
+                continue
+
             actor_type = row["type"]
             if allowed_prefixes and not actor_type.startswith(allowed_prefixes):
                 continue
