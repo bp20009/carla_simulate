@@ -318,6 +318,7 @@ class EntityManager:
         self._timing_header_written = False
         self._next_frame_sequence = 1
         self._active_frame_sequence: Optional[int] = None
+        self._arrival_tolerance = 0.5
 
     @property
     def timing_enabled(self) -> bool:
@@ -463,28 +464,41 @@ class EntityManager:
             if record is None:
                 return False
             self._entities[state.object_id] = record
+            record.target = new_location
+            record.previous_location = new_location
+            record.last_update = timestamp
 
         actor = record.actor
 
-        actor_transform = actor.get_transform()
-        reference_location = record.target or record.previous_location or actor_transform.location
-        dx = new_location.x - reference_location.x
-        dy = new_location.y - reference_location.y
-        distance_sq = dx * dx + dy * dy
-        if distance_sq <= 1e-8:
-            heading = actor_transform.rotation.yaw
-        else:
-            heading = math.degrees(math.atan2(dy, dx))
-
-        transform = carla.Transform(
-            new_location,
-            carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=heading),
-        )
-
-        actor.set_transform(transform)
         record.last_update = timestamp
-        record.previous_location = record.target
-        record.target = transform.location
+        current_location: Optional[carla.Location] = None
+        previous_target = record.target
+
+        if previous_target is not None:
+            try:
+                current_transform = actor.get_transform()
+                current_location = current_transform.location
+                remaining_distance = math.sqrt(
+                    (previous_target.x - current_location.x) ** 2
+                    + (previous_target.y - current_location.y) ** 2
+                    + (previous_target.z - current_location.z) ** 2
+                )
+                if remaining_distance > self._arrival_tolerance:
+                    actor.set_transform(
+                        carla.Transform(previous_target, current_transform.rotation)
+                    )
+                    current_location = previous_target
+            except RuntimeError:
+                LOGGER.debug("Unable to force-arrive actor '%s'", state.object_id)
+
+        if current_location is None:
+            try:
+                current_location = actor.get_location()
+            except RuntimeError:
+                current_location = None
+
+        record.previous_location = previous_target or current_location
+        record.target = new_location
 
         if timing_start_ns is not None and self._frame_start_ns is not None:
             self._actor_timings.append(
@@ -575,6 +589,8 @@ class EntityManager:
         yaw_rad = math.radians(transform.rotation.yaw)
         target_yaw = math.atan2(direction_vector.y, direction_vector.x)
         yaw_error = math.atan2(math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad))
+        if abs(yaw_error) > math.radians(60.0):
+            yaw_error = 0.0
         steer = 0.0
         if record.steering_pid is not None:
             steer = record.steering_pid.step(yaw_error, dt)
@@ -732,6 +748,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         time.sleep(args.fixed_delta - elapsed)
                         current_time = time.monotonic()
 
+                    manager.step_all(args.fixed_delta)
                     carla_frame_id = world.tick()
                     frame_completed = True
                     last_step_time = time.monotonic()
