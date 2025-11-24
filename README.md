@@ -57,9 +57,11 @@ Key options:
 - `--host` / `--port`: CARLA server address to connect to.
 - `--timeout`: Maximum time to wait for the client connection to establish (seconds).
 - `--interval`: Optional delay (seconds) between snapshots to throttle logging.
+- `--mode`: Choose `wait` (default) to block on `wait_for_tick`, or `on-tick` to register a `World.on_tick` listener.
 - `--output`: Destination for the CSV log (`-` for `stdout`, default).
+- `--wall-clock`: Add a `wall_time` column with the local UNIX timestamp for each frame.
 
-Each CSV row includes the frame index reported by CARLA, the stable ID assigned by the script, the original CARLA actor ID, the vehicle blueprint, as well as its world-space location and rotation. Because the header is emitted once at startup and the writer flushes after every frame, the command can be safely redirected to a file or piped into another process.
+Each CSV row includes the frame index reported by CARLA, the stable ID assigned by the script, the original CARLA actor ID, the vehicle blueprint, as well as its world-space location and rotation. Because the header is emitted once at startup and the writer flushes after every frame, the command can be safely redirected to a file or piped into another process. When `--wall-clock` is used, the `wall_time` column is prepended to the CSV. The plotting and animation utilities ignore extra columns, so either layout can be used with the downstream tools.
 
 ## Visualising trajectories from CSV logs
 

@@ -26,15 +26,38 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
         help="Optional sleep interval between snapshots in seconds",
     )
     parser.add_argument(
+        "--mode",
+        choices=("wait", "on-tick"),
+        default="wait",
+        help=(
+            "Synchronization strategy: block on wait_for_tick (default) or register an "
+            "on_tick callback"
+        ),
+    )
+    parser.add_argument(
         "--output",
         default="-",
         help="Destination CSV file (use '-' for stdout)",
+    )
+    parser.add_argument(
+        "--wall-clock",
+        action="store_true",
+        help=(
+            "Include wall-clock timestamps alongside CARLA frame numbers in the CSV "
+            "output"
+        ),
     )
     return parser.parse_args(list(argv))
 
 
 def stream_vehicle_states(
-    host: str, port: int, timeout: float, interval: float, output: TextIO
+    host: str,
+    port: int,
+    timeout: float,
+    interval: float,
+    output: TextIO,
+    include_wall_clock: bool,
+    mode: str,
 ) -> None:
     """Continuously write vehicle and pedestrian transforms with stable IDs to CSV."""
     client = carla.Client(host, port)
@@ -45,60 +68,84 @@ def stream_vehicle_states(
     id_sequence = itertools.count(1)
 
     writer = csv.writer(output)
-    writer.writerow(
-        [
-            "frame",
-            "id",
-            "carla_actor_id",
-            "type",
-            "location_x",
-            "location_y",
-            "location_z",
-            "rotation_roll",
-            "rotation_pitch",
-            "rotation_yaw",
-        ]
-    )
+    header = [
+        "frame",
+        "id",
+        "carla_actor_id",
+        "type",
+        "location_x",
+        "location_y",
+        "location_z",
+        "rotation_roll",
+        "rotation_pitch",
+        "rotation_yaw",
+    ]
+    if include_wall_clock:
+        header.insert(0, "wall_time")
+    writer.writerow(header)
     output.flush()
 
+    throttle_with_interval = interval > 0.0 and mode == "on-tick"
+    last_emit_monotonic: float | None = None
+
+    def handle_snapshot(world_snapshot: carla.WorldSnapshot) -> None:
+        nonlocal last_emit_monotonic
+
+        if throttle_with_interval:
+            now = time.monotonic()
+            if last_emit_monotonic is not None and now - last_emit_monotonic < interval:
+                return
+            last_emit_monotonic = now
+
+        wall_time = time.time() if include_wall_clock else None
+        actors = world.get_actors()
+        tracked_actors = (
+            actor for actor in actors if actor.type_id.startswith(("vehicle.", "walker."))
+        )
+
+        wrote_frame = False
+        for actor in tracked_actors:
+            actor_id = actor.id
+            if actor_id not in actor_to_custom_id:
+                actor_to_custom_id[actor_id] = next(id_sequence)
+
+            transform = actor.get_transform()
+            row = [
+                world_snapshot.frame,
+                actor_to_custom_id[actor_id],
+                actor_id,
+                actor.type_id,
+                transform.location.x,
+                transform.location.y,
+                transform.location.z,
+                transform.rotation.roll,
+                transform.rotation.pitch,
+                transform.rotation.yaw,
+            ]
+            if include_wall_clock:
+                row.insert(0, wall_time)
+            writer.writerow(row)
+            wrote_frame = True
+
+        if wrote_frame:
+            output.flush()
+
     try:
-        while True:
-            world_snapshot = world.wait_for_tick()
-            actors = world.get_actors()
-            tracked_actors = (
-                actor
-                for actor in actors
-                if actor.type_id.startswith(("vehicle.", "walker."))
-            )
-
-            wrote_frame = False
-            for actor in tracked_actors:
-                actor_id = actor.id
-                if actor_id not in actor_to_custom_id:
-                    actor_to_custom_id[actor_id] = next(id_sequence)
-
-                transform = actor.get_transform()
-                writer.writerow(
-                    [
-                        world_snapshot.frame,
-                        actor_to_custom_id[actor_id],
-                        actor_id,
-                        actor.type_id,
-                        transform.location.x,
-                        transform.location.y,
-                        transform.location.z,
-                        transform.rotation.roll,
-                        transform.rotation.pitch,
-                        transform.rotation.yaw,
-                    ]
-                )
-                wrote_frame = True
-
-            if wrote_frame:
-                output.flush()
-
-            if interval > 0.0:
-                time.sleep(interval)
+        if mode == "on-tick":
+            callback_id = world.on_tick(handle_snapshot)
+            try:
+                while True:
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                world.remove_on_tick(callback_id)
+        else:
+            while True:
+                world_snapshot = world.wait_for_tick()
+                handle_snapshot(world_snapshot)
+                if interval > 0.0:
+                    time.sleep(interval)
     except KeyboardInterrupt:
         pass
 
@@ -114,7 +161,13 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     try:
         stream_vehicle_states(
-            args.host, args.port, args.timeout, args.interval, output_stream
+            args.host,
+            args.port,
+            args.timeout,
+            args.interval,
+            output_stream,
+            args.wall_clock,
+            args.mode,
         )
     finally:
         if close_output:
