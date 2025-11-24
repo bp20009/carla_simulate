@@ -33,28 +33,19 @@ def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
 def load_trajectories(
     csv_path: Path,
     allowed_kinds: Iterable[str] | None = None,
-) -> Tuple[Dict[int, List[Point]], Dict[int, str]]:
-    """Load trajectories grouped by actor ID."""
+):
     allowed_prefixes = None
     if allowed_kinds:
         allowed_prefixes = tuple(f"{kind}." for kind in allowed_kinds)
 
-    trajectories: Dict[int, List[Point]] = defaultdict(list)
-    actor_types: Dict[int, str] = {}
+    trajectories = defaultdict(list)
+    actor_types = {}
 
-    required_fields = ("frame", "location_x", "location_y", "type", "id")
+    # ★ UTF-16 で読み取って UTF-8 として扱う
+    with csv_path.open("r", encoding="utf-16", newline="") as fh:
+        reader = csv.DictReader(fh)
 
-    with csv_path.open(newline="") as fh:
-        reader = csv.DictReader(_strip_null_bytes(fh))
         for row in reader:
-            missing = [field for field in required_fields if not row.get(field)]
-            if missing:
-                print(
-                    f"Skipping malformed row (missing: {', '.join(missing)}): {row}",
-                    file=sys.stderr,
-                )
-                continue
-
             actor_type = row["type"]
             if allowed_prefixes and not actor_type.startswith(allowed_prefixes):
                 continue
@@ -71,6 +62,7 @@ def load_trajectories(
         points.sort(key=lambda item: item[0])
 
     return trajectories, actor_types
+
 
 
 def plot_trajectories(
