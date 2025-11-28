@@ -34,11 +34,28 @@ Payload = Dict[str, object]
 
 
 def parse_args() -> argparse.Namespace:
+    def positive_int(value: str) -> int:
+        try:
+            int_value = int(value)
+        except ValueError as exc:  # pragma: no cover - argparse reports the error
+            raise argparse.ArgumentTypeError("--frame-stride must be an integer") from exc
+
+        if int_value <= 0:
+            raise argparse.ArgumentTypeError("--frame-stride must be a positive integer")
+
+        return int_value
+
     parser = argparse.ArgumentParser(
         description=(
             "Send UDP packets where each payload represents all actors in a frame "
             "from a reduced vehicle state CSV."
         )
+    )
+    parser.add_argument(
+        "--frame-stride",
+        type=positive_int,
+        default=1,
+        help="Only send every Nth frame (default: 1, send all frames)",
     )
     parser.add_argument(
         "csv_path",
@@ -117,14 +134,24 @@ def send_frames(
     interval: float,
     delay_column: str | None,
     encoding: str,
+    frame_stride: int,
 ) -> None:
     host, port = destination
     sent_frames = 0
     missing_delay_logged = False
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        for frame_id, frame_rows in frames:
+        for index, (frame_id, frame_rows) in enumerate(frames):
             if not frame_rows:
+                continue
+
+            if index % frame_stride != 0:
+                LOGGER.debug(
+                    "Skipping frame %s (index %d) due to frame_stride=%d",
+                    frame_id,
+                    index,
+                    frame_stride,
+                )
                 continue
 
             payload_dict = build_frame_payload(frame_id, frame_rows)
@@ -182,6 +209,7 @@ def main() -> None:
         interval=args.interval,
         delay_column=args.delay_column,
         encoding=args.encoding,
+        frame_stride=args.frame_stride,
     )
 
 

@@ -110,6 +110,8 @@ python send_data/send_udp_from_csv.py data.csv --host 192.168.0.20 --port 5005 -
 The script treats each CSV row as a message. By default it serialises the entire row as JSON before transmitting it, but you can
 pick a specific column with `--message-column`. Use `--interval` for a fixed delay between packets or `--delay-column` to use a per-row delay value stored in the CSV.
 
+Use `--frame-stride` with the frame-specific sender to skip frames while streaming. For example, `--frame-stride 5` sends only every fifth frame.
+
 When replaying world snapshots captured by `scripts/vehicle_state_stream.py`, first reduce the dataset and then transmit the per-frame payloads:
 
 ```bash
