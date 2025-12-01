@@ -112,9 +112,12 @@ def _coerce_float(value: str | None) -> float | None:
         return None
 
 
-def build_frame_payload(frame_id: str, rows: FrameRows) -> Payload:
+def build_frame_payload(
+    frame_id: str, rows: FrameRows, *, max_actors: int | None = None
+) -> Payload:
+    actor_rows = rows[:max_actors] if max_actors is not None else rows
     actors = []
-    for row in rows:
+    for row in actor_rows:
         actors.append(
             {
                 "id": row.get("id"),
@@ -154,7 +157,19 @@ def send_frames(
                 )
                 continue
 
-            payload_dict = build_frame_payload(frame_id, frame_rows)
+            max_actors = min(len(frame_rows), index + 1)
+            staged_send = max_actors < len(frame_rows)
+
+            if staged_send:
+                LOGGER.debug(
+                    "Staged send for frame %s (index %d): sending %d of %d actors",
+                    frame_id,
+                    index,
+                    max_actors,
+                    len(frame_rows),
+                )
+
+            payload_dict = build_frame_payload(frame_id, frame_rows, max_actors=max_actors)
             payload_text = json.dumps(payload_dict, ensure_ascii=False)
             LOGGER.debug(
                 "Sending frame %s payload to %s:%d: %s", frame_id, host, port, payload_text
