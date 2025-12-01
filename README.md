@@ -60,8 +60,10 @@ Key options:
 - `--mode`: Choose `wait` (default) to block on `wait_for_tick`, or `on-tick` to register a `World.on_tick` listener.
 - `--output`: Destination for the CSV log (`-` for `stdout`, default).
 - `--wall-clock`: Add a `wall_time` column with the local UNIX timestamp for each frame.
+- `--frame-elapsed`: Prepend a `frame_elapsed` column with the delta time reported by CARLA between frames.
 
 Each CSV row includes the frame index reported by CARLA, the stable ID assigned by the script, the original CARLA actor ID, the vehicle blueprint, as well as its world-space location and rotation. Because the header is emitted once at startup and the writer flushes after every frame, the command can be safely redirected to a file or piped into another process. When `--wall-clock` is used, the `wall_time` column is prepended to the CSV. The plotting and animation utilities ignore extra columns, so either layout can be used with the downstream tools.
+When `--frame-elapsed` is set, a `frame_elapsed` column is added before any optional timestamp fields, and it contains the delta time reported in each `WorldSnapshot`. Using either or both timestamp flags preserves the same column order across `wait` and `on-tick` modes, so downstream tools can skip unknown columns as before.
 
 ## Visualising trajectories from CSV logs
 

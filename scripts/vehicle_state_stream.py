@@ -47,6 +47,13 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
             "output"
         ),
     )
+    parser.add_argument(
+        "--frame-elapsed",
+        action="store_true",
+        help=(
+            "Include the frame-to-frame delta time reported by CARLA in the CSV output"
+        ),
+    )
     return parser.parse_args(list(argv))
 
 
@@ -57,6 +64,7 @@ def stream_vehicle_states(
     interval: float,
     output: TextIO,
     include_wall_clock: bool,
+    include_frame_elapsed: bool,
     mode: str,
 ) -> None:
     """Continuously write vehicle and pedestrian transforms with stable IDs to CSV."""
@@ -68,7 +76,12 @@ def stream_vehicle_states(
     id_sequence = itertools.count(1)
 
     writer = csv.writer(output)
-    header = [
+    header_prefix = []
+    if include_frame_elapsed:
+        header_prefix.append("frame_elapsed")
+    if include_wall_clock:
+        header_prefix.append("wall_time")
+    header = header_prefix + [
         "frame",
         "id",
         "carla_actor_id",
@@ -80,8 +93,6 @@ def stream_vehicle_states(
         "rotation_pitch",
         "rotation_yaw",
     ]
-    if include_wall_clock:
-        header.insert(0, "wall_time")
     writer.writerow(header)
     output.flush()
 
@@ -98,6 +109,9 @@ def stream_vehicle_states(
             last_emit_monotonic = now
 
         wall_time = time.time() if include_wall_clock else None
+        frame_elapsed = (
+            world_snapshot.timestamp.delta_seconds if include_frame_elapsed else None
+        )
         actors = world.get_actors()
         tracked_actors = (
             actor for actor in actors if actor.type_id.startswith(("vehicle.", "walker."))
@@ -110,7 +124,12 @@ def stream_vehicle_states(
                 actor_to_custom_id[actor_id] = next(id_sequence)
 
             transform = actor.get_transform()
-            row = [
+            row_prefix = []
+            if include_frame_elapsed:
+                row_prefix.append(frame_elapsed)
+            if include_wall_clock:
+                row_prefix.append(wall_time)
+            row = row_prefix + [
                 world_snapshot.frame,
                 actor_to_custom_id[actor_id],
                 actor_id,
@@ -122,8 +141,6 @@ def stream_vehicle_states(
                 transform.rotation.pitch,
                 transform.rotation.yaw,
             ]
-            if include_wall_clock:
-                row.insert(0, wall_time)
             writer.writerow(row)
             wrote_frame = True
 
@@ -167,6 +184,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.interval,
             output_stream,
             args.wall_clock,
+            args.frame_elapsed,
             args.mode,
         )
     finally:
