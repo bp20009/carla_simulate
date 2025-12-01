@@ -106,6 +106,7 @@ class IncomingState:
     roll: float = 0.0
     pitch: float = 0.0
     yaw: float = 0.0
+    yaw_provided: bool = False
 
 
 class MissingTargetDataError(ValueError):
@@ -255,7 +256,7 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
     y = _extract_coordinate("y")
     z = _extract_coordinate("z")
 
-    def _extract_rotation(key: str) -> float:
+    def _extract_rotation(key: str) -> Tuple[float, bool]:
         candidates = (
             key,
             f"target_{key}",
@@ -273,16 +274,16 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
                 value = container.get(candidate)
                 if value is not None:
                     try:
-                        return float(value)
+                        return float(value), True
                     except (TypeError, ValueError):
                         raise ValueError(
                             f"Invalid numeric value '{value}' for rotation '{candidate}'"
                         ) from None
-        return 0.0
+        return 0.0, False
 
-    roll = _extract_rotation("roll")
-    pitch = _extract_rotation("pitch")
-    yaw = _extract_rotation("yaw")
+    roll, _ = _extract_rotation("roll")
+    pitch, _ = _extract_rotation("pitch")
+    yaw, yaw_provided = _extract_rotation("yaw")
 
     return IncomingState(
         object_id=str(object_id),
@@ -293,6 +294,7 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
         roll=roll,
         pitch=pitch,
         yaw=yaw,
+        yaw_provided=yaw_provided,
     )
 
 
@@ -458,33 +460,41 @@ class EntityManager:
         new_location = carla.Location(x=state.x, y=state.y, z=state.z)
         timing_start_ns = time.perf_counter_ns() if self._frame_start_ns is not None else None
 
+        newly_spawned = False
         if record is None or not record.actor.is_alive:
             record = self._spawn_actor(state)
             if record is None:
                 return False
             self._entities[state.object_id] = record
+            newly_spawned = True
 
         actor = record.actor
 
         actor_transform = actor.get_transform()
-        reference_location = record.target or record.previous_location or actor_transform.location
-        dx = new_location.x - reference_location.x
-        dy = new_location.y - reference_location.y
+        previous_target = record.target or record.previous_location or actor_transform.location
+        dx = new_location.x - previous_target.x
+        dy = new_location.y - previous_target.y
         distance_sq = dx * dx + dy * dy
-        if distance_sq <= 1e-8:
-            heading = actor_transform.rotation.yaw
-        else:
-            heading = math.degrees(math.atan2(dy, dx))
+        yaw = actor_transform.rotation.yaw
+        if state.yaw_provided:
+            if newly_spawned:
+                yaw = state.yaw
+            else:
+                delta_yaw = ((state.yaw - yaw + 180.0) % 360.0) - 180.0
+                if abs(delta_yaw) < 60.0:
+                    yaw = state.yaw
+        elif distance_sq > 1e-8:
+            yaw = math.degrees(math.atan2(dy, dx))
 
         transform = carla.Transform(
-            new_location,
-            carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=heading),
+            previous_target,
+            carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=yaw),
         )
 
         actor.set_transform(transform)
         record.last_update = timestamp
-        record.previous_location = record.target
-        record.target = transform.location
+        record.previous_location = previous_target
+        record.target = new_location
 
         if timing_start_ns is not None and self._frame_start_ns is not None:
             self._actor_timings.append(
@@ -728,9 +738,13 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                     current_time = time.monotonic()
                     elapsed = current_time - last_step_time
-                    if args.fixed_delta > 0.0 and elapsed < args.fixed_delta:
-                        time.sleep(args.fixed_delta - elapsed)
+                    if args.fixed_delta > 0.0:
+                        if elapsed < args.fixed_delta:
+                            time.sleep(args.fixed_delta - elapsed)
                         current_time = time.monotonic()
+                        elapsed = args.fixed_delta
+
+                    manager.step_all(elapsed)
 
                     carla_frame_id = world.tick()
                     frame_completed = True
