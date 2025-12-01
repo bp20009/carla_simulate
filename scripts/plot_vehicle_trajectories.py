@@ -8,7 +8,7 @@ import csv
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Dict, Iterable, Iterator, List, TextIO, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.cm import get_cmap
@@ -30,10 +30,35 @@ def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
         yield line.replace("\x00", "")
 
 
+def _open_with_fallback(csv_path: Path, newline: str = "") -> TextIO:
+    """Open a CSV file using the first compatible encoding.
+
+    Attempts UTF-8 (with BOM handling) first, then falls back to UTF-16
+    variants if necessary, preserving newline handling for ``csv``.
+    """
+
+    encodings = ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be")
+    last_error: UnicodeError | None = None
+
+    for encoding in encodings:
+        try:
+            return csv_path.open("r", encoding=encoding, newline=newline)
+        except UnicodeError as exc:
+            last_error = exc
+
+    if last_error:
+        raise last_error
+
+
 def load_trajectories(
     csv_path: Path,
     allowed_kinds: Iterable[str] | None = None,
 ):
+    """Load trajectories from a vehicle_state_stream CSV file.
+
+    Supports UTF-8 (including BOM) and UTF-16 encodings to accommodate
+    different CARLA logging configurations.
+    """
     allowed_prefixes = None
     if allowed_kinds:
         allowed_prefixes = tuple(f"{kind}." for kind in allowed_kinds)
@@ -41,8 +66,7 @@ def load_trajectories(
     trajectories = defaultdict(list)
     actor_types = {}
 
-    # ★ UTF-16 で読み取って UTF-8 として扱う
-    with csv_path.open("r", encoding="utf-16", newline="") as fh:
+    with _open_with_fallback(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
 
         for row in reader:
