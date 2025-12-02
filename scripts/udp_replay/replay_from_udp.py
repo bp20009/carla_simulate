@@ -71,6 +71,13 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Log frame and per-actor update timings during replay",
     )
     parser.add_argument(
+        "--enable-completion",
+        action="store_true",
+        help=(
+            "Fill in missing yaw/heading values from movement direction when incoming data lacks yaw"
+        ),
+    )
+    parser.add_argument(
         "--timing-output",
         default="update_timings.csv",
         help="CSV file that stores frame and actor update timings",
@@ -306,12 +313,14 @@ class EntityManager:
         *,
         enable_timing: bool = False,
         timing_output: Optional[TextIO] = None,
+        enable_completion: bool = False,
     ) -> None:
         self._world = world
         self._map = world.get_map()
         self._blueprint_library = blueprint_library
         self._entities: Dict[str, EntityRecord] = {}
         self._timing_enabled = enable_timing
+        self._enable_completion = enable_completion
         self._frame_start_ns: Optional[int] = None
         self._actor_timings: List[Tuple[str, int]] = []
         self._timing_output = timing_output
@@ -482,7 +491,7 @@ class EntityManager:
                 delta_yaw = ((state.yaw - yaw + 180.0) % 360.0) - 180.0
                 if abs(delta_yaw) < 60.0:
                     yaw = state.yaw
-        elif distance_sq > 1e-8:
+        elif self._enable_completion and distance_sq > 1e-8:
             yaw = math.degrees(math.atan2(dy, dx))
 
         transform = carla.Transform(
@@ -655,6 +664,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         blueprint_library,
         enable_timing=args.measure_update_times,
         timing_output=timing_file,
+        enable_completion=args.enable_completion,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
