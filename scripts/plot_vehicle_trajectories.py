@@ -3,7 +3,8 @@
 
 The script now accepts multiple CSV inputs. You can pass several paths
 directly, or supply a directory/glob pattern to aggregate trajectories across
-files::
+files. When merging runs, the script prefers the ``carla_actor_id`` column when
+present (falling back to ``id``) to avoid conflicts from per-file numbering::
 
     python plot_vehicle_trajectories.py run1.csv run2.csv
     python plot_vehicle_trajectories.py --dir logs/
@@ -83,7 +84,8 @@ def load_trajectories(
                 if allowed_prefixes and not actor_type.startswith(allowed_prefixes):
                     continue
 
-                actor_id = int(row["id"])
+                actor_identifier = row.get("carla_actor_id") or row["id"]
+                actor_id = int(actor_identifier)
                 frame = float(row["frame"])
                 x = float(row["location_x"])
                 y = float(row["location_y"])
