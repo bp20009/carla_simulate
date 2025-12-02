@@ -24,6 +24,7 @@ from matplotlib.cm import get_cmap
 
 
 Point = Tuple[float, float, float]  # (frame, x, y)
+TrajectoryKey = Tuple[Path, int]
 
 
 def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
@@ -72,8 +73,8 @@ def load_trajectories(
     if allowed_kinds:
         allowed_prefixes = tuple(f"{kind}." for kind in allowed_kinds)
 
-    trajectories = defaultdict(list)
-    actor_types = {}
+    trajectories: defaultdict[TrajectoryKey, List[Point]] = defaultdict(list)
+    actor_types: Dict[TrajectoryKey, str] = {}
 
     for csv_path in csv_paths:
         with _open_with_fallback(csv_path, newline="") as fh:
@@ -86,18 +87,19 @@ def load_trajectories(
 
                 actor_identifier = row.get("carla_actor_id") or row["id"]
                 actor_id = int(actor_identifier)
+                traj_key: TrajectoryKey = (csv_path, actor_id)
                 frame = float(row["frame"])
                 x = float(row["location_x"])
                 y = float(row["location_y"])
 
-                if actor_id in actor_types and actor_types[actor_id] != actor_type:
+                if traj_key in actor_types and actor_types[traj_key] != actor_type:
                     raise ValueError(
                         f"Actor id {actor_id} has inconsistent types: "
-                        f"'{actor_types[actor_id]}' vs '{actor_type}' in {csv_path}"
+                        f"'{actor_types[traj_key]}' vs '{actor_type}' in {csv_path}"
                     )
 
-                trajectories[actor_id].append((frame, x, y))
-                actor_types[actor_id] = actor_type
+                trajectories[traj_key].append((frame, x, y))
+                actor_types[traj_key] = actor_type
 
     for points in trajectories.values():
         points.sort(key=lambda item: item[0])
@@ -107,8 +109,8 @@ def load_trajectories(
 
 
 def plot_trajectories(
-    trajectories: Dict[int, List[Point]],
-    actor_types: Dict[int, str],
+    trajectories: Dict[TrajectoryKey, List[Point]],
+    actor_types: Dict[TrajectoryKey, str],
     show_ids: bool,
     mark_endpoints: bool,
     title: str,
@@ -117,11 +119,12 @@ def plot_trajectories(
     fig, ax = plt.subplots(figsize=(10, 8))
     cmap = get_cmap("tab20")
 
-    for idx, (actor_id, points) in enumerate(sorted(trajectories.items())):
+    for idx, (traj_key, points) in enumerate(sorted(trajectories.items())):
+        csv_path, actor_id = traj_key
         xs = [pt[1] for pt in points]
         ys = [pt[2] for pt in points]
         color = cmap(idx % cmap.N)
-        label = f"{actor_types[actor_id]} (id={actor_id})"
+        label = f"{csv_path.name}: {actor_types[traj_key]} (id={actor_id})"
 
         ax.plot(xs, ys, color=color, label=label, linewidth=1.5)
 
@@ -130,7 +133,13 @@ def plot_trajectories(
             ax.scatter(xs[-1], ys[-1], color=color, marker="X", s=50, edgecolors="black")
 
         if show_ids:
-            ax.text(xs[-1], ys[-1], str(actor_id), color=color, fontsize=8)
+            ax.text(
+                xs[-1],
+                ys[-1],
+                f"{csv_path.name}:{actor_id}",
+                color=color,
+                fontsize=8,
+            )
 
     ax.set_title(title)
     ax.set_xlabel("X [m]")
