@@ -82,6 +82,15 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="update_timings.csv",
         help="CSV file that stores frame and actor update timings",
     )
+    parser.add_argument(
+        "--disable-pid",
+        "--no-pid",
+        action="store_true",
+        help=(
+            "Disable PID controllers for vehicle control; uses a simple steering and "
+            "throttle heuristic instead"
+        ),
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -314,6 +323,7 @@ class EntityManager:
         enable_timing: bool = False,
         timing_output: Optional[TextIO] = None,
         enable_completion: bool = False,
+        pid_enabled: bool = True,
     ) -> None:
         self._world = world
         self._map = world.get_map()
@@ -321,6 +331,7 @@ class EntityManager:
         self._entities: Dict[str, EntityRecord] = {}
         self._timing_enabled = enable_timing
         self._enable_completion = enable_completion
+        self._pid_enabled = pid_enabled
         self._frame_start_ns: Optional[int] = None
         self._actor_timings: List[Tuple[str, int]] = []
         self._timing_output = timing_output
@@ -449,10 +460,15 @@ class EntityManager:
             except RuntimeError:
                 LOGGER.debug("Unable to configure physics for actor '%s'", state.object_id)
 
-            throttle_pid = PIDController(1.0, 0.0, 0.05, integral_limit=10.0, output_limits=(0.0, 1.0))
-            steering_pid = PIDController(2.0, 0.0, 0.2, integral_limit=5.0, output_limits=(-1.0, 1.0))
-            record.throttle_pid = throttle_pid
-            record.steering_pid = steering_pid
+            if self._pid_enabled:
+                throttle_pid = PIDController(
+                    1.0, 0.0, 0.05, integral_limit=10.0, output_limits=(0.0, 1.0)
+                )
+                steering_pid = PIDController(
+                    2.0, 0.0, 0.2, integral_limit=5.0, output_limits=(-1.0, 1.0)
+                )
+                record.throttle_pid = throttle_pid
+                record.steering_pid = steering_pid
             record.max_speed = 20.0 if object_type == "vehicle" else 10.0
         elif object_type == "pedestrian":
             try:
@@ -573,6 +589,30 @@ class EntityManager:
         velocity = record.actor.get_velocity()
         speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
 
+        if not self._pid_enabled:
+            desired_speed = min(distance / max(dt, 1e-3), record.max_speed)
+            throttle = max(0.0, min(desired_speed / max(record.max_speed, 1e-3), 1.0))
+
+            yaw_rad = math.radians(transform.rotation.yaw)
+            target_yaw = math.atan2(direction_vector.y, direction_vector.x)
+            yaw_error = math.atan2(math.sin(target_yaw - yaw_rad), math.cos(target_yaw - yaw_rad))
+            steer = max(-1.0, min(yaw_error / (math.pi / 2), 1.0))
+
+            brake = 0.0
+            hand_brake = False
+            reverse = False
+            if distance < 0.5 and speed < 0.2:
+                throttle = 0.0
+                brake = 0.5
+
+            return carla.VehicleControl(
+                throttle=float(throttle),
+                steer=float(steer),
+                brake=float(brake),
+                hand_brake=hand_brake,
+                reverse=reverse,
+            )
+
         desired_speed = min(distance / max(dt, 1e-3), record.max_speed)
         throttle_error = desired_speed - speed
         throttle = 0.0
@@ -665,6 +705,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         enable_timing=args.measure_update_times,
         timing_output=timing_file,
         enable_completion=args.enable_completion,
+        pid_enabled=not args.disable_pid,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
