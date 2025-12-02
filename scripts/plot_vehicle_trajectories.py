@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""Plot CARLA actor trajectories stored by vehicle_state_stream.py."""
+"""Plot CARLA actor trajectories stored by vehicle_state_stream.py.
+
+The script now accepts multiple CSV inputs. You can pass several paths
+directly, or supply a directory/glob pattern to aggregate trajectories across
+files. When merging runs, the script prefers the ``carla_actor_id`` column when
+present (falling back to ``id``) to avoid conflicts from per-file numbering::
+
+    python plot_vehicle_trajectories.py run1.csv run2.csv
+    python plot_vehicle_trajectories.py --dir logs/
+    python plot_vehicle_trajectories.py --glob "logs/*.csv"
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, TextIO, Tuple
@@ -51,10 +60,10 @@ def _open_with_fallback(csv_path: Path, newline: str = "") -> TextIO:
 
 
 def load_trajectories(
-    csv_path: Path,
+    csv_paths: Iterable[Path],
     allowed_kinds: Iterable[str] | None = None,
 ):
-    """Load trajectories from a vehicle_state_stream CSV file.
+    """Load trajectories from one or more vehicle_state_stream CSV files.
 
     Supports UTF-8 (including BOM) and UTF-16 encodings to accommodate
     different CARLA logging configurations.
@@ -66,21 +75,29 @@ def load_trajectories(
     trajectories = defaultdict(list)
     actor_types = {}
 
-    with _open_with_fallback(csv_path, newline="") as fh:
-        reader = csv.DictReader(fh)
+    for csv_path in csv_paths:
+        with _open_with_fallback(csv_path, newline="") as fh:
+            reader = csv.DictReader(fh)
 
-        for row in reader:
-            actor_type = row["type"]
-            if allowed_prefixes and not actor_type.startswith(allowed_prefixes):
-                continue
+            for row in reader:
+                actor_type = row["type"]
+                if allowed_prefixes and not actor_type.startswith(allowed_prefixes):
+                    continue
 
-            actor_id = int(row["id"])
-            frame = float(row["frame"])
-            x = float(row["location_x"])
-            y = float(row["location_y"])
+                actor_identifier = row.get("carla_actor_id") or row["id"]
+                actor_id = int(actor_identifier)
+                frame = float(row["frame"])
+                x = float(row["location_x"])
+                y = float(row["location_y"])
 
-            trajectories[actor_id].append((frame, x, y))
-            actor_types[actor_id] = actor_type
+                if actor_id in actor_types and actor_types[actor_id] != actor_type:
+                    raise ValueError(
+                        f"Actor id {actor_id} has inconsistent types: "
+                        f"'{actor_types[actor_id]}' vs '{actor_type}' in {csv_path}"
+                    )
+
+                trajectories[actor_id].append((frame, x, y))
+                actor_types[actor_id] = actor_type
 
     for points in trajectories.values():
         points.sort(key=lambda item: item[0])
@@ -127,7 +144,23 @@ def plot_trajectories(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("csv", type=Path, help="Path to vehicle_state_stream output CSV")
+    parser.add_argument(
+        "csv",
+        type=Path,
+        nargs="*",
+        help="One or more vehicle_state_stream output CSVs.",
+    )
+    parser.add_argument(
+        "--dir",
+        type=Path,
+        dest="csv_dir",
+        help="Directory containing CSV logs to combine (non-recursive).",
+    )
+    parser.add_argument(
+        "--glob",
+        dest="csv_glob",
+        help="Glob pattern (e.g., 'logs/*.csv') for CSV files to include.",
+    )
     parser.add_argument(
         "--only",
         nargs="+",
@@ -153,7 +186,18 @@ def main() -> int:
     parser = build_argument_parser()
     args = parser.parse_args()
 
-    trajectories, actor_types = load_trajectories(args.csv, args.only)
+    csv_paths = list(args.csv)
+
+    if args.csv_dir:
+        csv_paths.extend(sorted(args.csv_dir.glob("*.csv")))
+
+    if args.csv_glob:
+        csv_paths.extend(sorted(Path().glob(args.csv_glob)))
+
+    if not csv_paths:
+        parser.error("Provide at least one CSV via positional args, --dir, or --glob.")
+
+    trajectories, actor_types = load_trajectories(csv_paths, args.only)
     if not trajectories:
         parser.error("No trajectories matched the provided filters.")
 
