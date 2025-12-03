@@ -125,6 +125,8 @@ class EntityRecord:
     actor: carla.Actor
     object_type: str
     last_update: float
+    last_observed_location: Optional[carla.Location] = None
+    last_observed_time: Optional[float] = None
     target: Optional[carla.Location] = None
     previous_location: Optional[carla.Location] = None
     throttle_pid: Optional[PIDController] = None
@@ -440,7 +442,15 @@ class EntityManager:
         LOGGER.info("Spawned %s '%s'", state.object_type, state.object_id)
 
         object_type = state.object_type
-        record = EntityRecord(actor=actor, object_type=object_type, last_update=time.monotonic())
+        initial_observation = carla.Location(x=state.x, y=state.y, z=state.z)
+        now = time.monotonic()
+        record = EntityRecord(
+            actor=actor,
+            object_type=object_type,
+            last_update=now,
+            last_observed_location=initial_observation,
+            last_observed_time=now,
+        )
 
         if object_type in {"vehicle", "bicycle"}:
             try:
@@ -501,6 +511,8 @@ class EntityManager:
 
         actor.set_transform(transform)
         record.last_update = timestamp
+        record.last_observed_location = new_location
+        record.last_observed_time = timestamp
         record.previous_location = previous_target
         record.target = new_location
 
