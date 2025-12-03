@@ -124,7 +124,7 @@ def plot_trajectories(
     """Draw each trajectory on a shared XY plane."""
     fig, ax = plt.subplots(figsize=(10, 8))
     cmap = get_cmap("tab20")
-    base_color = cmap(0)
+    base_color = cmap(1)  # slightly darker for better contrast in paper mode
 
     effective_show_ids = show_ids and not paper
     effective_mark_endpoints = mark_endpoints and not paper
@@ -141,8 +141,8 @@ def plot_trajectories(
             ys,
             color=color,
             label=label if not paper else None,
-            linewidth=1.0 if paper else 1.5,
-            alpha=0.6 if paper else 1.0,
+            linewidth=1.8 if paper else 1.5,
+            alpha=0.8 if paper else 1.0,
         )
 
         if effective_mark_endpoints:
