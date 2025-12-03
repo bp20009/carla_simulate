@@ -86,7 +86,7 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 
 TYPE_FILTERS: Mapping[str, List[str]] = {
-    "vehicle": ["vehicle.tesla.model3", "vehicle.lincoln.mkz_2017", "vehicle.*"],
+    "vehicle": ["vehicle.ue4.mercedes.ccc", "vehicle.lincoln.mkz_2017", "vehicle.*"],
     "pedestrian": ["walker.pedestrian.0010", "walker.pedestrian.*"],
     "bicycle": ["vehicle.diamondback.century", "vehicle.bh.crossbike", "vehicle.*bike*"],
 }
