@@ -167,6 +167,7 @@ def plot_trajectories(
     ax.set_ylabel("Y [m]", fontsize=label_fontsize)
     if tick_fontsize:
         ax.tick_params(labelsize=tick_fontsize)
+        ax.tick_params(direction="in")
     ax.set_aspect("equal")
     ax.grid(True, linestyle="--", alpha=0.4)
     if not paper:
