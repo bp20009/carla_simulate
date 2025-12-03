@@ -9,6 +9,11 @@ present (falling back to ``id``) to avoid conflicts from per-file numbering::
     python plot_vehicle_trajectories.py run1.csv run2.csv
     python plot_vehicle_trajectories.py --dir logs/
     python plot_vehicle_trajectories.py --glob "logs/*.csv"
+
+For reproducible figures with simplified styling suitable for publications,
+combine ``--paper`` with ``--save`` to write the output directly to disk::
+
+    python plot_vehicle_trajectories.py --dir logs/ --paper --save trajectories.png
 """
 
 from __future__ import annotations
@@ -114,25 +119,37 @@ def plot_trajectories(
     show_ids: bool,
     mark_endpoints: bool,
     title: str,
+    paper: bool,
 ):
     """Draw each trajectory on a shared XY plane."""
     fig, ax = plt.subplots(figsize=(10, 8))
     cmap = get_cmap("tab20")
+    base_color = cmap(1)  # slightly darker for better contrast in paper mode
+
+    effective_show_ids = show_ids and not paper
+    effective_mark_endpoints = mark_endpoints and not paper
 
     for idx, (traj_key, points) in enumerate(sorted(trajectories.items())):
         csv_path, actor_id = traj_key
         xs = [pt[1] for pt in points]
         ys = [pt[2] for pt in points]
-        color = cmap(idx % cmap.N)
+        color = base_color if paper else cmap(idx % cmap.N)
         label = f"{csv_path.name}: {actor_types[traj_key]} (id={actor_id})"
 
-        ax.plot(xs, ys, color=color, label=label, linewidth=1.5)
+        ax.plot(
+            xs,
+            ys,
+            color=color,
+            label=label if not paper else None,
+            linewidth=1.8 if paper else 1.5,
+            alpha=0.8 if paper else 1.0,
+        )
 
-        if mark_endpoints:
+        if effective_mark_endpoints:
             ax.scatter(xs[0], ys[0], color=color, marker="o", s=30, edgecolors="white")
             ax.scatter(xs[-1], ys[-1], color=color, marker="X", s=50, edgecolors="black")
 
-        if show_ids:
+        if effective_show_ids:
             ax.text(
                 xs[-1],
                 ys[-1],
@@ -141,12 +158,19 @@ def plot_trajectories(
                 fontsize=8,
             )
 
-    ax.set_title(title)
-    ax.set_xlabel("X [m]")
-    ax.set_ylabel("Y [m]")
+    if not paper:
+        ax.set_title(title)
+    label_fontsize = 14 if paper else None
+    tick_fontsize = 12 if paper else None
+
+    ax.set_xlabel("X [m]", fontsize=label_fontsize)
+    ax.set_ylabel("Y [m]", fontsize=label_fontsize)
+    if tick_fontsize:
+        ax.tick_params(labelsize=tick_fontsize)
     ax.set_aspect("equal")
     ax.grid(True, linestyle="--", alpha=0.4)
-    ax.legend(loc="upper right", fontsize=8)
+    if not paper:
+        ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     return fig, ax
 
@@ -188,6 +212,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional path to save the figure instead of opening an interactive window.",
     )
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help=(
+            "Use simplified styling (single color, no labels) for publication-ready images; "
+            "combine with --save for reproducible figures."
+        ),
+    )
     return parser
 
 
@@ -216,6 +248,7 @@ def main() -> int:
         show_ids=not args.hide_ids,
         mark_endpoints=not args.no_endpoints,
         title=args.title,
+        paper=args.paper,
     )
 
     if args.save:
