@@ -158,9 +158,15 @@ def plot_trajectories(
                 fontsize=8,
             )
 
-    ax.set_title(title)
-    ax.set_xlabel("X [m]")
-    ax.set_ylabel("Y [m]")
+    if not paper:
+        ax.set_title(title)
+    label_fontsize = 14 if paper else None
+    tick_fontsize = 12 if paper else None
+
+    ax.set_xlabel("X [m]", fontsize=label_fontsize)
+    ax.set_ylabel("Y [m]", fontsize=label_fontsize)
+    if tick_fontsize:
+        ax.tick_params(labelsize=tick_fontsize)
     ax.set_aspect("equal")
     ax.grid(True, linestyle="--", alpha=0.4)
     if not paper:
