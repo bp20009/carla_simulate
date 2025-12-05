@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
 
 import carla
+import torch
+import torch.nn as nn
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +83,40 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--timing-output",
         default="update_timings.csv",
         help="CSV file that stores frame and actor update timings",
+    )
+    parser.add_argument(
+        "--enable-lstm",
+        action="store_true",
+        help="Enable LSTM-based predictions for incoming actors",
+    )
+    parser.add_argument(
+        "--lstm-history-sec",
+        type=float,
+        default=2.0,
+        help="Number of seconds of history to feed into the LSTM model",
+    )
+    parser.add_argument(
+        "--lstm-horizon-min-sec",
+        type=float,
+        default=0.5,
+        help="Minimum prediction horizon in seconds for the LSTM model",
+    )
+    parser.add_argument(
+        "--lstm-horizon-max-sec",
+        type=float,
+        default=2.0,
+        help="Maximum prediction horizon in seconds for the LSTM model",
+    )
+    parser.add_argument(
+        "--lstm-log-interval",
+        type=float,
+        default=1.0,
+        help="Interval in seconds between LSTM prediction log entries",
+    )
+    parser.add_argument(
+        "--use-lstm-target",
+        action="store_true",
+        help="Use LSTM-predicted targets when controlling actors",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
 
