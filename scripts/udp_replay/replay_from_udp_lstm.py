@@ -14,9 +14,12 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 import carla
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 LOGGER = logging.getLogger(__name__)
 
@@ -436,6 +439,158 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
         yaw=yaw,
         yaw_provided=yaw_provided,
     )
+
+
+class TrajLSTM(nn.Module):
+    """LSTM-based trajectory predictor for x/y coordinates."""
+
+    def __init__(
+        self,
+        *,
+        feature_dim: int = 2,
+        hidden_dim: int = 64,
+        num_layers: int = 1,
+        horizon_steps: int = 5,
+    ) -> None:
+        super().__init__()
+        self.horizon_steps = horizon_steps
+        self.lstm = nn.LSTM(
+            input_size=feature_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True
+        )
+        self.decoder = nn.Linear(hidden_dim, feature_dim)
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        """Predict future coordinates from a batch of history sequences."""
+
+        _, hidden = self.lstm(history)
+        step_input = history[:, -1:, :]
+        predictions: List[torch.Tensor] = []
+
+        for _ in range(self.horizon_steps):
+            step_output, hidden = self.lstm(step_input, hidden)
+            coords = self.decoder(step_output[:, -1, :])
+            predictions.append(coords)
+            step_input = coords.unsqueeze(1)
+
+        return torch.stack(predictions, dim=1)
+
+
+class LSTMBuffers:
+    """Sliding-window buffers for preparing history/horizon training samples."""
+
+    def __init__(self, history_steps: int, horizon_steps: int) -> None:
+        self.history_steps = history_steps
+        self.horizon_steps = horizon_steps
+        self._positions: List[Tuple[float, float]] = []
+
+    def add_observation(self, x: float, y: float) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Add a point and return a training sample when enough data is present."""
+
+        self._positions.append((float(x), float(y)))
+        max_len = self.history_steps + self.horizon_steps
+        if len(self._positions) > max_len:
+            self._positions.pop(0)
+
+        if len(self._positions) < max_len:
+            return None
+
+        history_start = len(self._positions) - max_len
+        history = self._positions[history_start : history_start + self.history_steps]
+        horizon = self._positions[-self.horizon_steps :]
+        history_tensor = torch.tensor(history, dtype=torch.float32)
+        horizon_tensor = torch.tensor(horizon, dtype=torch.float32)
+        return history_tensor, horizon_tensor
+
+    def latest_history(self) -> Optional[torch.Tensor]:
+        """Return the latest history window if available."""
+
+        if len(self._positions) < self.history_steps:
+            return None
+        history = self._positions[-self.history_steps :]
+        return torch.tensor(history, dtype=torch.float32)
+
+
+class OnlineLSTMPredictor:
+    """Online trainer/predictor that maintains buffers per tracked object."""
+
+    def __init__(
+        self,
+        *,
+        history_steps: int = 8,
+        horizon_steps: int = 12,
+        learning_rate: float = 1e-3,
+        batch_size: int = 32,
+        max_epochs: int = 10,
+    ) -> None:
+        self.history_steps = history_steps
+        self.horizon_steps = horizon_steps
+        self.model = TrajLSTM(horizon_steps=horizon_steps)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.criterion = nn.MSELoss()
+        self.batch_size = batch_size
+        self.max_epochs = max_epochs
+        self._buffers: Dict[str, LSTMBuffers] = {}
+        self._train_inputs: List[torch.Tensor] = []
+        self._train_targets: List[torch.Tensor] = []
+        self._trained = False
+
+    def _buffer_for(self, object_id: str) -> LSTMBuffers:
+        if object_id not in self._buffers:
+            self._buffers[object_id] = LSTMBuffers(self.history_steps, self.horizon_steps)
+        return self._buffers[object_id]
+
+    def record_observation(self, object_id: str, x: float, y: float) -> None:
+        """Record a new observation and store training samples when ready."""
+
+        buffer = self._buffer_for(object_id)
+        sample = buffer.add_observation(x, y)
+        if sample is not None:
+            history, horizon = sample
+            self._train_inputs.append(history)
+            self._train_targets.append(horizon)
+
+    def train(self) -> Optional[float]:
+        """Train the LSTM model with accumulated samples."""
+
+        if not self._train_inputs:
+            return None
+
+        inputs = torch.stack(self._train_inputs)
+        targets = torch.stack(self._train_targets)
+        dataset = TensorDataset(inputs, targets)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        self.model.train()
+        last_loss = 0.0
+        for _ in range(self.max_epochs):
+            epoch_loss = 0.0
+            for batch_history, batch_target in loader:
+                self.optimizer.zero_grad()
+                preds = self.model(batch_history)
+                loss = self.criterion(preds, batch_target)
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += loss.item() * batch_history.size(0)
+
+            last_loss = epoch_loss / len(dataset)
+
+        self._trained = True
+        return last_loss
+
+    def predict(self, object_id: str) -> Optional[Sequence[Tuple[float, float]]]:
+        """Predict future coordinates for a tracked object."""
+
+        if not self._trained:
+            return None
+
+        history = self._buffer_for(object_id).latest_history()
+        if history is None:
+            return None
+
+        self.model.eval()
+        with torch.no_grad():
+            preds = self.model(history.unsqueeze(0)).squeeze(0)
+        return [(float(x), float(y)) for x, y in preds]
 
 
 class EntityManager:
