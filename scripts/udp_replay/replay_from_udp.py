@@ -505,12 +505,7 @@ class EntityManager:
         distance_sq = dx * dx + dy * dy
         yaw = actor_transform.rotation.yaw
         if state.yaw_provided:
-            if newly_spawned:
-                yaw = state.yaw
-            else:
-                delta_yaw = ((state.yaw - yaw + 180.0) % 360.0) - 180.0
-                if abs(delta_yaw) < 60.0:
-                    yaw = state.yaw
+            yaw = state.yaw
         elif self._enable_completion and distance_sq > 1e-8:
             yaw = math.degrees(math.atan2(dy, dx))
 
