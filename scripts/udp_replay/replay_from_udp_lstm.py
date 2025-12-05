@@ -191,6 +191,7 @@ class EntityRecord:
     last_observed_location: Optional[carla.Location] = None
     last_observed_time: Optional[float] = None
     target: Optional[carla.Location] = None
+    predicted_target: Optional[carla.Location] = None
     previous_location: Optional[carla.Location] = None
     last_observed_location: Optional[carla.Location] = None
     last_observed_time: Optional[float] = None
@@ -644,6 +645,7 @@ class EntityManager:
         self._entities: Dict[str, EntityRecord] = {}
         self._timing_enabled = enable_timing
         self._enable_completion = enable_completion
+        self._use_lstm_target = use_lstm_target
         self._frame_start_ns: Optional[int] = None
         self._actor_timings: List[Tuple[str, int]] = []
         self._timing_output = timing_output
