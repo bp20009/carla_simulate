@@ -128,6 +128,7 @@ class EntityRecord:
     last_observed_location: Optional[carla.Location] = None
     last_observed_time: Optional[float] = None
     target: Optional[carla.Location] = None
+    predicted_target: Optional[carla.Location] = None
     previous_location: Optional[carla.Location] = None
     last_observed_location: Optional[carla.Location] = None
     last_observed_time: Optional[float] = None
