@@ -164,8 +164,8 @@ def plot_trajectories(
 
     if not paper:
         ax.set_title(title)
-    label_fontsize = 14 if paper else None
-    tick_fontsize = 12 if paper else None
+    label_fontsize = 22 if paper else None
+    tick_fontsize = 20 if paper else None
 
     ax.set_xlabel("X [m]", fontsize=label_fontsize)
     ax.set_ylabel("Y [m]", fontsize=label_fontsize)
