@@ -24,8 +24,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, TextIO, Tuple
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.cm import get_cmap
+
+mpl.rcParams["pdf.fonttype"] = 42
+mpl.rcParams["ps.fonttype"] = 42
 
 
 Point = Tuple[float, float, float]  # (frame, x, y)
@@ -227,6 +231,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_argument_parser()
     args = parser.parse_args()
+
+    if args.paper:
+        mpl.rcParams["font.family"] = "Times New Roman"
 
     csv_paths = list(args.csv)
 
