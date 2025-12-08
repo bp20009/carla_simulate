@@ -19,6 +19,9 @@ import carla
 
 LOGGER = logging.getLogger(__name__)
 
+# 秒数だけ外部トラッキングを行い，その後は CARLA の autopilot に制御を渡す
+TRACKING_PHASE_DURATION = 30.0  # 好きな秒数に変えて下さい
+
 
 def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -336,9 +339,38 @@ class EntityManager:
         self._next_frame_sequence = 1
         self._active_frame_sequence: Optional[int] = None
 
+        # autopilot 有効化済みかどうか
+        self._autopilot_enabled = False
+
     @property
     def timing_enabled(self) -> bool:
         return self._timing_enabled
+
+    def enable_autopilot(self, traffic_manager: carla.TrafficManager) -> None:
+        """現在の vehicle / bicycle アクターを CARLA の autopilot 配下に移行する．"""
+        if self._autopilot_enabled:
+            return
+        self._autopilot_enabled = True
+
+        tm_port = traffic_manager.get_port()
+        for object_id, record in self._entities.items():
+            actor = record.actor
+            if not actor.is_alive:
+                continue
+
+            if record.object_type in {"vehicle", "bicycle"}:
+                # Vehicle のみ set_autopilot が有効なので，安全に呼ぶ
+                try:
+                    actor.set_autopilot(True, tm_port)
+                    LOGGER.info("Enabled autopilot for '%s' (%s)", object_id, record.object_type)
+                except RuntimeError:
+                    LOGGER.warning("Failed to enable autopilot for '%s'", object_id)
+
+                # 以後は自前 PID での制御をやめる
+                record.throttle_pid = None
+                record.steering_pid = None
+
+            # 歩行者は WalkerAIController を使っていないので現状はそのまま
 
     def begin_frame(self) -> None:
         if not self._timing_enabled:
@@ -696,6 +728,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     client.set_timeout(args.timeout)
     world = client.get_world()
     blueprint_library = world.get_blueprint_library()
+
+    # Traffic Manager を取得しておく（autopilot 用）
+    traffic_manager = client.get_trafficmanager()
+    # synchronous_mode のときは Traffic Manager も同期モードに
+    traffic_manager.set_synchronous_mode(True)
+
     timing_file: Optional[TextIO] = None
     if args.measure_update_times:
         output_path = Path(args.timing_output).expanduser()
@@ -721,9 +759,13 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     next_cleanup = start_time
     last_step_time = start_time
 
+    # 追加: トラッキング開始時刻と future モードフラグ
+    has_received_first_data = False
+    tracking_start_time: Optional[float] = None
+    future_mode = False
+
     try:
         with synchronous_mode(world, args.fixed_delta):
-            has_received_first_data = False
             while True:
                 frame_completed = False
                 carla_frame_id: Optional[int] = None
@@ -737,33 +779,53 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         )
                         break
 
-                    while True:
-                        try:
-                            payload, _ = sock.recvfrom(65535)
-                        except socket.timeout:
-                            break
-                        except OSError as exc:
-                            LOGGER.error("Socket error: %s", exc)
-                            return 1
-                        else:
-                            for raw_message in decode_messages(payload):
-                                try:
-                                    state = normalise_message(raw_message)
-                                except MissingTargetDataError as exc:
-                                    LOGGER.warning("Incomplete target data: %s", exc)
-                                    continue
-                                except (TypeError, ValueError) as exc:
-                                    LOGGER.debug("Ignoring invalid message: %s", exc)
-                                    continue
+                    # --- トラッキングフェーズか future フェーズかで処理を切り替える ---
 
-                                applied = manager.apply_state(
-                                    state, time.monotonic()
-                                )
-                                if applied and not has_received_first_data:
-                                    LOGGER.info(
-                                        "Received first complete tracking update"
+                    if not future_mode:
+                        # ===== トラッキングフェーズ =====
+                        while True:
+                            try:
+                                payload, _ = sock.recvfrom(65535)
+                            except socket.timeout:
+                                break
+                            except OSError as exc:
+                                LOGGER.error("Socket error: %s", exc)
+                                return 1
+                            else:
+                                for raw_message in decode_messages(payload):
+                                    try:
+                                        state = normalise_message(raw_message)
+                                    except MissingTargetDataError as exc:
+                                        LOGGER.warning("Incomplete target data: %s", exc)
+                                        continue
+                                    except (TypeError, ValueError) as exc:
+                                        LOGGER.debug("Ignoring invalid message: %s", exc)
+                                        continue
+
+                                    applied = manager.apply_state(
+                                        state, time.monotonic()
                                     )
-                                    has_received_first_data = True
+                                    if applied and not has_received_first_data:
+                                        LOGGER.info(
+                                            "Received first complete tracking update"
+                                        )
+                                        has_received_first_data = True
+                                        tracking_start_time = time.monotonic()
+
+                        # トラッキング開始から一定時間経過したら future モードへ
+                        if (
+                            not future_mode
+                            and has_received_first_data
+                            and tracking_start_time is not None
+                            and (now - tracking_start_time) >= TRACKING_PHASE_DURATION
+                        ):
+                            LOGGER.info(
+                                "Switching to future simulation mode (autopilot) "
+                                "after %.1f seconds of tracking",
+                                TRACKING_PHASE_DURATION,
+                            )
+                            future_mode = True
+                            manager.enable_autopilot(traffic_manager)
 
                     current_time = time.monotonic()
                     elapsed = current_time - last_step_time
@@ -773,14 +835,19 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         current_time = time.monotonic()
                         elapsed = args.fixed_delta
 
-                    manager.step_all(elapsed)
+                    # トラッキングフェーズ中だけ自前 PID で target へ追従
+                    if not future_mode:
+                        manager.step_all(elapsed)
+                    # future_mode のときは Traffic Manager / autopilot が制御するので
+                    # ここでは何もしない（world.tick() だけ進める）
 
                     carla_frame_id = world.tick()
                     frame_completed = True
                     last_step_time = time.monotonic()
 
                     now = last_step_time
-                    if now >= next_cleanup:
+                    # stale アクタの自動 destroy は future_mode では無効化しておく
+                    if not future_mode and now >= next_cleanup:
                         manager.destroy_stale(now, args.stale_timeout)
                         next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
                 finally:
