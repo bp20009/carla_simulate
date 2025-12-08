@@ -10,7 +10,6 @@ import math
 import socket
 import sys
 import time
-from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,35 +114,6 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--enable-lstm",
         action="store_true",
         help="Enable LSTM-based predictions for incoming actors",
-    )
-    parser.add_argument(
-        "--lstm-history-sec",
-        type=float,
-        default=2.0,
-        help="Number of seconds of history to feed into the LSTM model",
-    )
-    parser.add_argument(
-        "--lstm-horizon-min-sec",
-        type=float,
-        default=0.5,
-        help="Minimum prediction horizon in seconds for the LSTM model",
-    )
-    parser.add_argument(
-        "--lstm-horizon-max-sec",
-        type=float,
-        default=2.0,
-        help="Maximum prediction horizon in seconds for the LSTM model",
-    )
-    parser.add_argument(
-        "--lstm-log-interval",
-        type=float,
-        default=1.0,
-        help="Interval in seconds between LSTM prediction log entries",
-    )
-    parser.add_argument(
-        "--use-lstm-target",
-        action="store_true",
-        help="Use LSTM-predicted targets when controlling actors",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -253,101 +223,6 @@ class PredictionResult:
     predicted_target: Optional[carla.Location]
     loss: Optional[float]
     log_loss: bool = False
-
-
-class OnlineLSTMPredictor:
-    def __init__(
-        self,
-        *,
-        fixed_delta_seconds: float,
-        history_size: int,
-        horizon_steps: int,
-        log_interval: int = 0,
-    ) -> None:
-        self._fixed_delta = max(fixed_delta_seconds, 0.0)
-        self._history_size = max(history_size, 1)
-        self._horizon_steps = max(horizon_steps, 0)
-        self._log_interval = max(log_interval, 0)
-        self._histories: Dict[str, Deque[Tuple[float, carla.Location]]] = {}
-        self._predictions: Dict[str, List[Tuple[float, carla.Location]]] = {}
-        self._loss_count = 0
-
-    def observe(
-        self, object_id: str, location: carla.Location, timestamp: float
-    ) -> PredictionResult:
-        previous_predictions = self._predictions.get(object_id)
-        history = self._histories.get(object_id)
-        if history is None:
-            history = deque(maxlen=self._history_size)
-            self._histories[object_id] = history
-
-        history.append((timestamp, location))
-
-        loss = self._compute_loss(previous_predictions, timestamp, location)
-        if loss is not None:
-            self._loss_count += 1
-
-        predicted_path = self._predict_future(history)
-        self._predictions[object_id] = predicted_path
-        predicted_target = predicted_path[-1][1] if predicted_path else None
-        log_loss = (
-            loss is not None
-            and self._log_interval > 0
-            and self._loss_count % self._log_interval == 0
-        )
-
-        return PredictionResult(
-            predicted_target=predicted_target, loss=loss, log_loss=log_loss
-        )
-
-    def _compute_loss(
-        self,
-        predictions: Optional[List[Tuple[float, carla.Location]]],
-        timestamp: float,
-        actual: carla.Location,
-    ) -> Optional[float]:
-        if not predictions:
-            return None
-
-        closest_time, predicted = min(
-            predictions, key=lambda item: abs(item[0] - timestamp)
-        )
-        dx = actual.x - predicted.x
-        dy = actual.y - predicted.y
-        dz = actual.z - predicted.z
-        del closest_time
-        return math.sqrt(dx * dx + dy * dy + dz * dz)
-
-    def _predict_future(
-        self, history: Deque[Tuple[float, carla.Location]]
-    ) -> List[Tuple[float, carla.Location]]:
-        if self._horizon_steps <= 0 or self._fixed_delta <= 0.0:
-            return []
-
-        last_time, last_location = history[-1]
-        vx = vy = vz = 0.0
-        if len(history) >= 2:
-            prev_time, prev_location = history[-2]
-            dt = last_time - prev_time
-            if dt > 0.0:
-                vx = (last_location.x - prev_location.x) / dt
-                vy = (last_location.y - prev_location.y) / dt
-                vz = (last_location.z - prev_location.z) / dt
-
-        predictions: List[Tuple[float, carla.Location]] = []
-        for step in range(1, self._horizon_steps + 1):
-            future_time = last_time + step * self._fixed_delta
-            predictions.append(
-                (
-                    future_time,
-                    carla.Location(
-                        x=last_location.x + vx * step * self._fixed_delta,
-                        y=last_location.y + vy * step * self._fixed_delta,
-                        z=last_location.z + vz * step * self._fixed_delta,
-                    ),
-                )
-            )
-        return predictions
 
 
 def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
@@ -546,47 +421,86 @@ class LSTMBuffers:
 
 
 class OnlineLSTMPredictor:
-    """Online trainer/predictor that maintains buffers per tracked object."""
+    """Online trainer/predictor that maintains buffers per tracked object.
+
+    - run() からは observe(object_id, location, timestamp) を呼ぶだけでOK
+    - observe() 内部で:
+        - 観測を sliding-window バッファに追加
+        - 十分たまったら学習データを貯める
+        - 必要に応じて学習を走らせる
+        - 最新の履歴から将来位置を予測して predicted_target を返す
+    """
 
     def __init__(
         self,
         *,
-        history_steps: int = 8,
-        horizon_steps: int = 12,
+        fixed_delta_seconds: float,
+        history_size: int,
+        horizon_steps: int,
+        log_interval: int = 0,
         learning_rate: float = 1e-3,
         batch_size: int = 32,
-        max_epochs: int = 10,
+        max_epochs: int = 3,
     ) -> None:
-        self.history_steps = history_steps
-        self.horizon_steps = horizon_steps
-        self.model = TrajLSTM(horizon_steps=horizon_steps)
+        self.fixed_delta = float(max(fixed_delta_seconds, 1e-3))
+        self.history_steps = int(max(history_size, 1))
+        self.horizon_steps = int(max(horizon_steps, 1))
+        self.log_interval = max(int(log_interval), 0)
+
+        self.model = TrajLSTM(horizon_steps=self.horizon_steps)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
         self.batch_size = batch_size
         self.max_epochs = max_epochs
+
         self._buffers: Dict[str, LSTMBuffers] = {}
         self._train_inputs: List[torch.Tensor] = []
         self._train_targets: List[torch.Tensor] = []
         self._trained = False
+        self._loss_count = 0
 
     def _buffer_for(self, object_id: str) -> LSTMBuffers:
         if object_id not in self._buffers:
             self._buffers[object_id] = LSTMBuffers(self.history_steps, self.horizon_steps)
         return self._buffers[object_id]
 
-    def record_observation(self, object_id: str, x: float, y: float) -> None:
-        """Record a new observation and store training samples when ready."""
-
+    def observe(
+        self,
+        object_id: str,
+        location: carla.Location,
+        timestamp: float,
+    ) -> PredictionResult:
         buffer = self._buffer_for(object_id)
-        sample = buffer.add_observation(x, y)
+
+        sample = buffer.add_observation(location.x, location.y)
         if sample is not None:
             history, horizon = sample
             self._train_inputs.append(history)
             self._train_targets.append(horizon)
 
-    def train(self) -> Optional[float]:
-        """Train the LSTM model with accumulated samples."""
+        loss_value: Optional[float] = None
+        log_loss = False
+        if self._train_inputs:
+            if self.log_interval == 0 or len(self._train_inputs) % max(self.log_interval, 1) == 0:
+                loss_value = self._train()
+                if loss_value is not None:
+                    self._loss_count += 1
+                    if self.log_interval > 0 and self._loss_count % self.log_interval == 0:
+                        log_loss = True
 
+        predicted_target: Optional[carla.Location] = None
+        future_xy = self._predict_future_xy(object_id, location.z)
+        if future_xy:
+            last_x, last_y, last_z = future_xy[-1]
+            predicted_target = carla.Location(x=last_x, y=last_y, z=last_z)
+
+        return PredictionResult(
+            predicted_target=predicted_target,
+            loss=loss_value,
+            log_loss=log_loss,
+        )
+
+    def _train(self) -> Optional[float]:
         if not self._train_inputs:
             return None
 
@@ -606,26 +520,34 @@ class OnlineLSTMPredictor:
                 loss.backward()
                 self.optimizer.step()
                 epoch_loss += loss.item() * batch_history.size(0)
-
             last_loss = epoch_loss / len(dataset)
 
         self._trained = True
-        return last_loss
+        return float(last_loss)
 
-    def predict(self, object_id: str) -> Optional[Sequence[Tuple[float, float]]]:
-        """Predict future coordinates for a tracked object."""
-
+    def _predict_future_xy(
+        self,
+        object_id: str,
+        current_z: float,
+    ) -> Optional[Sequence[Tuple[float, float, float]]]:
         if not self._trained:
             return None
 
-        history = self._buffer_for(object_id).latest_history()
+        buffer = self._buffer_for(object_id)
+        history = buffer.latest_history()
         if history is None:
             return None
 
         self.model.eval()
         with torch.no_grad():
             preds = self.model(history.unsqueeze(0)).squeeze(0)
-        return [(float(x), float(y)) for x, y in preds]
+
+        future: List[Tuple[float, float, float]] = []
+        for step, coord in enumerate(preds, start=1):
+            x, y = float(coord[0]), float(coord[1])
+            z = float(current_z)
+            future.append((x, y, z))
+        return future
 
 
 class EntityManager:
@@ -1046,12 +968,14 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         use_lstm_target=args.use_lstm_target,
     )
 
-    lstm_predictor = OnlineLSTMPredictor(
-        fixed_delta_seconds=args.fixed_delta,
-        history_size=args.lstm_history,
-        horizon_steps=args.lstm_horizon,
-        log_interval=args.lstm_log_interval,
-    )
+    lstm_predictor: Optional[OnlineLSTMPredictor] = None
+    if args.enable_lstm:
+        lstm_predictor = OnlineLSTMPredictor(
+            fixed_delta_seconds=args.fixed_delta,
+            history_size=args.lstm_history,
+            horizon_steps=args.lstm_horizon,
+            log_interval=args.lstm_log_interval,
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
@@ -1101,7 +1025,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                                 timestamp = time.monotonic()
                                 applied = manager.apply_state(state, timestamp)
-                                if applied:
+                                if applied and lstm_predictor is not None:
                                     prediction = lstm_predictor.observe(
                                         state.object_id,
                                         carla.Location(x=state.x, y=state.y, z=state.z),
