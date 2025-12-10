@@ -110,11 +110,6 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="update_timings.csv",
         help="CSV file that stores frame and actor update timings",
     )
-    parser.add_argument(
-        "--enable-lstm",
-        action="store_true",
-        help="Enable LSTM-based predictions for incoming actors",
-    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -968,14 +963,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         use_lstm_target=args.use_lstm_target,
     )
 
-    lstm_predictor: Optional[OnlineLSTMPredictor] = None
-    if args.enable_lstm:
-        lstm_predictor = OnlineLSTMPredictor(
-            fixed_delta_seconds=args.fixed_delta,
-            history_size=args.lstm_history,
-            horizon_steps=args.lstm_horizon,
-            log_interval=args.lstm_log_interval,
-        )
+    lstm_predictor = OnlineLSTMPredictor(
+        fixed_delta_seconds=args.fixed_delta,
+        history_size=args.lstm_history,
+        horizon_steps=args.lstm_horizon,
+        log_interval=args.lstm_log_interval,
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
@@ -1025,7 +1018,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                                 timestamp = time.monotonic()
                                 applied = manager.apply_state(state, timestamp)
-                                if applied and lstm_predictor is not None:
+                                if applied:
                                     prediction = lstm_predictor.observe(
                                         state.object_id,
                                         carla.Location(x=state.x, y=state.y, z=state.z),
