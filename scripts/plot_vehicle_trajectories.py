@@ -7,7 +7,8 @@ files. When merging runs, the script prefers the ``carla_actor_id`` column when
 present (falling back to ``id``) to avoid conflicts from per-file numbering.
 It also understands the optional ``control_mode`` column to color trajectories
 by their driving source (e.g., autopilot vs. direct control) when provided,
-using consistent colors for common mode names::
+using consistent colors for common mode names (and falling back to a "mixed"
+bucket if multiple values appear for the same actor)::
 
     python plot_vehicle_trajectories.py run1.csv run2.csv
     python plot_vehicle_trajectories.py --dir logs/
@@ -26,6 +27,7 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, TextIO, Tuple
+import warnings
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -89,6 +91,8 @@ def load_trajectories(
     actor_types: Dict[TrajectoryKey, str] = {}
     control_modes: Dict[TrajectoryKey, str] = {}
 
+    mismatched_control_modes: set[TrajectoryKey] = set()
+
     for csv_path in csv_paths:
         with _open_with_fallback(csv_path, newline="") as fh:
             reader = csv.DictReader(fh)
@@ -114,14 +118,23 @@ def load_trajectories(
 
                 if has_control_mode:
                     control_mode = row["control_mode"]
-                    if (
-                        traj_key in control_modes
-                        and control_modes[traj_key] != control_mode
-                    ):
-                        raise ValueError(
-                            f"Actor id {actor_id} has inconsistent control modes: "
-                            f"'{control_modes[traj_key]}' vs '{control_mode}' in {csv_path}"
-                        )
+                    if traj_key in control_modes and control_modes[traj_key] != control_mode:
+                        if control_modes[traj_key] != "mixed":
+                            if traj_key not in mismatched_control_modes:
+                                warnings.warn(
+                                    "Actor id %s has multiple control modes in %s: '%s' vs '%s'. "
+                                    "Using 'mixed' to plot."
+                                    % (
+                                        actor_id,
+                                        csv_path,
+                                        control_modes[traj_key],
+                                        control_mode,
+                                    )
+                                )
+                                mismatched_control_modes.add(traj_key)
+                            control_mode = "mixed"
+                        else:
+                            control_mode = "mixed"
                     control_modes[traj_key] = control_mode
 
                 trajectories[traj_key].append((frame, x, y))
