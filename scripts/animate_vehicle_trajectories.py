@@ -101,7 +101,7 @@ def animate_trajectories(
     dpi: int,
     title: str,
 ) -> None:
-    trajectories, actor_types = load_trajectories(csv_path, allowed_kinds)
+    trajectories, actor_types, _ = load_trajectories(csv_path, allowed_kinds)
     if not trajectories:
         raise SystemExit("No trajectories matched the provided filters.")
 
