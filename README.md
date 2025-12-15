@@ -5,6 +5,8 @@
 
 `scripts/vehicle_state_stream.py` exposes a lightweight CLI for watching the world state in an existing CARLA simulation. It assigns a stable identifier to every `vehicle.*` actor discovered in the world and writes a CSV row per vehicle for each frame received from the simulator.
 
+The stream can also merge per-actor control mode hints produced by the UDP replay utility. When a control state file is provided, each CSV row will include whether the actor is currently being driven by the replay PID controller (`tracking`) or handed off to CARLA's autopilot (`autopilot`). Position and rotation values always come directly from the CARLA server, so the stream reflects authoritative simulator poses even while ingesting external control metadata.
+
 `scripts/plot_vehicle_trajectories.py` reads one of those CSV logs and renders a static XY plot of the actors' motion. You can filter by actor category, annotate actor IDs, and optionally save the figure to disk instead of opening an interactive window.
 
 `scripts/animate_vehicle_trajectories.py` builds on the same CSV data to generate a Matplotlib animation. The command-line tool lets you configure the playback FPS, the amount of history to retain in the position trail, and the output resolution before exporting to formats supported by your Matplotlib installation (e.g. MP4, GIF).
@@ -42,6 +44,23 @@ Key options:
 
 Refer to `python scripts/autopilot_simulation.py --help` for the full list of flags.
 
+### Replaying UDP tracking data with control state sharing
+`scripts/udp_replay/replay_from_udp_carla_pred.py` consumes tracking messages over UDP, mirrors them into the CARLA world, and after a configurable tracking period hands control to CARLA's autopilot. It can optionally mirror each actor's control mode to disk so other tools (like the vehicle state stream) can annotate rows with the current tracking/autopilot status while continuing to read transforms from the simulator.
+
+```bash
+python scripts/udp_replay/replay_from_udp_carla_pred.py \
+  --carla-host 127.0.0.1 \
+  --carla-port 2000 \
+  --listen-port 5005 \
+  --control-state-file /tmp/control_state.json
+```
+
+Key options:
+- `--control-state-file`: Optional JSON file that is updated with a mapping from CARLA actor ID to control flags (`autopilot_enabled`, `control_mode`). Downstream consumers can read this file between frames to detect when the replay switches from PID tracking to autopilot.
+- `--enable-completion`: Fill in missing yaw/heading values based on motion direction when incoming data omits yaw.
+- `--measure-update-times`: Emit per-frame update timing CSV for profiling replay performance.
+- `--max-runtime`: Optional maximum duration before the replay loop exits.
+
 ## Streaming vehicle states to CSV
 Use the vehicle state streaming tool to monitor the traffic in a running simulation:
 
@@ -50,6 +69,7 @@ python scripts/vehicle_state_stream.py \
   --host 127.0.0.1 \
   --port 2000 \
   --interval 0.5 \
+  --control-state-file /tmp/control_state.json \
   --output vehicle_states.csv
 ```
 
@@ -61,6 +81,7 @@ Key options:
 - `--output`: Destination for the CSV log (`-` for `stdout`, default).
 - `--wall-clock`: Add a `wall_time` column with the local UNIX timestamp for each frame.
 - `--frame-elapsed`: Prepend a `frame_elapsed` column with the delta time reported by CARLA between frames.
+- `--control-state-file`: Optional path to a JSON file that overrides the control/autopilot columns per actor. This is intended to be fed by `replay_from_udp_carla_pred.py` so mode transitions are visible in the CSV while poses remain sourced from CARLA.
 
 Each CSV row includes the frame index reported by CARLA, the stable ID assigned by the script, the original CARLA actor ID, the vehicle blueprint, as well as its world-space location and rotation. Because the header is emitted once at startup and the writer flushes after every frame, the command can be safely redirected to a file or piped into another process. When `--wall-clock` is used, the `wall_time` column is prepended to the CSV. The plotting and animation utilities ignore extra columns, so either layout can be used with the downstream tools.
 When `--frame-elapsed` is set, a `frame_elapsed` column is added before any optional timestamp fields, and it contains the delta time reported in each `WorldSnapshot`. Using either or both timestamp flags preserves the same column order across `wait` and `on-tick` modes, so downstream tools can skip unknown columns as before.
