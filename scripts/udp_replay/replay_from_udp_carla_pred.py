@@ -85,6 +85,14 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="update_timings.csv",
         help="CSV file that stores frame and actor update timings",
     )
+    parser.add_argument(
+        "--control-state-file",
+        default=None,
+        help=(
+            "Optional JSON file to mirror current control modes per CARLA actor for "
+            "downstream consumers"
+        ),
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -138,6 +146,31 @@ class EntityRecord:
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
+    autopilot_enabled: bool = False
+    control_mode: str = "direct"
+
+
+class ControlStateBroadcaster:
+    """Persist current control modes so other tools can read them."""
+
+    def __init__(self, path: Optional[str]) -> None:
+        self._path = Path(path) if path else None
+        self._last_payload: Optional[str] = None
+
+    def publish(self, control_state: Mapping[int, Mapping[str, object]]) -> None:
+        if self._path is None:
+            return
+
+        payload = json.dumps(control_state, ensure_ascii=False, sort_keys=True)
+        if payload == self._last_payload:
+            return
+
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(payload, encoding="utf-8")
+            self._last_payload = payload
+        except OSError:
+            LOGGER.warning("Failed to write control state file '%s'", self._path)
 
 
 class PIDController:
@@ -369,8 +402,24 @@ class EntityManager:
                 # 以後は自前 PID での制御をやめる
                 record.throttle_pid = None
                 record.steering_pid = None
+                record.autopilot_enabled = True
+                record.control_mode = "autopilot"
 
             # 歩行者は WalkerAIController を使っていないので現状はそのまま
+
+    def control_state_snapshot(self) -> Dict[int, Dict[str, object]]:
+        """Return a mapping of CARLA actor id to control mode info."""
+
+        snapshot: Dict[int, Dict[str, object]] = {}
+        for record in self._entities.values():
+            actor = record.actor
+            if not actor.is_alive:
+                continue
+            snapshot[actor.id] = {
+                "autopilot_enabled": bool(record.autopilot_enabled),
+                "control_mode": record.control_mode,
+            }
+        return snapshot
 
     def begin_frame(self) -> None:
         if not self._timing_enabled:
@@ -508,6 +557,14 @@ class EntityManager:
                 LOGGER.debug("Unable to enable physics for pedestrian '%s'", state.object_id)
             record.max_speed = 3.0
 
+        if self._autopilot_enabled and object_type in {"vehicle", "bicycle"}:
+            try:
+                actor.set_autopilot(True)
+                record.autopilot_enabled = True
+                record.control_mode = "autopilot"
+            except RuntimeError:
+                LOGGER.warning("Failed to enable autopilot for late join '%s'", state.object_id)
+
         return record
 
     def apply_state(self, state: IncomingState, timestamp: float) -> bool:
@@ -573,6 +630,8 @@ class EntityManager:
         record.last_observed_time = timestamp
         record.previous_location = previous_target
         record.target = new_location
+        if not record.autopilot_enabled:
+            record.control_mode = "tracking"
 
         if timing_start_ns is not None and self._frame_start_ns is not None:
             self._actor_timings.append(
@@ -748,6 +807,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         enable_completion=args.enable_completion,
     )
 
+    control_broadcaster = ControlStateBroadcaster(args.control_state_file)
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
     sock.settimeout(args.poll_interval)
@@ -850,6 +911,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                     if not future_mode and now >= next_cleanup:
                         manager.destroy_stale(now, args.stale_timeout)
                         next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
+
+                    control_broadcaster.publish(manager.control_state_snapshot())
                 finally:
                     if manager.timing_enabled:
                         manager.end_frame(
