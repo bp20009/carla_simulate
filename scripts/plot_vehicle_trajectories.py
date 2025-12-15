@@ -178,6 +178,7 @@ def plot_trajectories(
     mode_colors: Dict[str, tuple[float, float, float, float]] = dict(
         canonical_mode_colors
     )
+    used_mode_handles: Dict[str, tuple[float, float, float, float]] = {}
 
     effective_show_ids = show_ids and not paper
     effective_mark_endpoints = mark_endpoints and not paper
@@ -197,6 +198,7 @@ def plot_trajectories(
             if mode_key not in mode_colors:
                 mode_colors[mode_key] = mode_cmap(len(mode_colors) % mode_cmap.N)
             color = mode_colors[mode_key]
+            used_mode_handles.setdefault(mode_key, color)
         else:
             color = base_color if paper else cmap(idx % cmap.N)
 
@@ -253,6 +255,14 @@ def plot_trajectories(
     ax.grid(True, linestyle="--", alpha=0.4)
     if not paper:
         ax.legend(loc="upper right", fontsize=8)
+    elif control_modes and used_mode_handles:
+        handles = [
+            mpl.lines.Line2D(
+                [], [], color=color, label=mode_name, linewidth=1.8, alpha=0.8
+            )
+            for mode_name, color in sorted(used_mode_handles.items())
+        ]
+        ax.legend(handles=handles, loc="upper right", fontsize=12, frameon=False)
     fig.tight_layout()
     return fig, ax
 
