@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import itertools
 import sys
 import time
@@ -54,6 +55,14 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
             "Include the frame-to-frame delta time reported by CARLA in the CSV output"
         ),
     )
+    parser.add_argument(
+        "--control-state-file",
+        default=None,
+        help=(
+            "Optional JSON file containing autopilot/control mode overrides keyed by "
+            "CARLA actor ID"
+        ),
+    )
     return parser.parse_args(list(argv))
 
 
@@ -89,6 +98,7 @@ def stream_vehicle_states(
     include_wall_clock: bool,
     include_frame_elapsed: bool,
     mode: str,
+    control_state_file: str | None,
 ) -> None:
     """Continuously write vehicle and pedestrian transforms with stable IDs to CSV."""
     client = carla.Client(host, port)
@@ -124,8 +134,41 @@ def stream_vehicle_states(
     throttle_with_interval = interval > 0.0 and mode == "on-tick"
     last_emit_monotonic: float | None = None
 
+    def load_control_overrides() -> Dict[int, Dict[str, object]]:
+        if not control_state_file:
+            return {}
+
+        try:
+            with open(control_state_file, "r", encoding="utf-8") as f:
+                data = f.read()
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            return {}
+
+        if not data.strip():
+            return {}
+
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            return {}
+
+        overrides: Dict[int, Dict[str, object]] = {}
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                try:
+                    actor_id = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(value, dict):
+                    overrides[actor_id] = value
+        return overrides
+
     def handle_snapshot(world_snapshot: carla.WorldSnapshot) -> None:
         nonlocal last_emit_monotonic
+
+        control_overrides = load_control_overrides()
 
         if throttle_with_interval:
             now = time.monotonic()
@@ -150,7 +193,15 @@ def stream_vehicle_states(
 
             transform = actor.get_transform()
             autopilot_enabled = _get_autopilot_state(actor)
-            control_mode = "autopilot" if autopilot_enabled else "direct"
+            override = control_overrides.get(actor_id)
+            if isinstance(override, dict):
+                if "autopilot_enabled" in override:
+                    autopilot_enabled = bool(override["autopilot_enabled"])
+                control_mode = str(override.get("control_mode", "")) or (
+                    "autopilot" if autopilot_enabled else "direct"
+                )
+            else:
+                control_mode = "autopilot" if autopilot_enabled else "direct"
             row_prefix = []
             if include_frame_elapsed:
                 row_prefix.append(frame_elapsed)
@@ -215,6 +266,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.wall_clock,
             args.frame_elapsed,
             args.mode,
+            args.control_state_file,
         )
     finally:
         if close_output:
