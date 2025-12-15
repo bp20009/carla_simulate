@@ -7,8 +7,8 @@ files. When merging runs, the script prefers the ``carla_actor_id`` column when
 present (falling back to ``id``) to avoid conflicts from per-file numbering.
 It also understands the optional ``control_mode`` column to color trajectories
 by their driving source (e.g., autopilot vs. direct control) when provided,
-using consistent colors for common mode names (and falling back to a "mixed"
-bucket if multiple values appear for the same actor)::
+using consistent colors for common mode names. Segments switch color as
+the control mode changes (red for ``autopilot``, blue for ``direct``)::
 
     python plot_vehicle_trajectories.py run1.csv run2.csv
     python plot_vehicle_trajectories.py --dir logs/
@@ -38,7 +38,9 @@ mpl.rcParams["ps.fonttype"] = 42
 
 
 Point = Tuple[float, float, float]  # (frame, x, y)
-TrajectoryKey = Tuple[Path, int]
+
+# (csv_path, actor_id, segment_index)
+TrajectoryKey = Tuple[Path, int, int]
 
 
 def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
@@ -78,25 +80,23 @@ def load_trajectories(
     csv_paths: Iterable[Path],
     allowed_kinds: Iterable[str] | None = None,
 ):
-    """Load trajectories from one or more vehicle_state_stream CSV files.
+    """Load trajectories and split them into segments when control_mode changes."""
 
-    Supports UTF-8 (including BOM) and UTF-16 encodings to accommodate
-    different CARLA logging configurations.
-    """
     allowed_prefixes = None
     if allowed_kinds:
         allowed_prefixes = tuple(f"{kind}." for kind in allowed_kinds)
 
-    trajectories: defaultdict[TrajectoryKey, List[Point]] = defaultdict(list)
-    actor_types: Dict[TrajectoryKey, str] = {}
-    control_modes: Dict[TrajectoryKey, str] = {}
+    # raw_points[(csv_path, actor_id)] = [(frame, x, y, control_mode_or_none), ...]
+    raw_points: defaultdict[tuple[Path, int], list[tuple[float, float, float, str | None]]] = defaultdict(list)
+    raw_actor_types: Dict[tuple[Path, int], str] = {}
 
-    mismatched_control_modes: set[TrajectoryKey] = set()
+    has_any_control_mode = False
 
     for csv_path in csv_paths:
         with _open_with_fallback(csv_path, newline="") as fh:
-            reader = csv.DictReader(fh)
-            has_control_mode = reader.fieldnames and "control_mode" in reader.fieldnames
+            reader = csv.DictReader(_strip_null_bytes(fh))
+            has_control_mode = bool(reader.fieldnames and "control_mode" in reader.fieldnames)
+            has_any_control_mode = has_any_control_mode or has_control_mode
 
             for row in reader:
                 actor_type = row["type"]
@@ -105,45 +105,52 @@ def load_trajectories(
 
                 actor_identifier = row.get("carla_actor_id") or row["id"]
                 actor_id = int(actor_identifier)
-                traj_key: TrajectoryKey = (csv_path, actor_id)
+
+                key = (csv_path, actor_id)
+
+                if key in raw_actor_types and raw_actor_types[key] != actor_type:
+                    raise ValueError(
+                        f"Actor id {actor_id} has inconsistent types: "
+                        f"'{raw_actor_types[key]}' vs '{actor_type}' in {csv_path}"
+                    )
+                raw_actor_types[key] = actor_type
+
                 frame = float(row["frame"])
                 x = float(row["location_x"])
                 y = float(row["location_y"])
+                control_mode = row["control_mode"] if has_control_mode else None
 
-                if traj_key in actor_types and actor_types[traj_key] != actor_type:
-                    raise ValueError(
-                        f"Actor id {actor_id} has inconsistent types: "
-                        f"'{actor_types[traj_key]}' vs '{actor_type}' in {csv_path}"
-                    )
+                raw_points[key].append((frame, x, y, control_mode))
 
-                if has_control_mode:
-                    control_mode = row["control_mode"]
-                    if traj_key in control_modes and control_modes[traj_key] != control_mode:
-                        if control_modes[traj_key] != "mixed":
-                            if traj_key not in mismatched_control_modes:
-                                warnings.warn(
-                                    "Actor id %s has multiple control modes in %s: '%s' vs '%s'. "
-                                    "Using 'mixed' to plot."
-                                    % (
-                                        actor_id,
-                                        csv_path,
-                                        control_modes[traj_key],
-                                        control_mode,
-                                    )
-                                )
-                                mismatched_control_modes.add(traj_key)
-                            control_mode = "mixed"
-                        else:
-                            control_mode = "mixed"
-                    control_modes[traj_key] = control_mode
+    trajectories: defaultdict[TrajectoryKey, List[Point]] = defaultdict(list)
+    actor_types: Dict[TrajectoryKey, str] = {}
+    control_modes: Dict[TrajectoryKey, str] = {}
 
-                trajectories[traj_key].append((frame, x, y))
-                actor_types[traj_key] = actor_type
+    for (csv_path, actor_id), rows in raw_points.items():
+        rows.sort(key=lambda t: t[0])
+
+        seg_idx = 1
+        prev_mode: str | None = None
+
+        for frame, x, y, mode in rows:
+            mode_norm = (mode or "unknown").strip()
+
+            if prev_mode is None:
+                prev_mode = mode_norm
+
+            if mode_norm != prev_mode:
+                seg_idx += 1
+                prev_mode = mode_norm
+
+            seg_key: TrajectoryKey = (csv_path, actor_id, seg_idx)
+            trajectories[seg_key].append((frame, x, y))
+            actor_types[seg_key] = raw_actor_types[(csv_path, actor_id)]
+            control_modes[seg_key] = prev_mode
 
     for points in trajectories.values():
         points.sort(key=lambda item: item[0])
 
-    return trajectories, actor_types, control_modes if control_modes else None
+    return trajectories, actor_types, control_modes if has_any_control_mode else None
 
 
 
@@ -162,9 +169,9 @@ def plot_trajectories(
     base_color = cmap(1)  # slightly darker for better contrast in paper mode
     mode_cmap = get_cmap("tab10")
     canonical_mode_colors = {
-        "autopilot": mode_cmap(2),
-        "direct": mode_cmap(1),
-        "direct_control": mode_cmap(1),
+        "autopilot": (1.0, 0.0, 0.0, 1.0),  # red
+        "direct": (0.0, 0.0, 1.0, 1.0),  # blue
+        "direct_control": (0.0, 0.0, 1.0, 1.0),
         "manual": mode_cmap(0),
         "user": mode_cmap(0),
     }
@@ -176,21 +183,24 @@ def plot_trajectories(
     effective_mark_endpoints = mark_endpoints and not paper
 
     for idx, (traj_key, points) in enumerate(sorted(trajectories.items())):
-        csv_path, actor_id = traj_key
-        xs = [pt[1] for pt in points]
-        ys = [pt[2] for pt in points]
-        if control_modes:
-            raw_mode = control_modes.get(traj_key, "unknown")
-            mode = raw_mode.strip().lower()
-            if mode not in mode_colors:
-                mode_colors[mode] = mode_cmap(len(mode_colors) % mode_cmap.N)
-            color = mode_colors[mode]
-        else:
-            color = base_color if paper else cmap(idx % cmap.N)
-        label = f"{csv_path.name}: {actor_types[traj_key]} (id={actor_id})"
+        csv_path, actor_id, segment_idx = traj_key
+        label = f"{csv_path.name}: {actor_types[traj_key]} (id={actor_id}, seg={segment_idx})"
+        raw_mode = control_modes.get(traj_key, "unknown") if control_modes else None
         if control_modes:
             label += f" [{raw_mode}]"
 
+        xs = [pt[1] for pt in points]
+        ys = [pt[2] for pt in points]
+
+        if control_modes and raw_mode is not None:
+            mode_key = raw_mode.strip().lower() if raw_mode else "unknown"
+            if mode_key not in mode_colors:
+                mode_colors[mode_key] = mode_cmap(len(mode_colors) % mode_cmap.N)
+            color = mode_colors[mode_key]
+        else:
+            color = base_color if paper else cmap(idx % cmap.N)
+
+        last_color = color
         ax.plot(
             xs,
             ys,
@@ -200,16 +210,32 @@ def plot_trajectories(
             alpha=0.8 if paper else 1.0,
         )
 
+        marker_color = last_color
+
         if effective_mark_endpoints:
-            ax.scatter(xs[0], ys[0], color=color, marker="o", s=30, edgecolors="white")
-            ax.scatter(xs[-1], ys[-1], color=color, marker="X", s=50, edgecolors="black")
+            ax.scatter(
+                points[0][1],
+                points[0][2],
+                color=marker_color,
+                marker="o",
+                s=30,
+                edgecolors="white",
+            )
+            ax.scatter(
+                points[-1][1],
+                points[-1][2],
+                color=marker_color,
+                marker="X",
+                s=50,
+                edgecolors="black",
+            )
 
         if effective_show_ids:
             ax.text(
-                xs[-1],
-                ys[-1],
+                points[-1][1],
+                points[-1][2],
                 f"{csv_path.name}:{actor_id}",
-                color=color,
+                color=marker_color,
                 fontsize=8,
             )
 

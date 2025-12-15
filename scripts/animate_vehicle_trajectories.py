@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
@@ -101,9 +102,19 @@ def animate_trajectories(
     dpi: int,
     title: str,
 ) -> None:
-    trajectories, actor_types, _ = load_trajectories(csv_path, allowed_kinds)
-    if not trajectories:
+    raw_trajectories, raw_actor_types, _ = load_trajectories(csv_path, allowed_kinds)
+    if not raw_trajectories:
         raise SystemExit("No trajectories matched the provided filters.")
+
+    trajectories: Dict[int, List[Point]] = defaultdict(list)
+    actor_types: Dict[int, str] = {}
+
+    for (csv_file, actor_id, _segment_idx), points in raw_trajectories.items():
+        trajectories[actor_id].extend(points)
+        actor_types.setdefault(actor_id, raw_actor_types[(csv_file, actor_id, _segment_idx)])
+
+    for points in trajectories.values():
+        points.sort(key=lambda item: item[0])
 
     frame_sequence = compute_frame_sequence(trajectories)
 
