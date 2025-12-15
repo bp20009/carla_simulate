@@ -1,26 +1,26 @@
-# CARLA Simulation Utilities
+# CARLAシミュレーション用ユーティリティ
 
-## Introduction
-`scripts/autopilot_simulation.py` provides a convenient way to launch an autopilot scenario in CARLA. The script connects to a running CARLA server, spawns vehicles with autopilot enabled, and continuously records their trajectories. Each run produces structured trajectory logs that can be inspected or visualised for further analysis.
+## 概要
+`scripts/autopilot_simulation.py` は、CARLAでオートパイロットシナリオを手軽に起動するスクリプトです。実行中のCARLAサーバに接続し、オートパイロットを有効にした車両をスポーンして軌跡を継続的に記録します。各実行では構造化された軌跡ログが生成され、確認や可視化に利用できます。
 
-`scripts/vehicle_state_stream.py` exposes a lightweight CLI for watching the world state in an existing CARLA simulation. It assigns a stable identifier to every `vehicle.*` actor discovered in the world and writes a CSV row per vehicle for each frame received from the simulator.
+`scripts/vehicle_state_stream.py` は、既存のCARLAシミュレーション内の世界状態を監視するための軽量CLIです。ワールド内のすべての `vehicle.*` アクターに安定した識別子を割り当て、受信した各フレームごとに車両単位のCSV行を出力します。
 
-The stream can also merge per-actor control mode hints produced by the UDP replay utility. When a control state file is provided, each CSV row will include whether the actor is currently being driven by the replay PID controller (`tracking`) or handed off to CARLA's autopilot (`autopilot`). Position and rotation values always come directly from the CARLA server, so the stream reflects authoritative simulator poses even while ingesting external control metadata.
+このストリームは、UDPリプレイスクリプトが生成するアクターごとの制御モード情報も取り込めます。制御状態ファイルが与えられた場合、各CSV行にはPID制御による追従中（`tracking`）かCARLAのオートパイロットへ切り替わったか（`autopilot`）が記録されます。位置と回転は常にCARLAサーバから直接取得するため、外部の制御メタデータを取り込んでも、ストリームにはシミュレータの正しい姿勢が反映されます。
 
-`scripts/plot_vehicle_trajectories.py` reads one of those CSV logs and renders a static XY plot of the actors' motion. You can filter by actor category, annotate actor IDs, and optionally save the figure to disk instead of opening an interactive window.
+`scripts/plot_vehicle_trajectories.py` は、上記CSVログを読み込み静的なXYプロットとして描画します。アクター種別によるフィルタ、アクターIDの注釈、インタラクティブ表示の代わりにファイルへ保存するオプションなどを備えています。
 
-`scripts/animate_vehicle_trajectories.py` builds on the same CSV data to generate a Matplotlib animation. The command-line tool lets you configure the playback FPS, the amount of history to retain in the position trail, and the output resolution before exporting to formats supported by your Matplotlib installation (e.g. MP4, GIF).
+`scripts/animate_vehicle_trajectories.py` は同じCSVデータを用いてMatplotlibアニメーションを生成します。CLIでは再生FPS、軌跡に残す履歴長、出力解像度などを設定でき、環境で利用可能なフォーマット（例: MP4, GIF）にエクスポートできます。
 
-## Prerequisites
-- A running CARLA 0.10 server accessible from the machine executing the script.
-- Python dependencies:
-- `carla`
-- `matplotlib` (required for the plotting and animation tools)
-- `pillow` (optional, enables GIF export in the animation script)
-- A working `ffmpeg` binary on your `PATH` for MP4 export from Matplotlib (optional but recommended)
+## 事前準備
+- 実行マシンからアクセス可能なCARLA 0.10サーバ
+- Python依存関係:
+  - `carla`
+  - `matplotlib`（プロット・アニメーションツールに必要）
+  - `pillow`（任意。アニメーションをGIF出力する場合に必要）
+- MatplotlibでMP4を出力する場合は、`PATH`上にある`ffmpeg`バイナリ（任意だが推奨）
 
-## Usage
-Run the autopilot simulation script with the desired connection and scenario parameters:
+## 使い方
+接続先やシナリオのパラメータを指定してオートパイロットシミュレーションスクリプトを実行します。
 
 ```bash
 python scripts/autopilot_simulation.py \
@@ -33,19 +33,19 @@ python scripts/autopilot_simulation.py \
   --plot-trajectories
 ```
 
-Key options:
-- `--host` / `--port`: CARLA server address (default: `127.0.0.1:2000`).
-- `--vehicles`: Number of autopilot vehicles to spawn (default: 10).
-- `--duration`: Duration of the simulation in seconds (default: 60).
-- `--output-dir`: Directory for generated outputs (default: `outputs`).
-- `--log-level`: Logging verbosity (`DEBUG`, `INFO`, `WARNING`, etc.).
-- `--plot-trajectories`: Enable generation of trajectory plots (requires `matplotlib`).
-- `--no-save-json`: Disable JSON export if you only need CSV logs.
+主なオプション:
+- `--host` / `--port`: CARLAサーバのアドレス（デフォルト: `127.0.0.1:2000`）。
+- `--vehicles`: スポーンするオートパイロット車両数（デフォルト: 10）。
+- `--duration`: シミュレーション時間（秒、デフォルト: 60）。
+- `--output-dir`: 生成物の保存先ディレクトリ（デフォルト: `outputs`）。
+- `--log-level`: ログの詳細度（`DEBUG`、`INFO`、`WARNING` など）。
+- `--plot-trajectories`: 軌跡プロットの生成を有効化（`matplotlib`が必要）。
+- `--no-save-json`: CSVのみ必要な場合はJSON出力を無効化。
 
-Refer to `python scripts/autopilot_simulation.py --help` for the full list of flags.
+全オプションは `python scripts/autopilot_simulation.py --help` を参照してください。
 
-### Replaying UDP tracking data with control state sharing
-`scripts/udp_replay/replay_from_udp_carla_pred.py` consumes tracking messages over UDP, mirrors them into the CARLA world, and after a configurable tracking period hands control to CARLA's autopilot. It can optionally mirror each actor's control mode to disk so other tools (like the vehicle state stream) can annotate rows with the current tracking/autopilot status while continuing to read transforms from the simulator.
+### UDPトラッキングデータのリプレイと制御状態共有
+`scripts/udp_replay/replay_from_udp_carla_pred.py` は、UDP経由で受信したトラッキングメッセージをCARLAワールドに反映し、設定した追従時間の後にCARLAのオートパイロットへ制御を引き継ぎます。任意で各アクターの制御モードをファイルへ書き出し、車両状態ストリームなどが追従/オートパイロットの切り替えを検出できるようにします。
 
 ```bash
 python scripts/udp_replay/replay_from_udp_carla_pred.py \
@@ -55,14 +55,14 @@ python scripts/udp_replay/replay_from_udp_carla_pred.py \
   --control-state-file /tmp/control_state.json
 ```
 
-Key options:
-- `--control-state-file`: Optional JSON file that is updated with a mapping from CARLA actor ID to control flags (`autopilot_enabled`, `control_mode`). Downstream consumers can read this file between frames to detect when the replay switches from PID tracking to autopilot.
-- `--enable-completion`: Fill in missing yaw/heading values based on motion direction when incoming data omits yaw.
-- `--measure-update-times`: Emit per-frame update timing CSV for profiling replay performance.
-- `--max-runtime`: Optional maximum duration before the replay loop exits.
+主なオプション:
+- `--control-state-file`: CARLAアクターIDをキーに、`autopilot_enabled` と `control_mode` を保持するJSONファイルを更新します。リプレイがPID追従からオートパイロットへ切り替わったことを、下流のツールがこのファイルを読むことで検出できます。
+- `--enable-completion`: 受信データにyawが欠落している場合、移動方向からヘディングを補完します。
+- `--measure-update-times`: パフォーマンスプロファイル用にフレームごとの更新時間をCSVで出力します。
+- `--max-runtime`: リプレイループの最大実行時間を指定（任意）。
 
-## Streaming vehicle states to CSV
-Use the vehicle state streaming tool to monitor the traffic in a running simulation:
+## 車両状態をCSVへストリーミング
+実行中のシミュレーションを監視するには、車両状態ストリームツールを使用します。
 
 ```bash
 python scripts/vehicle_state_stream.py \
@@ -73,78 +73,76 @@ python scripts/vehicle_state_stream.py \
   --output vehicle_states.csv
 ```
 
-Key options:
-- `--host` / `--port`: CARLA server address to connect to.
-- `--timeout`: Maximum time to wait for the client connection to establish (seconds).
-- `--interval`: Optional delay (seconds) between snapshots to throttle logging.
-- `--mode`: Choose `wait` (default) to block on `wait_for_tick`, or `on-tick` to register a `World.on_tick` listener.
-- `--output`: Destination for the CSV log (`-` for `stdout`, default).
-- `--wall-clock`: Add a `wall_time` column with the local UNIX timestamp for each frame.
-- `--frame-elapsed`: Prepend a `frame_elapsed` column with the delta time reported by CARLA between frames.
-- `--control-state-file`: Optional path to a JSON file that overrides the control/autopilot columns per actor. This is intended to be fed by `replay_from_udp_carla_pred.py` so mode transitions are visible in the CSV while poses remain sourced from CARLA.
+主なオプション:
+- `--host` / `--port`: 接続先CARLAサーバ。
+- `--timeout`: クライアント接続の最大待ち時間（秒）。
+- `--interval`: ログを間引くためのスナップショット間隔（秒、任意）。
+- `--mode`: `wait`（デフォルト。`wait_for_tick` を使用）または `on-tick`（`World.on_tick` を登録）。
+- `--output`: CSVの出力先（デフォルトは`stdout`、`-`指定）。
+- `--wall-clock`: 各フレームにローカルのUNIX時刻 `wall_time` 列を追加。
+- `--frame-elapsed`: 各 `WorldSnapshot` が報告する経過時間を `frame_elapsed` 列として先頭に追加。
+- `--control-state-file`: アクターごとの制御/オートパイロット状態を上書きするJSONファイルのパス。`replay_from_udp_carla_pred.py` から供給されることを想定しており、ポーズはCARLAから取得しつつ、CSVでモード遷移を可視化できます。
 
-Each CSV row includes the frame index reported by CARLA, the stable ID assigned by the script, the original CARLA actor ID, the vehicle blueprint, as well as its world-space location and rotation. Because the header is emitted once at startup and the writer flushes after every frame, the command can be safely redirected to a file or piped into another process. When `--wall-clock` is used, the `wall_time` column is prepended to the CSV. The plotting and animation utilities ignore extra columns, so either layout can be used with the downstream tools.
-When `--frame-elapsed` is set, a `frame_elapsed` column is added before any optional timestamp fields, and it contains the delta time reported in each `WorldSnapshot`. Using either or both timestamp flags preserves the same column order across `wait` and `on-tick` modes, so downstream tools can skip unknown columns as before.
+各CSV行にはCARLAが報告するフレーム番号、スクリプトが付与する安定ID、元のCARLAアクターID、ブループリント、ワールド座標系の位置と回転が含まれます。ヘッダーは起動時に1度だけ出力され、各フレーム後にフラッシュされるため、ファイルへのリダイレクトや別プロセスへのパイプも安全です。`--wall-clock` を使うと `wall_time` 列が先頭に追加されます。プロット/アニメーションツールは余分な列を無視するため、どちらのカラム順でも下流ツールと併用できます。`--frame-elapsed` を指定すると、任意のタイムスタンプ列よりも前に `frame_elapsed` が追加され、各フレーム間のデルタ時間を保持します。`wait` と `on-tick` のどちらでも同じ列順が維持され、従来通り未知の列はスキップできます。
 
-## Visualising trajectories from CSV logs
+## CSVログから軌跡を可視化
 
-### Static plots
-Use the plotting utility to quickly inspect recorded trajectories:
+### 静的プロット
+記録した軌跡を手早く確認するには、プロットユーティリティを使用します。
 
 ```bash
 python scripts/plot_vehicle_trajectories.py vehicle_states.csv --only vehicle --save trajectories.png
 ```
 
-Useful flags:
-- `--only vehicle` or `--only walker`: Filter by actor categories found in the CSV.
-- `--hide-ids`: Suppress text labels for actor IDs on the plot.
-- `--no-endpoints`: Do not mark the start and end points of each trajectory.
-- `--save`: Store the figure on disk instead of showing it interactively.
+便利なフラグ:
+- `--only vehicle` または `--only walker`: CSVに含まれるアクター種別でフィルタ。
+- `--hide-ids`: プロット上のアクターIDテキストを非表示。
+- `--no-endpoints`: 各軌跡の始点・終点を描かない。
+- `--save`: インタラクティブ表示の代わりにファイルへ保存。
 
-### Animated videos
-Generate an animation that shows vehicles moving over time:
+### アニメーション動画
+時間とともに車両が動く様子を表示するにはアニメーションを生成します。
 
 ```bash
 python scripts/animate_vehicle_trajectories.py vehicle_states.csv trajectories.mp4 --fps 15 --history 60
 ```
 
-Useful flags:
-- `--fps`: Playback speed in frames per second.
-- `--history`: Number of past samples to keep in the trail (default: full history).
-- `--dpi`: Resolution passed to Matplotlib when rendering each frame.
-- `--only`: Filter to a subset of actor categories (e.g. only vehicles).
-- Any output format supported by your Matplotlib writers can be used by changing the file extension (e.g. `.gif`).
+便利なフラグ:
+- `--fps`: 再生フレームレート。
+- `--history`: 軌跡に残す過去サンプル数（デフォルト: 全履歴）。
+- `--dpi`: 各フレームを描画する際の解像度（DPI）。
+- `--only`: アクター種別で絞り込み（例: vehicleのみ）。
+- Matplotlibがサポートする任意の出力形式を、拡張子を変えることで利用可能（例: `.gif`）。
 
-## Outputs
-By default, results are saved inside the specified `--output-dir` (or `outputs` if omitted):
-- `trajectories.csv`: Tabular log of sampled vehicle positions, orientations, and velocities over time.
-- `trajectories.json`: JSON representation of the recorded trajectories (omit with `--no-save-json`).
-- `trajectories.png`: Optional plot generated when `--plot-trajectories` is provided.
+## 出力
+デフォルトでは、指定した `--output-dir`（未指定の場合は `outputs`）配下に結果を保存します。
+- `trajectories.csv`: 時系列で記録した車両位置・姿勢・速度の表形式ログ。
+- `trajectories.json`: 軌跡のJSON表現（`--no-save-json` 指定で省略）。
+- `trajectories.png`: `--plot-trajectories` を指定した場合に生成される軌跡プロット。
 
-Each run creates or reuses the output directory; existing files with the same names are overwritten unless the script provides rotation options. Review the generated CSV/JSON files to process trajectory data programmatically, and use the plot to quickly inspect vehicle paths.
+各実行では出力ディレクトリを作成（または再利用）し、同名ファイルが存在する場合はスクリプトがローテーションを提供しない限り上書きされます。生成されたCSV/JSONはプログラム的に処理でき、プロットは軌跡をすばやく確認するのに役立ちます。
 
-## Sending CSV data over UDP
-To stream arbitrary CSV rows to another process over UDP, use `send_data/send_udp_from_csv.py`:
+## CSVデータをUDP送信
+任意のCSV行をUDPで他プロセスへ送信するには `send_data/send_udp_from_csv.py` を使用します。
 
 ```bash
 python send_data/send_udp_from_csv.py data.csv --host 192.168.0.20 --port 5005 --message-column payload
 ```
 
-The script treats each CSV row as a message. By default it serialises the entire row as JSON before transmitting it, but you can
-pick a specific column with `--message-column`. Use `--interval` for a fixed delay between packets or `--delay-column` to use a per-row delay value stored in the CSV.
+スクリプトは各CSV行をメッセージとして扱います。デフォルトでは行全体をJSON化して送信しますが、`--message-column` で特定のカラムを選択できます。`--interval` で一定時間遅延を入れるか、`--delay-column` で行ごとの遅延値を使用できます。
 
-Use `--frame-stride` with the frame-specific sender to skip frames while streaming. For example, `--frame-stride 5` sends only every fifth frame.
+フレーム専用の送信では `--frame-stride` を使ってフレームを間引けます。例: `--frame-stride 5` は5フレームごとに送信します。
 
-When replaying world snapshots captured by `scripts/vehicle_state_stream.py`, first reduce the dataset and then transmit the per-frame payloads:
+`scripts/vehicle_state_stream.py` で取得したワールドスナップショットを送信する場合は、まずデータセットを縮小し、フレームごとのペイロードを送信します。
 
 ```bash
 python scripts/convert_vehicle_state_csv.py vehicle_states.csv vehicle_states_reduced.csv
 python send_data/send_udp_frames_from_csv.py vehicle_states_reduced.csv --host 192.168.0.20 --port 5005
 ```
 
-`send_udp_frames_from_csv.py` expects the reduced CSV layout generated by the converter (columns: `frame`, `id`, `type`, `x`, `y`, `z`) and sends one UDP datagram per frame containing the actors present in that snapshot.
+`send_udp_frames_from_csv.py` は、コンバータが生成する簡易CSV（列: `frame`, `id`, `type`, `x`, `y`, `z`）を前提とし、各フレームのアクター情報を1データグラムにまとめて送信します。
 
-## Replaying tracking data in CARLA
-`scripts/udp_replay/replay_from_udp.py` listens for UDP messages describing actor positions and replays them inside a CARLA world. Run `python scripts/udp_replay/replay_from_udp.py --help` for the full list of options, including:
+## トラッキングデータをCARLAで再生
+`scripts/udp_replay/replay_from_udp.py` は、UDPメッセージで送られるアクター位置情報を受信し、CARLAワールド上で再生します。`python scripts/udp_replay/replay_from_udp.py --help` で利用可能な全オプションを確認してください。
 
-- `--enable-completion`: Default off. When set, the script fills in missing yaw/heading values using the direction of motion (calculated from position deltas).
+- `--enable-completion`: デフォルトでは無効。設定すると、位置差分から移動方向を計算し、欠落したyaw/ヘディングを補完します。
