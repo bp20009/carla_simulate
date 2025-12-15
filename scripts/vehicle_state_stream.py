@@ -57,6 +57,29 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
     return parser.parse_args(list(argv))
 
 
+def _get_autopilot_state(actor: carla.Actor) -> bool:
+    """Return True if the actor reports being under autopilot control.
+
+    CARLA only exposes autopilot on vehicle types; pedestrians and other actors
+    will always report False. Some CARLA versions expose it as a property and
+    others as a method, so both are handled defensively.
+    """
+
+    if not actor.type_id.startswith("vehicle."):
+        return False
+
+    autopilot_attr = getattr(actor, "is_autopilot_enabled", None)
+    try:
+        if callable(autopilot_attr):
+            return bool(autopilot_attr())
+        if autopilot_attr is not None:
+            return bool(autopilot_attr)
+    except RuntimeError:
+        # Actor may have been destroyed between snapshot and query.
+        return False
+    return False
+
+
 def stream_vehicle_states(
     host: str,
     port: int,
@@ -92,6 +115,8 @@ def stream_vehicle_states(
         "rotation_roll",
         "rotation_pitch",
         "rotation_yaw",
+        "autopilot_enabled",
+        "control_mode",
     ]
     writer.writerow(header)
     output.flush()
@@ -124,6 +149,8 @@ def stream_vehicle_states(
                 actor_to_custom_id[actor_id] = next(id_sequence)
 
             transform = actor.get_transform()
+            autopilot_enabled = _get_autopilot_state(actor)
+            control_mode = "autopilot" if autopilot_enabled else "direct"
             row_prefix = []
             if include_frame_elapsed:
                 row_prefix.append(frame_elapsed)
@@ -140,6 +167,8 @@ def stream_vehicle_states(
                 transform.rotation.roll,
                 transform.rotation.pitch,
                 transform.rotation.yaw,
+                autopilot_enabled,
+                control_mode,
             ]
             writer.writerow(row)
             wrote_frame = True
