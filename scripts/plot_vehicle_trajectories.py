@@ -6,7 +6,8 @@ directly, or supply a directory/glob pattern to aggregate trajectories across
 files. When merging runs, the script prefers the ``carla_actor_id`` column when
 present (falling back to ``id``) to avoid conflicts from per-file numbering.
 It also understands the optional ``control_mode`` column to color trajectories
-by their driving source (e.g., autopilot vs. direct control) when provided::
+by their driving source (e.g., autopilot vs. direct control) when provided,
+using consistent colors for common mode names::
 
     python plot_vehicle_trajectories.py run1.csv run2.csv
     python plot_vehicle_trajectories.py --dir logs/
@@ -147,7 +148,16 @@ def plot_trajectories(
     cmap = get_cmap("tab20")
     base_color = cmap(1)  # slightly darker for better contrast in paper mode
     mode_cmap = get_cmap("tab10")
-    mode_colors: Dict[str, tuple[float, float, float, float]] = {}
+    canonical_mode_colors = {
+        "autopilot": mode_cmap(2),
+        "direct": mode_cmap(1),
+        "direct_control": mode_cmap(1),
+        "manual": mode_cmap(0),
+        "user": mode_cmap(0),
+    }
+    mode_colors: Dict[str, tuple[float, float, float, float]] = dict(
+        canonical_mode_colors
+    )
 
     effective_show_ids = show_ids and not paper
     effective_mark_endpoints = mark_endpoints and not paper
@@ -157,7 +167,8 @@ def plot_trajectories(
         xs = [pt[1] for pt in points]
         ys = [pt[2] for pt in points]
         if control_modes:
-            mode = control_modes.get(traj_key, "unknown")
+            raw_mode = control_modes.get(traj_key, "unknown")
+            mode = raw_mode.strip().lower()
             if mode not in mode_colors:
                 mode_colors[mode] = mode_cmap(len(mode_colors) % mode_cmap.N)
             color = mode_colors[mode]
@@ -165,7 +176,7 @@ def plot_trajectories(
             color = base_color if paper else cmap(idx % cmap.N)
         label = f"{csv_path.name}: {actor_types[traj_key]} (id={actor_id})"
         if control_modes:
-            label += f" [{control_modes.get(traj_key, 'unknown')}]"
+            label += f" [{raw_mode}]"
 
         ax.plot(
             xs,
