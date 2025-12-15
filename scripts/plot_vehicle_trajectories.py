@@ -4,7 +4,10 @@
 The script now accepts multiple CSV inputs. You can pass several paths
 directly, or supply a directory/glob pattern to aggregate trajectories across
 files. When merging runs, the script prefers the ``carla_actor_id`` column when
-present (falling back to ``id``) to avoid conflicts from per-file numbering::
+present (falling back to ``id``) to avoid conflicts from per-file numbering.
+It also understands the optional ``control_mode`` column to color trajectories
+by their driving source (e.g., autopilot vs. direct control) when provided,
+using consistent colors for common mode names::
 
     python plot_vehicle_trajectories.py run1.csv run2.csv
     python plot_vehicle_trajectories.py --dir logs/
@@ -84,10 +87,12 @@ def load_trajectories(
 
     trajectories: defaultdict[TrajectoryKey, List[Point]] = defaultdict(list)
     actor_types: Dict[TrajectoryKey, str] = {}
+    control_modes: Dict[TrajectoryKey, str] = {}
 
     for csv_path in csv_paths:
         with _open_with_fallback(csv_path, newline="") as fh:
             reader = csv.DictReader(fh)
+            has_control_mode = reader.fieldnames and "control_mode" in reader.fieldnames
 
             for row in reader:
                 actor_type = row["type"]
@@ -107,19 +112,32 @@ def load_trajectories(
                         f"'{actor_types[traj_key]}' vs '{actor_type}' in {csv_path}"
                     )
 
+                if has_control_mode:
+                    control_mode = row["control_mode"]
+                    if (
+                        traj_key in control_modes
+                        and control_modes[traj_key] != control_mode
+                    ):
+                        raise ValueError(
+                            f"Actor id {actor_id} has inconsistent control modes: "
+                            f"'{control_modes[traj_key]}' vs '{control_mode}' in {csv_path}"
+                        )
+                    control_modes[traj_key] = control_mode
+
                 trajectories[traj_key].append((frame, x, y))
                 actor_types[traj_key] = actor_type
 
     for points in trajectories.values():
         points.sort(key=lambda item: item[0])
 
-    return trajectories, actor_types
+    return trajectories, actor_types, control_modes if control_modes else None
 
 
 
 def plot_trajectories(
     trajectories: Dict[TrajectoryKey, List[Point]],
     actor_types: Dict[TrajectoryKey, str],
+    control_modes: Dict[TrajectoryKey, str] | None,
     show_ids: bool,
     mark_endpoints: bool,
     title: str,
@@ -129,6 +147,17 @@ def plot_trajectories(
     fig, ax = plt.subplots(figsize=(10, 8))
     cmap = get_cmap("tab20")
     base_color = cmap(1)  # slightly darker for better contrast in paper mode
+    mode_cmap = get_cmap("tab10")
+    canonical_mode_colors = {
+        "autopilot": mode_cmap(2),
+        "direct": mode_cmap(1),
+        "direct_control": mode_cmap(1),
+        "manual": mode_cmap(0),
+        "user": mode_cmap(0),
+    }
+    mode_colors: Dict[str, tuple[float, float, float, float]] = dict(
+        canonical_mode_colors
+    )
 
     effective_show_ids = show_ids and not paper
     effective_mark_endpoints = mark_endpoints and not paper
@@ -137,8 +166,17 @@ def plot_trajectories(
         csv_path, actor_id = traj_key
         xs = [pt[1] for pt in points]
         ys = [pt[2] for pt in points]
-        color = base_color if paper else cmap(idx % cmap.N)
+        if control_modes:
+            raw_mode = control_modes.get(traj_key, "unknown")
+            mode = raw_mode.strip().lower()
+            if mode not in mode_colors:
+                mode_colors[mode] = mode_cmap(len(mode_colors) % mode_cmap.N)
+            color = mode_colors[mode]
+        else:
+            color = base_color if paper else cmap(idx % cmap.N)
         label = f"{csv_path.name}: {actor_types[traj_key]} (id={actor_id})"
+        if control_modes:
+            label += f" [{raw_mode}]"
 
         ax.plot(
             xs,
@@ -246,13 +284,14 @@ def main() -> int:
     if not csv_paths:
         parser.error("Provide at least one CSV via positional args, --dir, or --glob.")
 
-    trajectories, actor_types = load_trajectories(csv_paths, args.only)
+    trajectories, actor_types, control_modes = load_trajectories(csv_paths, args.only)
     if not trajectories:
         parser.error("No trajectories matched the provided filters.")
 
     fig, _ = plot_trajectories(
         trajectories,
         actor_types,
+        control_modes,
         show_ids=not args.hide_ids,
         mark_endpoints=not args.no_endpoints,
         title=args.title,
