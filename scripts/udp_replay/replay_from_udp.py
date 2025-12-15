@@ -322,7 +322,7 @@ class EntityManager:
         use_lstm_target: bool = False,
     ) -> None:
         self._world = world
-        self._map = world.get_map()
+        # self._map = world.get_map()
         self._blueprint_library = blueprint_library
         self._entities: Dict[str, EntityRecord] = {}
         self._timing_enabled = enable_timing
