@@ -172,6 +172,7 @@ def plot_trajectories(
         "autopilot": (1.0, 0.0, 0.0, 1.0),  # red
         "direct": (0.0, 0.0, 1.0, 1.0),  # blue
         "direct_control": (0.0, 0.0, 1.0, 1.0),
+        "tracking": mpl.colors.to_rgba("yellowgreen"),
         "manual": mode_cmap(0),
         "user": mode_cmap(0),
     }
