@@ -108,7 +108,9 @@ def main():
     all_id = []
     collision_sensors = []
     csv_f = None
+    csv_w = None
     log_path = None
+    pending_by_frame = None
     client = carla.Client(args.host, args.port)
     client.set_timeout(10.0)
     synchronous_master = False
@@ -212,9 +214,14 @@ def main():
         log_path = os.path.join(os.getcwd(), "collisions.csv")
         csv_f = open(log_path, "w", newline="")
         csv_w = csv.writer(csv_f)
-        csv_w.writerow(["time_sec", "frame", "vehicle_id", "other_id", "other_type", "x", "y", "z", "intensity"])
+        csv_w.writerow([
+            "time_sec", "frame",
+            "vehicle_id", "other_id", "other_type", "other_class",
+            "x", "y", "z",
+            "intensity", "is_accident"
+        ])
 
-        # frame -> time_sec の対応を取る（同期モードなら特に安定）
+        # frame -> time_sec の対応（同期モードなら安定）
         frame_to_time = {"frame": None, "time_sec": None}
 
         def _on_tick(snapshot):
@@ -223,42 +230,114 @@ def main():
 
         world.on_tick(_on_tick)
 
-        collision_sensors = []
+        # ---- accident filtering knobs ----
+        ACCIDENT_THRESHOLD = 150.0       # N*s（vehicle同士）
+        COOLDOWN_SEC = 0.5               # 同一車両の連発抑制
+        VEHICLE_ONLY = True              # vehicle vs vehicle だけ事故扱い
+
+        # 連発抑制：vehicle_id -> last_logged_time
+        last_accident_time = {}
+
+        # 同一フレーム集約： (vehicle_id, frame) -> (best_row, best_intensity)
+        # best_row は CSV に書く1行分（list）
+        pending_by_frame = {}
+        last_flushed_frame = {"frame": -1}
+
+        def _other_class(other_type: str) -> str:
+            s = (other_type or "").lower()
+            if s.startswith("vehicle."):
+                return "vehicle"
+            if s.startswith("walker."):
+                return "walker"
+            if s.startswith("static."):
+                return "static"
+            if s.startswith("traffic."):
+                return "traffic"
+            if s.strip() == "":
+                return "unknown"
+            return "other"
+
+        def flush_until(frame_now: int):
+            """
+            frameが進んだタイミングで，過去フレームの pending を確定出力する．
+            """
+            prev = last_flushed_frame["frame"]
+            if prev < 0:
+                last_flushed_frame["frame"] = frame_now
+                return
+
+            # 1フレームでも進んだら，prevフレームを確定
+            if frame_now > prev:
+                to_delete = []
+                for (vid, f), (row, best_int) in pending_by_frame.items():
+                    if f == prev:
+                        csv_w.writerow(row)
+                        to_delete.append((vid, f))
+                for k in to_delete:
+                    pending_by_frame.pop(k, None)
+                csv_f.flush()
+                last_flushed_frame["frame"] = frame_now
 
         def make_collision_callback(vehicle):
             vehicle_id = vehicle.id
 
             def _on_collision(event):
-                # event.frame は衝突が起きたフレーム
-                frame = event.frame
-
-                # 時刻は直近snapshotから取る（同一フレームで取れることが多い）
-                # 厳密に frame == snapshot.frame にしたければ簡易に一致チェックして，外れたら None にするなど運用可能
+                frame = int(event.frame)
                 t = frame_to_time["time_sec"]
+                if t is None:
+                    # on_tick がまだ来てない等
+                    return
 
-                loc = vehicle.get_transform().location
+                # frameが進んだら過去フレーム分を確定
+                flush_until(frame)
+
                 other = event.other_actor
+                other_id = other.id if other is not None else None
+                other_type = other.type_id if other is not None else ""
+                other_cls = _other_class(other_type)
 
+                # intensity
                 impulse = event.normal_impulse
                 intensity = (impulse.x**2 + impulse.y**2 + impulse.z**2) ** 0.5
 
-                other_id = other.id if other is not None else None
-                other_type = other.type_id if other is not None else None
+                # 位置（衝突時点の車両位置としてはこれが一番取りやすい）
+                loc = vehicle.get_transform().location
 
-                # 標準出力
-                print(
-                    f"[COLLISION] time={t:.3f}s frame={frame} "
-                    f"vehicle_id={vehicle_id} other_id={other_id} "
-                    f"loc=({loc.x:.2f},{loc.y:.2f},{loc.z:.2f}) intensity={intensity:.2f}"
-                )
+                # accident判定
+                is_vehicle_vehicle = (other_cls == "vehicle")
+                is_accident = (intensity >= ACCIDENT_THRESHOLD) and (is_vehicle_vehicle if VEHICLE_ONLY else True)
 
-                # CSV
-                csv_w.writerow([t, frame, vehicle_id, other_id, other_type, loc.x, loc.y, loc.z, intensity])
-                csv_f.flush()
+                # 事故としてログするならクールダウン
+                if is_accident:
+                    last_t = last_accident_time.get(vehicle_id, -1e9)
+                    if (t - last_t) < COOLDOWN_SEC:
+                        return
+                    last_accident_time[vehicle_id] = t
+
+                # pending（同一(vehicle, frame)内で最大intensityだけ残す）
+                row = [
+                    float(t), frame,
+                    vehicle_id, other_id, other_type, other_cls,
+                    float(loc.x), float(loc.y), float(loc.z),
+                    float(intensity), int(is_accident)
+                ]
+                key = (vehicle_id, frame)
+                prev = pending_by_frame.get(key)
+                if prev is None or intensity > prev[1]:
+                    pending_by_frame[key] = (row, intensity)
+
+                # 標準出力は「事故のみ」にする（ログが爆発しないように）
+                if is_accident:
+                    print(
+                        f"[ACCIDENT] time={t:.3f}s frame={frame} "
+                        f"vehicle_id={vehicle_id} other_id={other_id} "
+                        f"loc=({loc.x:.2f},{loc.y:.2f},{loc.z:.2f}) intensity={intensity:.2f}"
+                    )
 
             return _on_collision
 
         # 各車両にセンサを付与
+        collision_sensors = []
         for v in all_vehicle_actors:
             s = world.spawn_actor(collision_bp, carla.Transform(), attach_to=v)
             s.listen(make_collision_callback(v))
@@ -394,6 +473,14 @@ def main():
 
         # close csv
         if csv_f is not None:
+            # flush remaining pending rows before closing csv
+            try:
+                if pending_by_frame is not None and csv_w is not None:
+                    for (vid, f), (row, _) in list(pending_by_frame.items()):
+                        csv_w.writerow(row)
+                    csv_f.flush()
+            except Exception:
+                pass
             csv_f.close()
             print(f"collision log saved to: {log_path}")
 
