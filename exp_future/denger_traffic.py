@@ -8,6 +8,8 @@
 
 """Example script to generate traffic in the simulation"""
 
+import csv
+import os
 import time
 
 import carla
@@ -104,6 +106,11 @@ def main():
     vehicles_list = []
     walkers_list = []
     all_id = []
+    collision_sensors = []
+    csv_f = None
+    csv_w = None
+    log_path = None
+    pending_by_frame = None
     client = carla.Client(args.host, args.port)
     client.set_timeout(10.0)
     synchronous_master = False
@@ -196,11 +203,169 @@ def main():
             else:
                 vehicles_list.append(response.actor_id)
 
+        # -------------------------
+        # Attach collision sensors
+        # -------------------------
+        all_vehicle_actors = world.get_actors(vehicles_list)
+
+        collision_bp = world.get_blueprint_library().find('sensor.other.collision')
+
+        # 衝突ログ（CSV）
+        log_path = os.path.join(os.getcwd(), "collisions.csv")
+        csv_f = open(log_path, "w", newline="")
+        csv_w = csv.writer(csv_f)
+        csv_w.writerow([
+            "time_sec", "frame",
+            "vehicle_id", "other_id", "other_type", "other_class",
+            "x", "y", "z",
+            "intensity", "is_accident"
+        ])
+
+        # frame -> time_sec の対応（同期モードなら安定）
+        frame_to_time = {"frame": None, "time_sec": None}
+
+        def _on_tick(snapshot):
+            frame_to_time["frame"] = snapshot.frame
+            frame_to_time["time_sec"] = snapshot.timestamp.elapsed_seconds
+
+        world.on_tick(_on_tick)
+
+        # ---- accident filtering knobs ----
+        ACCIDENT_THRESHOLD = 150.0       # N*s（vehicle同士）
+        COOLDOWN_SEC = 0.5               # 同一車両の連発抑制
+        VEHICLE_ONLY = True              # vehicle vs vehicle だけ事故扱い
+
+        # 連発抑制：vehicle_id -> last_logged_time
+        last_accident_time = {}
+
+        # 同一フレーム集約： (vehicle_id, frame) -> (best_row, best_intensity)
+        # best_row は CSV に書く1行分（list）
+        pending_by_frame = {}
+        last_flushed_frame = {"frame": -1}
+
+        def _other_class(other_type: str) -> str:
+            s = (other_type or "").lower()
+            if s.startswith("vehicle."):
+                return "vehicle"
+            if s.startswith("walker."):
+                return "walker"
+            if s.startswith("static."):
+                return "static"
+            if s.startswith("traffic."):
+                return "traffic"
+            if s.strip() == "":
+                return "unknown"
+            return "other"
+
+        def flush_until(frame_now: int):
+            """
+            frameが進んだタイミングで，過去フレームの pending を確定出力する．
+            """
+            prev = last_flushed_frame["frame"]
+            if prev < 0:
+                last_flushed_frame["frame"] = frame_now
+                return
+
+            # 1フレームでも進んだら，prevフレームを確定
+            if frame_now > prev:
+                to_delete = []
+                for (vid, f), (row, best_int) in pending_by_frame.items():
+                    if f == prev:
+                        csv_w.writerow(row)
+                        to_delete.append((vid, f))
+                for k in to_delete:
+                    pending_by_frame.pop(k, None)
+                csv_f.flush()
+                last_flushed_frame["frame"] = frame_now
+
+        def make_collision_callback(vehicle):
+            vehicle_id = vehicle.id
+
+            def _on_collision(event):
+                frame = int(event.frame)
+                t = frame_to_time["time_sec"]
+                if t is None:
+                    # on_tick がまだ来てない等
+                    return
+
+                # frameが進んだら過去フレーム分を確定
+                flush_until(frame)
+
+                other = event.other_actor
+                other_id = other.id if other is not None else None
+                other_type = other.type_id if other is not None else ""
+                other_cls = _other_class(other_type)
+
+                # intensity
+                impulse = event.normal_impulse
+                intensity = (impulse.x**2 + impulse.y**2 + impulse.z**2) ** 0.5
+
+                # 位置（衝突時点の車両位置としてはこれが一番取りやすい）
+                loc = vehicle.get_transform().location
+
+                # accident判定
+                is_vehicle_vehicle = (other_cls == "vehicle")
+                is_accident = (intensity >= ACCIDENT_THRESHOLD) and (is_vehicle_vehicle if VEHICLE_ONLY else True)
+
+                # 事故としてログするならクールダウン
+                if is_accident:
+                    last_t = last_accident_time.get(vehicle_id, -1e9)
+                    if (t - last_t) < COOLDOWN_SEC:
+                        return
+                    last_accident_time[vehicle_id] = t
+
+                # pending（同一(vehicle, frame)内で最大intensityだけ残す）
+                row = [
+                    float(t), frame,
+                    vehicle_id, other_id, other_type, other_cls,
+                    float(loc.x), float(loc.y), float(loc.z),
+                    float(intensity), int(is_accident)
+                ]
+                key = (vehicle_id, frame)
+                prev = pending_by_frame.get(key)
+                if prev is None or intensity > prev[1]:
+                    pending_by_frame[key] = (row, intensity)
+
+                # 標準出力は「事故のみ」にする（ログが爆発しないように）
+                if is_accident:
+                    print(
+                        f"[ACCIDENT] time={t:.3f}s frame={frame} "
+                        f"vehicle_id={vehicle_id} other_id={other_id} "
+                        f"loc=({loc.x:.2f},{loc.y:.2f},{loc.z:.2f}) intensity={intensity:.2f}"
+                    )
+
+            return _on_collision
+
+        # 各車両にセンサを付与
+        collision_sensors = []
+        for v in all_vehicle_actors:
+            s = world.spawn_actor(collision_bp, carla.Transform(), attach_to=v)
+            s.listen(make_collision_callback(v))
+            collision_sensors.append(s)
+
         # Set automatic vehicle lights update if specified
         if args.car_lights_on:
             all_vehicle_actors = world.get_actors(vehicles_list)
             for actor in all_vehicle_actors:
                 traffic_manager.update_vehicle_lights(actor, True)
+
+        # Configure a subset of vehicles with more aggressive parameters
+        all_vehicle_actors = world.get_actors(vehicles_list)
+        if len(all_vehicle_actors) > 0:
+            danger_ratio = 0.2
+            num_danger = max(1, int(len(all_vehicle_actors) * danger_ratio))
+            num_danger = min(num_danger, len(all_vehicle_actors))
+            danger_actors = random.choice(list(all_vehicle_actors), size=num_danger, replace=False)
+
+            traffic_manager.global_percentage_speed_difference(0.0)
+
+            for vehicle in danger_actors:
+                traffic_manager.ignore_lights_percentage(vehicle, 80.0)
+                traffic_manager.ignore_vehicles_percentage(vehicle, 60.0)
+                traffic_manager.distance_to_leading_vehicle(vehicle, 0.5)
+
+                if hasattr(traffic_manager, "vehicle_percentage_speed_difference"):
+                    traffic_manager.vehicle_percentage_speed_difference(vehicle, -30.0)
 
         # -------------
         # Spawn Walkers
@@ -286,9 +451,6 @@ def main():
 
         print('spawned %d vehicles and %d walkers, press Ctrl+C to exit.' % (len(vehicles_list), len(walkers_list)))
 
-        # Example of how to use Traffic Manager parameters
-        traffic_manager.global_percentage_speed_difference(30.0)
-
         while True:
             if not args.asynch and synchronous_master:
                 world.tick()
@@ -305,6 +467,23 @@ def main():
             world.apply_settings(settings)
 
         print('\ndestroying %d vehicles' % len(vehicles_list))
+        # destroy collision sensors
+        print('\ndestroying %d collision sensors' % len(collision_sensors))
+        client.apply_batch([carla.command.DestroyActor(x.id) for x in collision_sensors])
+
+        # close csv
+        if csv_f is not None:
+            # flush remaining pending rows before closing csv
+            try:
+                if pending_by_frame is not None and csv_w is not None:
+                    for (vid, f), (row, _) in list(pending_by_frame.items()):
+                        csv_w.writerow(row)
+                    csv_f.flush()
+            except Exception:
+                pass
+            csv_f.close()
+            print(f"collision log saved to: {log_path}")
+
         client.apply_batch([carla.command.DestroyActor(x) for x in vehicles_list])
 
         # stop walker controllers (list is [controller, actor, controller, actor ...])
