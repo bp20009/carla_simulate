@@ -72,7 +72,7 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--enable-completion",
-        action="store_false",
+        action="store_true",
         help=(
             "Fill in missing yaw/heading values from movement direction when incoming data lacks yaw"
         ),
@@ -322,7 +322,7 @@ class EntityManager:
         use_lstm_target: bool = False,
     ) -> None:
         self._world = world
-        self._map = world.get_map()
+        # self._map = world.get_map()
         self._blueprint_library = blueprint_library
         self._entities: Dict[str, EntityRecord] = {}
         self._timing_enabled = enable_timing
