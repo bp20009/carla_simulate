@@ -8,6 +8,8 @@
 
 """Example script to generate traffic in the simulation"""
 
+import csv
+import os
 import time
 
 import carla
@@ -104,6 +106,9 @@ def main():
     vehicles_list = []
     walkers_list = []
     all_id = []
+    collision_sensors = []
+    csv_f = None
+    log_path = None
     client = carla.Client(args.host, args.port)
     client.set_timeout(10.0)
     synchronous_master = False
@@ -196,11 +201,92 @@ def main():
             else:
                 vehicles_list.append(response.actor_id)
 
+        # -------------------------
+        # Attach collision sensors
+        # -------------------------
+        all_vehicle_actors = world.get_actors(vehicles_list)
+
+        collision_bp = world.get_blueprint_library().find('sensor.other.collision')
+
+        # 衝突ログ（CSV）
+        log_path = os.path.join(os.getcwd(), "collisions.csv")
+        csv_f = open(log_path, "w", newline="")
+        csv_w = csv.writer(csv_f)
+        csv_w.writerow(["time_sec", "frame", "vehicle_id", "other_id", "other_type", "x", "y", "z", "intensity"])
+
+        # frame -> time_sec の対応を取る（同期モードなら特に安定）
+        frame_to_time = {"frame": None, "time_sec": None}
+
+        def _on_tick(snapshot):
+            frame_to_time["frame"] = snapshot.frame
+            frame_to_time["time_sec"] = snapshot.timestamp.elapsed_seconds
+
+        world.on_tick(_on_tick)
+
+        collision_sensors = []
+
+        def make_collision_callback(vehicle):
+            vehicle_id = vehicle.id
+
+            def _on_collision(event):
+                # event.frame は衝突が起きたフレーム
+                frame = event.frame
+
+                # 時刻は直近snapshotから取る（同一フレームで取れることが多い）
+                # 厳密に frame == snapshot.frame にしたければ簡易に一致チェックして，外れたら None にするなど運用可能
+                t = frame_to_time["time_sec"]
+
+                loc = vehicle.get_transform().location
+                other = event.other_actor
+
+                impulse = event.normal_impulse
+                intensity = (impulse.x**2 + impulse.y**2 + impulse.z**2) ** 0.5
+
+                other_id = other.id if other is not None else None
+                other_type = other.type_id if other is not None else None
+
+                # 標準出力
+                print(
+                    f"[COLLISION] time={t:.3f}s frame={frame} "
+                    f"vehicle_id={vehicle_id} other_id={other_id} "
+                    f"loc=({loc.x:.2f},{loc.y:.2f},{loc.z:.2f}) intensity={intensity:.2f}"
+                )
+
+                # CSV
+                csv_w.writerow([t, frame, vehicle_id, other_id, other_type, loc.x, loc.y, loc.z, intensity])
+                csv_f.flush()
+
+            return _on_collision
+
+        # 各車両にセンサを付与
+        for v in all_vehicle_actors:
+            s = world.spawn_actor(collision_bp, carla.Transform(), attach_to=v)
+            s.listen(make_collision_callback(v))
+            collision_sensors.append(s)
+
         # Set automatic vehicle lights update if specified
         if args.car_lights_on:
             all_vehicle_actors = world.get_actors(vehicles_list)
             for actor in all_vehicle_actors:
                 traffic_manager.update_vehicle_lights(actor, True)
+
+        # Configure a subset of vehicles with more aggressive parameters
+        all_vehicle_actors = world.get_actors(vehicles_list)
+        if len(all_vehicle_actors) > 0:
+            danger_ratio = 0.2
+            num_danger = max(1, int(len(all_vehicle_actors) * danger_ratio))
+            num_danger = min(num_danger, len(all_vehicle_actors))
+            danger_actors = random.choice(list(all_vehicle_actors), size=num_danger, replace=False)
+
+            traffic_manager.global_percentage_speed_difference(0.0)
+
+            for vehicle in danger_actors:
+                traffic_manager.ignore_lights_percentage(vehicle, 80.0)
+                traffic_manager.ignore_vehicles_percentage(vehicle, 60.0)
+                traffic_manager.distance_to_leading_vehicle(vehicle, 0.5)
+
+                if hasattr(traffic_manager, "vehicle_percentage_speed_difference"):
+                    traffic_manager.vehicle_percentage_speed_difference(vehicle, -30.0)
 
         # -------------
         # Spawn Walkers
@@ -286,9 +372,6 @@ def main():
 
         print('spawned %d vehicles and %d walkers, press Ctrl+C to exit.' % (len(vehicles_list), len(walkers_list)))
 
-        # Example of how to use Traffic Manager parameters
-        traffic_manager.global_percentage_speed_difference(30.0)
-
         while True:
             if not args.asynch and synchronous_master:
                 world.tick()
@@ -305,6 +388,15 @@ def main():
             world.apply_settings(settings)
 
         print('\ndestroying %d vehicles' % len(vehicles_list))
+        # destroy collision sensors
+        print('\ndestroying %d collision sensors' % len(collision_sensors))
+        client.apply_batch([carla.command.DestroyActor(x.id) for x in collision_sensors])
+
+        # close csv
+        if csv_f is not None:
+            csv_f.close()
+            print(f"collision log saved to: {log_path}")
+
         client.apply_batch([carla.command.DestroyActor(x) for x in vehicles_list])
 
         # stop walker controllers (list is [controller, actor, controller, actor ...])
