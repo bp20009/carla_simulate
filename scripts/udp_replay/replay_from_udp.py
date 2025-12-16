@@ -72,7 +72,7 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--enable-completion",
-        action="store_false",
+        action="store_true",
         help=(
             "Fill in missing yaw/heading values from movement direction when incoming data lacks yaw"
         ),

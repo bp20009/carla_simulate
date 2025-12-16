@@ -158,9 +158,6 @@ class EntityRecord:
     target: Optional[carla.Location] = None
     predicted_target: Optional[carla.Location] = None
     previous_location: Optional[carla.Location] = None
-    last_observed_location: Optional[carla.Location] = None
-    last_observed_time: Optional[float] = None
-    predicted_target: Optional[carla.Location] = None
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
@@ -764,7 +761,9 @@ class EntityManager:
             new_location,
             carla.Rotation(roll=state.roll, pitch=state.pitch, yaw=yaw),
         )
-        actor.set_transform(transform)
+        should_teleport = newly_spawned or record.object_type not in {"vehicle", "bicycle"}
+        if should_teleport:
+            actor.set_transform(transform)
 
         observed_velocity = carla.Vector3D(0.0, 0.0, 0.0)
         if record.last_observed_location is not None and record.last_observed_time is not None:
@@ -776,11 +775,12 @@ class EntityManager:
                     (new_location.z - record.last_observed_location.z) / dt_obs,
                 )
 
-        try:
-            actor.set_target_velocity(observed_velocity)
-            actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-        except RuntimeError:
-            LOGGER.debug("Unable to set target velocity for actor '%s'", state.object_id)
+        if should_teleport:
+            try:
+                actor.set_target_velocity(observed_velocity)
+                actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            except RuntimeError:
+                LOGGER.debug("Unable to set target velocity for actor '%s'", state.object_id)
 
         if record.throttle_pid is not None:
             record.throttle_pid.reset()
