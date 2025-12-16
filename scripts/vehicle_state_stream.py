@@ -56,6 +56,11 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--include-velocity",
+        action="store_true",
+        help="Include actor velocity vectors in the CSV output",
+    )
+    parser.add_argument(
         "--control-state-file",
         default=None,
         help=(
@@ -97,6 +102,7 @@ def stream_vehicle_states(
     output: TextIO,
     include_wall_clock: bool,
     include_frame_elapsed: bool,
+    include_velocity: bool,
     mode: str,
     control_state_file: str | None,
 ) -> None:
@@ -125,9 +131,10 @@ def stream_vehicle_states(
         "rotation_roll",
         "rotation_pitch",
         "rotation_yaw",
-        "autopilot_enabled",
-        "control_mode",
     ]
+    if include_velocity:
+        header.extend(["velocity_x", "velocity_y", "velocity_z"])
+    header.extend(["autopilot_enabled", "control_mode"])
     writer.writerow(header)
     output.flush()
 
@@ -192,6 +199,10 @@ def stream_vehicle_states(
                 actor_to_custom_id[actor_id] = next(id_sequence)
 
             transform = actor.get_transform()
+            try:
+                velocity = actor.get_velocity() if include_velocity else None
+            except RuntimeError:
+                velocity = None
             autopilot_enabled = _get_autopilot_state(actor)
             override = control_overrides.get(actor_id)
             if isinstance(override, dict):
@@ -218,9 +229,16 @@ def stream_vehicle_states(
                 transform.rotation.roll,
                 transform.rotation.pitch,
                 transform.rotation.yaw,
-                autopilot_enabled,
-                control_mode,
             ]
+            if include_velocity:
+                row.extend(
+                    [
+                        velocity.x if velocity is not None else None,
+                        velocity.y if velocity is not None else None,
+                        velocity.z if velocity is not None else None,
+                    ]
+                )
+            row.extend([autopilot_enabled, control_mode])
             writer.writerow(row)
             wrote_frame = True
 
@@ -265,6 +283,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             output_stream,
             args.wall_clock,
             args.frame_elapsed,
+            args.include_velocity,
             args.mode,
             args.control_state_file,
         )
