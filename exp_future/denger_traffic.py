@@ -131,7 +131,7 @@ def main():
 
         original_settings = world.get_settings()
         settings = world.get_settings()
-        fixed_delta = 0.05
+        fixed_delta = 0.1
         if not args.asynch:
             traffic_manager.set_synchronous_mode(True)
             if not settings.synchronous_mode:
