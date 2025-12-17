@@ -129,17 +129,21 @@ def main():
         if args.seed is not None:
             traffic_manager.set_random_device_seed(args.seed)
 
+        original_settings = world.get_settings()
         settings = world.get_settings()
+        fixed_delta = 0.05
         if not args.asynch:
             traffic_manager.set_synchronous_mode(True)
             if not settings.synchronous_mode:
                 synchronous_master = True
                 settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.05
             else:
                 synchronous_master = False
         else:
-            print("You are currently in asynchronous mode, and traffic might experience some issues")
+            synchronous_master = False
+            print("You are currently in asynchronous mode; applying fixed delta seconds without synchronous stepping")
+
+        settings.fixed_delta_seconds = fixed_delta
 
         if args.no_rendering:
             settings.no_rendering_mode = True
@@ -459,12 +463,8 @@ def main():
 
     finally:
 
-        if not args.asynch and synchronous_master:
-            settings = world.get_settings()
-            settings.synchronous_mode = False
-            settings.no_rendering_mode = False
-            settings.fixed_delta_seconds = None
-            world.apply_settings(settings)
+        if 'original_settings' in locals():
+            world.apply_settings(original_settings)
 
         print('\ndestroying %d vehicles' % len(vehicles_list))
         # destroy collision sensors
