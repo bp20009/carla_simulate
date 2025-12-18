@@ -62,9 +62,9 @@ python scripts/udp_replay/replay_from_udp_carla_pred.py \
 - `--switch-payload-frame`: 受信ペイロードの `frame` が指定値に達した瞬間に、全車両をオートパイロットへ切替えます。`--lead-time-sec` と `--end-payload-frame` を組み合わせると、終了フレームから逆算して切替フレームを自動計算できます。
 - `--end-payload-frame`: 指定フレームに到達したらリプレイを終了します。リードタイム実験のためのバッチ実行に便利です。
 - `--max-runtime`: リプレイループの最大実行時間を指定（任意）。
-- `--actor-log` / `--id-map-file`: パスを指定すると、受信ペイロードの `frame` をキーに各アクターの姿勢と制御状態を `actors.csv` へ記録し、外部IDとCARLAアクターIDの対応表を `id_map.csv` として出力します（未指定なら無効）。`actors.csv` にはデバッグ用の `carla_frame` 列も含まれます。
+- `--actor-log` / `--id-map-file`: パスを指定すると、受信ペイロードの `frame` をキーに各アクターの姿勢と制御状態を `actors.csv` へ記録し、外部IDとCARLAアクターIDの対応表を `id_map.csv` として出力します（未指定なら無効）。`actors.csv` にはデバッグ用の `carla_frame` 列と `frame_source` 列（`payload`/`carla`）が含まれ、未来フェーズでペイロードが途切れてもCARLAフレームで時系列を継続します。
 
-衝突評価のため、車両・自転車アクターには衝突センサが自動付与され、`pred_collisions.csv` に衝突イベントを記録します（ペイロードフレーム、CARLAフレーム、相手ID/種別、接触座標、強度、事故判定を含む）。事故判定には `ACCIDENT_THRESHOLD`、`VEHICLE_ONLY`、`COOLDOWN_SEC` のフィルタが適用され、同一フレーム内の多重衝突は最も強いもののみ残ります。
+衝突評価のため、車両・自転車アクターには衝突センサが自動付与され、`pred_collisions.csv` に衝突イベントを記録します（ペイロードフレーム、ペイロードフレームの由来 `payload_frame_source`、CARLAフレーム、相手ID/種別、接触座標、強度、事故判定を含む）。事故判定には `ACCIDENT_THRESHOLD`、`VEHICLE_ONLY`、`COOLDOWN_SEC` のフィルタが適用され、同一フレーム内の多重衝突は最も強いもののみ残ります。
 
 ## 車両状態をCSVへストリーミング
 実行中のシミュレーションを監視するには、車両状態ストリームツールを使用します。

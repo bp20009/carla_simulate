@@ -240,6 +240,7 @@ class ActorCSVLogger:
                 self._actor_writer.writerow(
                     [
                         "frame",
+                        "frame_source",
                         "carla_frame",
                         "id",
                         "carla_actor_id",
@@ -291,10 +292,15 @@ class ActorCSVLogger:
         carla_frame: Optional[int],
         entities: Mapping[str, EntityRecord],
     ) -> None:
-        if self._actor_writer is None or payload_frame is None:
+        if self._actor_writer is None:
             return
 
         wrote_row = False
+        frame_source = "payload" if payload_frame is not None else "carla"
+        frame_value = payload_frame if payload_frame is not None else carla_frame
+        if frame_value is None:
+            return
+
         for object_id, record in entities.items():
             actor = record.actor
             if not actor.is_alive:
@@ -306,7 +312,8 @@ class ActorCSVLogger:
 
             self._actor_writer.writerow(
                 [
-                    payload_frame,
+                    frame_value,
+                    frame_source,
                     carla_frame,
                     object_id,
                     actor.id,
@@ -547,6 +554,7 @@ class CollisionLogger:
             [
                 "time_sec",
                 "payload_frame",
+                "payload_frame_source",
                 "carla_frame",
                 "actor_id",
                 "actor_type",
@@ -582,21 +590,22 @@ class CollisionLogger:
         return "other"
 
     def _flush_until(self, frame_now: int) -> None:
-        prev = self._last_flushed_frame
-        if prev < 0:
-            self._last_flushed_frame = frame_now
+        if frame_now < 0:
             return
 
-        if frame_now > prev:
-            to_delete: List[Tuple[int, int]] = []
-            for (actor_id, frame), (row, _best_intensity) in self._pending_by_frame.items():
-                if frame == prev:
-                    self._writer.writerow(row)
-                    to_delete.append((actor_id, frame))
-            for key in to_delete:
-                self._pending_by_frame.pop(key, None)
+        to_delete: List[Tuple[int, int]] = []
+        for (actor_id, frame), (row, _best_intensity) in self._pending_by_frame.items():
+            if frame <= frame_now - 1:
+                self._writer.writerow(row)
+                to_delete.append((actor_id, frame))
+
+        for key in to_delete:
+            self._pending_by_frame.pop(key, None)
+
+        if to_delete:
             self._log_file.flush()
-            self._last_flushed_frame = frame_now
+
+        self._last_flushed_frame = max(self._last_flushed_frame, frame_now - 1)
 
     def flush_all(self) -> None:
         if self._pending_by_frame:
@@ -643,20 +652,25 @@ class CollisionLogger:
                     return
                 self._last_accident_time[actor.id] = timestamp
 
+            payload_frame_source = "record"
             payload_frame = record.last_payload_frame
             if payload_frame is None and self._payload_frame_getter is not None:
                 try:
                     payload_frame = self._payload_frame_getter()
+                    payload_frame_source = "getter"
                 except Exception:
                     payload_frame = None
+                    payload_frame_source = "getter"
             if payload_frame is None:
                 payload_frame = carla_frame
+                payload_frame_source = "carla_fallback"
 
             self._flush_until(int(payload_frame))
 
             row = [
                 float(timestamp),
                 payload_frame,
+                payload_frame_source,
                 carla_frame,
                 actor.id,
                 record.object_type,
@@ -1309,6 +1323,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     has_received_first_data = False
     tracking_start_time: Optional[float] = None
     future_mode = False
+    first_frame: Optional[int] = None
+    switch_frame: Optional[int] = None
+    end_frame: Optional[int] = None
 
     try:
         with synchronous_mode(world, args.fixed_delta):
@@ -1329,6 +1346,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                     if not future_mode:
                         # ===== トラッキングフェーズ =====
+                        applied_any = False
                         while True:
                             try:
                                 payload, _ = sock.recvfrom(65535)
@@ -1355,12 +1373,11 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                     applied = manager.apply_state(
                                         state, time.monotonic()
                                     )
-                            if applied and not has_received_first_data:
-                                LOGGER.info(
-                                    "Received first complete tracking update"
-                                )
-                                has_received_first_data = True
-                                tracking_start_time = time.monotonic()
+                                    applied_any = applied_any or applied
+                        if applied_any and not has_received_first_data:
+                            LOGGER.info("Received first complete tracking update")
+                            has_received_first_data = True
+                            tracking_start_time = time.monotonic()
 
                         # 最新 payload_frame を取得した上で判定する
                         current_payload_frame = manager.current_payload_frame
