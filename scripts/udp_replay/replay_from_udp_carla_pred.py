@@ -131,12 +131,12 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "traceability"
         ),
         "--actor-log",
-        default="actors.csv",
-        help="CSV file that stores actor pose states per frame",
+        default=None,
+        help="CSV file path for actor pose states per frame (omit to disable)",
     )
     parser.add_argument(
         "--id-map-file",
-        default="id_map.csv",
+        default=None,
         help="CSV file that maps external object IDs to CARLA actor IDs/types",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
