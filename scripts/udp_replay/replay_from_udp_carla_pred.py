@@ -125,6 +125,7 @@ class IncomingState:
     pitch: float = 0.0
     yaw: float = 0.0
     yaw_provided: bool = False
+    payload_frame: Optional[int] = None
 
 
 class MissingTargetDataError(ValueError):
@@ -148,6 +149,8 @@ class EntityRecord:
     max_speed: float = 10.0
     autopilot_enabled: bool = False
     control_mode: str = "direct"
+    collision_sensor: Optional[carla.Sensor] = None
+    last_payload_frame: Optional[int] = None
 
 
 class ControlStateBroadcaster:
@@ -333,6 +336,17 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
     pitch, _ = _extract_rotation("pitch")
     yaw, yaw_provided = _extract_rotation("yaw")
 
+    payload_frame: Optional[int] = None
+    for candidate in ("frame", "frame_id", "seq", "sequence", "payload_frame"):
+        value = message.get(candidate)
+        if value is None:
+            continue
+        try:
+            payload_frame = int(value)
+            break
+        except (TypeError, ValueError):
+            LOGGER.debug("Invalid payload frame value for key '%s': %r", candidate, value)
+
     return IncomingState(
         object_id=str(object_id),
         object_type=object_type,
@@ -343,7 +357,203 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
         pitch=pitch,
         yaw=yaw,
         yaw_provided=yaw_provided,
+        payload_frame=payload_frame,
     )
+
+
+class CollisionLogger:
+    """Attach collision sensors and persist filtered collision events."""
+
+    ACCIDENT_THRESHOLD = 150.0
+    COOLDOWN_SEC = 0.5
+    VEHICLE_ONLY = True
+
+    def __init__(self, world: carla.World) -> None:
+        self._world = world
+        self._blueprint = world.get_blueprint_library().find("sensor.other.collision")
+        self._log_path = Path("pred_collisions.csv")
+        self._log_file = self._log_path.open("w", newline="")
+        self._writer = csv.writer(self._log_file)
+        self._writer.writerow(
+            [
+                "time_sec",
+                "payload_frame",
+                "carla_frame",
+                "actor_id",
+                "actor_type",
+                "other_id",
+                "other_type",
+                "other_class",
+                "x",
+                "y",
+                "z",
+                "intensity",
+                "is_accident",
+            ]
+        )
+
+        self._pending_by_frame: Dict[Tuple[int, int], Tuple[List[object], float]] = {}
+        self._last_flushed_frame = -1
+        self._last_accident_time: Dict[int, float] = {}
+
+    @staticmethod
+    def _other_class(other_type: str) -> str:
+        s = (other_type or "").lower()
+        if s.startswith("vehicle."):
+            return "vehicle"
+        if s.startswith("walker."):
+            return "walker"
+        if s.startswith("static."):
+            return "static"
+        if s.startswith("traffic."):
+            return "traffic"
+        if s.strip() == "":
+            return "unknown"
+        return "other"
+
+    def _flush_until(self, frame_now: int) -> None:
+        prev = self._last_flushed_frame
+        if prev < 0:
+            self._last_flushed_frame = frame_now
+            return
+
+        if frame_now > prev:
+            to_delete: List[Tuple[int, int]] = []
+            for (actor_id, frame), (row, _best_intensity) in self._pending_by_frame.items():
+                if frame == prev:
+                    self._writer.writerow(row)
+                    to_delete.append((actor_id, frame))
+            for key in to_delete:
+                self._pending_by_frame.pop(key, None)
+            self._log_file.flush()
+            self._last_flushed_frame = frame_now
+
+    def flush_all(self) -> None:
+        if self._pending_by_frame:
+            for row, _ in self._pending_by_frame.values():
+                self._writer.writerow(row)
+            self._pending_by_frame.clear()
+            self._log_file.flush()
+
+    def _make_callback(self, record: EntityRecord):
+        actor = record.actor
+
+        def _on_collision(event: carla.CollisionEvent) -> None:
+            frame = int(event.frame)
+            timestamp = getattr(event, "timestamp", time.monotonic())
+            self._flush_until(frame)
+
+            other = event.other_actor
+            other_id = other.id if other is not None else None
+            other_type = other.type_id if other is not None else ""
+            other_cls = self._other_class(other_type)
+
+            impulse = event.normal_impulse
+            intensity = (impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2) ** 0.5
+
+            contact_point = getattr(event, "contact_point", None)
+            if contact_point is None and hasattr(event, "transform"):
+                try:
+                    contact_point = event.transform.location
+                except Exception:
+                    contact_point = None
+            if contact_point is None:
+                try:
+                    contact_point = actor.get_transform().location
+                except RuntimeError:
+                    contact_point = carla.Location(0.0, 0.0, 0.0)
+
+            is_vehicle_vehicle = other_cls == "vehicle"
+            is_accident = (intensity >= self.ACCIDENT_THRESHOLD) and (
+                is_vehicle_vehicle if self.VEHICLE_ONLY else True
+            )
+
+            if is_accident:
+                last_t = self._last_accident_time.get(actor.id, -1e9)
+                if (timestamp - last_t) < self.COOLDOWN_SEC:
+                    return
+                self._last_accident_time[actor.id] = timestamp
+
+            row = [
+                float(timestamp),
+                record.last_payload_frame,
+                frame,
+                actor.id,
+                record.object_type,
+                other_id,
+                other_type,
+                other_cls,
+                float(contact_point.x),
+                float(contact_point.y),
+                float(contact_point.z),
+                float(intensity),
+                int(is_accident),
+            ]
+            key = (actor.id, frame)
+            prev = self._pending_by_frame.get(key)
+            if prev is None or intensity > prev[1]:
+                self._pending_by_frame[key] = (row, intensity)
+
+            if is_accident:
+                LOGGER.info(
+                    "[ACCIDENT] time=%.3fs frame=%d actor_id=%d other_id=%s "
+                    "loc=(%.2f,%.2f,%.2f) intensity=%.2f",
+                    timestamp,
+                    frame,
+                    actor.id,
+                    str(other_id),
+                    contact_point.x,
+                    contact_point.y,
+                    contact_point.z,
+                    intensity,
+                )
+
+        return _on_collision
+
+    def _cleanup_sensor(self, record: EntityRecord) -> None:
+        sensor = record.collision_sensor
+        if sensor is not None and sensor.is_alive:
+            try:
+                sensor.stop()
+                sensor.destroy()
+            except RuntimeError:
+                LOGGER.debug(
+                    "Failed to destroy collision sensor for actor '%s'", record.actor.id
+                )
+        record.collision_sensor = None
+
+    def ensure_sensor(self, record: EntityRecord) -> None:
+        if record.object_type not in {"vehicle", "bicycle"}:
+            return
+
+        if not record.actor.is_alive:
+            self._cleanup_sensor(record)
+            return
+
+        sensor = record.collision_sensor
+        if sensor is not None and sensor.is_alive:
+            return
+        if sensor is not None:
+            self._cleanup_sensor(record)
+
+        try:
+            sensor_actor = self._world.spawn_actor(
+                self._blueprint, carla.Transform(), attach_to=record.actor
+            )
+        except RuntimeError:
+            LOGGER.debug("Unable to attach collision sensor to actor '%s'", record.actor.id)
+            return
+
+        record.collision_sensor = sensor_actor
+        sensor_actor.listen(self._make_callback(record))
+
+    def ensure_sensors_for_entities(self, records: Iterable[EntityRecord]) -> None:
+        for record in records:
+            self.ensure_sensor(record)
+
+    def shutdown(self) -> None:
+        self.flush_all()
+        self._log_file.close()
 
 
 class EntityManager:
@@ -374,6 +584,10 @@ class EntityManager:
 
         # autopilot 有効化済みかどうか
         self._autopilot_enabled = False
+
+    @property
+    def entities(self) -> Mapping[str, EntityRecord]:
+        return self._entities
 
     @property
     def timing_enabled(self) -> bool:
@@ -536,6 +750,7 @@ class EntityManager:
             last_update=now,
             last_observed_location=initial_observation,
             last_observed_time=now,
+            last_payload_frame=state.payload_frame,
         )
 
         if object_type in {"vehicle", "bicycle"}:
@@ -630,6 +845,8 @@ class EntityManager:
         record.last_observed_time = timestamp
         record.previous_location = previous_target
         record.target = new_location
+        if state.payload_frame is not None:
+            record.last_payload_frame = state.payload_frame
         if not record.autopilot_enabled:
             record.control_mode = "tracking"
 
@@ -654,13 +871,19 @@ class EntityManager:
             if actor.is_alive:
                 LOGGER.info("Destroying stale actor '%s'", object_id)
                 actor.destroy()
-
+            if record.collision_sensor is not None and record.collision_sensor.is_alive:
+                record.collision_sensor.stop()
+                record.collision_sensor.destroy()
+            
     def destroy_all(self) -> None:
         for object_id, record in list(self._entities.items()):
             actor = record.actor
             if actor.is_alive:
                 LOGGER.info("Destroying actor '%s'", object_id)
                 actor.destroy()
+            if record.collision_sensor is not None and record.collision_sensor.is_alive:
+                record.collision_sensor.stop()
+                record.collision_sensor.destroy()
             self._entities.pop(object_id, None)
 
     def step_all(self, dt: float) -> None:
@@ -808,6 +1031,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     )
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
+    collision_logger = CollisionLogger(world)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
@@ -888,6 +1112,10 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             future_mode = True
                             manager.enable_autopilot(traffic_manager)
 
+                    collision_logger.ensure_sensors_for_entities(
+                        manager.entities.values()
+                    )
+
                     current_time = time.monotonic()
                     elapsed = current_time - last_step_time
                     if args.fixed_delta > 0.0:
@@ -923,6 +1151,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         LOGGER.info("Interrupted by user")
     finally:
         manager.destroy_all()
+        collision_logger.shutdown()
         sock.close()
         if timing_file is not None:
             timing_file.close()
