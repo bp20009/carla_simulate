@@ -176,8 +176,6 @@ class EntityRecord:
     target: Optional[carla.Location] = None
     predicted_target: Optional[carla.Location] = None
     previous_location: Optional[carla.Location] = None
-    last_observed_location: Optional[carla.Location] = None
-    last_observed_time: Optional[float] = None
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
