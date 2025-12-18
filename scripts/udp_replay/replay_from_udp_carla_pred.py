@@ -130,6 +130,8 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "Optional JSON file that captures run metadata for experiment "
             "traceability"
         ),
+    )
+    parser.add_argument(
         "--actor-log",
         default=None,
         help="CSV file path for actor pose states per frame (omit to disable)",
