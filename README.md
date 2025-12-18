@@ -45,7 +45,7 @@ python scripts/autopilot_simulation.py \
 全オプションは `python scripts/autopilot_simulation.py --help` を参照してください。
 
 ### UDPトラッキングデータのリプレイと制御状態共有
-`scripts/udp_replay/replay_from_udp_carla_pred.py` は、UDP経由で受信したトラッキングメッセージをCARLAワールドに反映し、設定した追従時間の後にCARLAのオートパイロットへ制御を引き継ぎます。任意で各アクターの制御モードをファイルへ書き出し、車両状態ストリームなどが追従/オートパイロットの切り替えを検出できるようにします。
+`scripts/udp_replay/replay_from_udp_carla_pred.py` は、UDP経由で受信したトラッキングメッセージをCARLAワールドに反映し、設定した条件でCARLAのオートパイロットへ制御を引き継ぎます。受信ペイロードが持つ `frame` を基準に切替タイミングや終了フレームを指定でき、オフライン評価で「何フレーム前に切り替えれば事故を避けられるか」を検証できます。任意で各アクターの制御モードをファイルへ書き出し、車両状態ストリームなどが追従/オートパイロットの切り替えを検出できるようにします。
 
 ```bash
 python scripts/udp_replay/replay_from_udp_carla_pred.py \
@@ -59,7 +59,12 @@ python scripts/udp_replay/replay_from_udp_carla_pred.py \
 - `--control-state-file`: CARLAアクターIDをキーに、`autopilot_enabled` と `control_mode` を保持するJSONファイルを更新します。リプレイがPID追従からオートパイロットへ切り替わったことを、下流のツールがこのファイルを読むことで検出できます。
 - `--enable-completion`: 受信データにyawが欠落している場合、移動方向からヘディングを補完します。
 - `--measure-update-times`: パフォーマンスプロファイル用にフレームごとの更新時間をCSVで出力します。
+- `--switch-payload-frame`: 受信ペイロードの `frame` が指定値に達した瞬間に、全車両をオートパイロットへ切替えます。`--lead-time-sec` と `--end-payload-frame` を組み合わせると、終了フレームから逆算して切替フレームを自動計算できます。
+- `--end-payload-frame`: 指定フレームに到達したらリプレイを終了します。リードタイム実験のためのバッチ実行に便利です。
 - `--max-runtime`: リプレイループの最大実行時間を指定（任意）。
+- `--actor-log` / `--id-map-file`: パスを指定すると、受信ペイロードの `frame` をキーに各アクターの姿勢と制御状態を `actors.csv` へ記録し、外部IDとCARLAアクターIDの対応表を `id_map.csv` として出力します（未指定なら無効）。
+
+衝突評価のため、車両・自転車アクターには衝突センサが自動付与され、`pred_collisions.csv` に衝突イベントを記録します（ペイロードフレーム、CARLAフレーム、相手ID/種別、接触座標、強度、事故判定を含む）。事故判定には `ACCIDENT_THRESHOLD`、`VEHICLE_ONLY`、`COOLDOWN_SEC` のフィルタが適用され、同一フレーム内の多重衝突は最も強いもののみ残ります。
 
 ## 車両状態をCSVへストリーミング
 実行中のシミュレーションを監視するには、車両状態ストリームツールを使用します。

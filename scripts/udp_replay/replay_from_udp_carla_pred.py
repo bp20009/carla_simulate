@@ -119,12 +119,12 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--actor-log",
-        default="actors.csv",
-        help="CSV file that stores actor pose states per frame",
+        default=None,
+        help="CSV file path for actor pose states per frame (omit to disable)",
     )
     parser.add_argument(
         "--id-map-file",
-        default="id_map.csv",
+        default=None,
         help="CSV file that maps external object IDs to CARLA actor IDs/types",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
@@ -176,8 +176,6 @@ class EntityRecord:
     target: Optional[carla.Location] = None
     predicted_target: Optional[carla.Location] = None
     previous_location: Optional[carla.Location] = None
-    last_observed_location: Optional[carla.Location] = None
-    last_observed_time: Optional[float] = None
     throttle_pid: Optional[PIDController] = None
     steering_pid: Optional[PIDController] = None
     max_speed: float = 10.0
