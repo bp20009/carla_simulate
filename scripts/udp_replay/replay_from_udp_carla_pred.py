@@ -63,6 +63,30 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Optional maximum runtime in seconds (0 runs indefinitely)",
     )
     parser.add_argument(
+        "--switch-payload-frame",
+        type=int,
+        default=None,
+        help=(
+            "Payload frame at which to hand control over to autopilot; defaults to "
+            "time-based switch when unset"
+        ),
+    )
+    parser.add_argument(
+        "--end-payload-frame",
+        type=int,
+        default=None,
+        help="Payload frame at which to end the replay; runs indefinitely when unset",
+    )
+    parser.add_argument(
+        "--lead-time-sec",
+        type=float,
+        default=None,
+        help=(
+            "Optional lead time (seconds) used to compute the autopilot switch frame "
+            "when only an end payload frame is provided"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
@@ -106,6 +130,14 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "Optional JSON file that captures run metadata for experiment "
             "traceability"
         ),
+        "--actor-log",
+        default="actors.csv",
+        help="CSV file that stores actor pose states per frame",
+    )
+    parser.add_argument(
+        "--id-map-file",
+        default="id_map.csv",
+        help="CSV file that maps external object IDs to CARLA actor IDs/types",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -139,6 +171,7 @@ class IncomingState:
     pitch: float = 0.0
     yaw: float = 0.0
     yaw_provided: bool = False
+    payload_frame: Optional[int] = None
 
 
 class MissingTargetDataError(ValueError):
@@ -162,6 +195,8 @@ class EntityRecord:
     max_speed: float = 10.0
     autopilot_enabled: bool = False
     control_mode: str = "direct"
+    collision_sensor: Optional[carla.Sensor] = None
+    last_payload_frame: Optional[int] = None
 
 
 class ControlStateBroadcaster:
@@ -186,6 +221,110 @@ class ControlStateBroadcaster:
         except OSError:
             LOGGER.warning("Failed to write control state file '%s'", self._path)
 
+
+class ActorCSVLogger:
+    """Persist per-frame actor transforms and id mappings."""
+
+    def __init__(self, actor_log_path: Optional[str], id_map_path: Optional[str]) -> None:
+        self._actor_path = Path(actor_log_path).expanduser() if actor_log_path else None
+        self._id_map_path = Path(id_map_path).expanduser() if id_map_path else None
+        self._actor_file: Optional[TextIO] = None
+        self._actor_writer: Optional[csv.writer] = None
+        self._id_map: Dict[str, Tuple[int, str]] = {}
+
+        if self._actor_path is not None:
+            try:
+                self._actor_path.parent.mkdir(parents=True, exist_ok=True)
+                self._actor_file = self._actor_path.open("w", newline="")
+                self._actor_writer = csv.writer(self._actor_file)
+                self._actor_writer.writerow(
+                    [
+                        "frame",
+                        "id",
+                        "carla_actor_id",
+                        "type",
+                        "location_x",
+                        "location_y",
+                        "location_z",
+                        "rotation_roll",
+                        "rotation_pitch",
+                        "rotation_yaw",
+                        "autopilot_enabled",
+                        "control_mode",
+                    ]
+                )
+                self._actor_file.flush()
+            except OSError:
+                LOGGER.warning("Failed to open actor log file '%s'", self._actor_path)
+                self._actor_file = None
+                self._actor_writer = None
+
+        if self._id_map_path is not None:
+            try:
+                self._id_map_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                LOGGER.warning("Failed to create id map directory '%s'", self._id_map_path)
+                self._id_map_path = None
+
+    def register_actor(self, object_id: str, actor: carla.Actor) -> None:
+        if self._id_map_path is None:
+            return
+        self._id_map[object_id] = (actor.id, actor.type_id)
+        self._write_id_map()
+
+    def _write_id_map(self) -> None:
+        if self._id_map_path is None:
+            return
+        try:
+            with self._id_map_path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["object_id", "carla_actor_id", "carla_type"])
+                for object_id, (actor_id, actor_type) in sorted(self._id_map.items()):
+                    writer.writerow([object_id, actor_id, actor_type])
+        except OSError:
+            LOGGER.warning("Failed to write id map file '%s'", self._id_map_path)
+
+    def log_frame(self, frame_id: Optional[int], entities: Mapping[str, EntityRecord]) -> None:
+        if self._actor_writer is None or frame_id is None:
+            return
+
+        wrote_row = False
+        for object_id, record in entities.items():
+            actor = record.actor
+            if not actor.is_alive:
+                continue
+            try:
+                transform = actor.get_transform()
+            except RuntimeError:
+                continue
+
+            self._actor_writer.writerow(
+                [
+                    frame_id,
+                    object_id,
+                    actor.id,
+                    actor.type_id,
+                    transform.location.x,
+                    transform.location.y,
+                    transform.location.z,
+                    transform.rotation.roll,
+                    transform.rotation.pitch,
+                    transform.rotation.yaw,
+                    record.autopilot_enabled,
+                    record.control_mode,
+                ]
+            )
+            wrote_row = True
+
+        if wrote_row and self._actor_file is not None:
+            self._actor_file.flush()
+
+    def close(self) -> None:
+        if self._actor_file is not None:
+            self._actor_file.flush()
+            self._actor_file.close()
+            self._actor_file = None
+            self._actor_writer = None
 
 class PIDController:
     """Simple PID controller for throttle and steering outputs."""
@@ -275,6 +414,22 @@ def decode_messages(payload: bytes) -> Iterator[Mapping[str, object]]:
     yield from _iter_message_objects(data)
 
 
+def extract_payload_frame(message: Mapping[str, object]) -> Optional[int]:
+    frame = (
+        message.get("payload_frame")
+        or message.get("frame")
+        or message.get("frame_id")
+    )
+    if frame is None:
+        return None
+
+    try:
+        return int(frame)
+    except (TypeError, ValueError):
+        LOGGER.debug("Invalid payload frame value: %r", frame)
+        return None
+
+
 def normalise_message(message: Mapping[str, object]) -> IncomingState:
     object_id = message.get("id") or message.get("object_id")
     if object_id is None:
@@ -347,6 +502,17 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
     pitch, _ = _extract_rotation("pitch")
     yaw, yaw_provided = _extract_rotation("yaw")
 
+    payload_frame: Optional[int] = None
+    for candidate in ("frame", "frame_id", "seq", "sequence", "payload_frame"):
+        value = message.get(candidate)
+        if value is None:
+            continue
+        try:
+            payload_frame = int(value)
+            break
+        except (TypeError, ValueError):
+            LOGGER.debug("Invalid payload frame value for key '%s': %r", candidate, value)
+
     return IncomingState(
         object_id=str(object_id),
         object_type=object_type,
@@ -357,7 +523,203 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
         pitch=pitch,
         yaw=yaw,
         yaw_provided=yaw_provided,
+        payload_frame=payload_frame,
     )
+
+
+class CollisionLogger:
+    """Attach collision sensors and persist filtered collision events."""
+
+    ACCIDENT_THRESHOLD = 150.0
+    COOLDOWN_SEC = 0.5
+    VEHICLE_ONLY = True
+
+    def __init__(self, world: carla.World) -> None:
+        self._world = world
+        self._blueprint = world.get_blueprint_library().find("sensor.other.collision")
+        self._log_path = Path("pred_collisions.csv")
+        self._log_file = self._log_path.open("w", newline="")
+        self._writer = csv.writer(self._log_file)
+        self._writer.writerow(
+            [
+                "time_sec",
+                "payload_frame",
+                "carla_frame",
+                "actor_id",
+                "actor_type",
+                "other_id",
+                "other_type",
+                "other_class",
+                "x",
+                "y",
+                "z",
+                "intensity",
+                "is_accident",
+            ]
+        )
+
+        self._pending_by_frame: Dict[Tuple[int, int], Tuple[List[object], float]] = {}
+        self._last_flushed_frame = -1
+        self._last_accident_time: Dict[int, float] = {}
+
+    @staticmethod
+    def _other_class(other_type: str) -> str:
+        s = (other_type or "").lower()
+        if s.startswith("vehicle."):
+            return "vehicle"
+        if s.startswith("walker."):
+            return "walker"
+        if s.startswith("static."):
+            return "static"
+        if s.startswith("traffic."):
+            return "traffic"
+        if s.strip() == "":
+            return "unknown"
+        return "other"
+
+    def _flush_until(self, frame_now: int) -> None:
+        prev = self._last_flushed_frame
+        if prev < 0:
+            self._last_flushed_frame = frame_now
+            return
+
+        if frame_now > prev:
+            to_delete: List[Tuple[int, int]] = []
+            for (actor_id, frame), (row, _best_intensity) in self._pending_by_frame.items():
+                if frame == prev:
+                    self._writer.writerow(row)
+                    to_delete.append((actor_id, frame))
+            for key in to_delete:
+                self._pending_by_frame.pop(key, None)
+            self._log_file.flush()
+            self._last_flushed_frame = frame_now
+
+    def flush_all(self) -> None:
+        if self._pending_by_frame:
+            for row, _ in self._pending_by_frame.values():
+                self._writer.writerow(row)
+            self._pending_by_frame.clear()
+            self._log_file.flush()
+
+    def _make_callback(self, record: EntityRecord):
+        actor = record.actor
+
+        def _on_collision(event: carla.CollisionEvent) -> None:
+            frame = int(event.frame)
+            timestamp = getattr(event, "timestamp", time.monotonic())
+            self._flush_until(frame)
+
+            other = event.other_actor
+            other_id = other.id if other is not None else None
+            other_type = other.type_id if other is not None else ""
+            other_cls = self._other_class(other_type)
+
+            impulse = event.normal_impulse
+            intensity = (impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2) ** 0.5
+
+            contact_point = getattr(event, "contact_point", None)
+            if contact_point is None and hasattr(event, "transform"):
+                try:
+                    contact_point = event.transform.location
+                except Exception:
+                    contact_point = None
+            if contact_point is None:
+                try:
+                    contact_point = actor.get_transform().location
+                except RuntimeError:
+                    contact_point = carla.Location(0.0, 0.0, 0.0)
+
+            is_vehicle_vehicle = other_cls == "vehicle"
+            is_accident = (intensity >= self.ACCIDENT_THRESHOLD) and (
+                is_vehicle_vehicle if self.VEHICLE_ONLY else True
+            )
+
+            if is_accident:
+                last_t = self._last_accident_time.get(actor.id, -1e9)
+                if (timestamp - last_t) < self.COOLDOWN_SEC:
+                    return
+                self._last_accident_time[actor.id] = timestamp
+
+            row = [
+                float(timestamp),
+                record.last_payload_frame,
+                frame,
+                actor.id,
+                record.object_type,
+                other_id,
+                other_type,
+                other_cls,
+                float(contact_point.x),
+                float(contact_point.y),
+                float(contact_point.z),
+                float(intensity),
+                int(is_accident),
+            ]
+            key = (actor.id, frame)
+            prev = self._pending_by_frame.get(key)
+            if prev is None or intensity > prev[1]:
+                self._pending_by_frame[key] = (row, intensity)
+
+            if is_accident:
+                LOGGER.info(
+                    "[ACCIDENT] time=%.3fs frame=%d actor_id=%d other_id=%s "
+                    "loc=(%.2f,%.2f,%.2f) intensity=%.2f",
+                    timestamp,
+                    frame,
+                    actor.id,
+                    str(other_id),
+                    contact_point.x,
+                    contact_point.y,
+                    contact_point.z,
+                    intensity,
+                )
+
+        return _on_collision
+
+    def _cleanup_sensor(self, record: EntityRecord) -> None:
+        sensor = record.collision_sensor
+        if sensor is not None and sensor.is_alive:
+            try:
+                sensor.stop()
+                sensor.destroy()
+            except RuntimeError:
+                LOGGER.debug(
+                    "Failed to destroy collision sensor for actor '%s'", record.actor.id
+                )
+        record.collision_sensor = None
+
+    def ensure_sensor(self, record: EntityRecord) -> None:
+        if record.object_type not in {"vehicle", "bicycle"}:
+            return
+
+        if not record.actor.is_alive:
+            self._cleanup_sensor(record)
+            return
+
+        sensor = record.collision_sensor
+        if sensor is not None and sensor.is_alive:
+            return
+        if sensor is not None:
+            self._cleanup_sensor(record)
+
+        try:
+            sensor_actor = self._world.spawn_actor(
+                self._blueprint, carla.Transform(), attach_to=record.actor
+            )
+        except RuntimeError:
+            LOGGER.debug("Unable to attach collision sensor to actor '%s'", record.actor.id)
+            return
+
+        record.collision_sensor = sensor_actor
+        sensor_actor.listen(self._make_callback(record))
+
+    def ensure_sensors_for_entities(self, records: Iterable[EntityRecord]) -> None:
+        for record in records:
+            self.ensure_sensor(record)
+
+    def shutdown(self) -> None:
+        self.flush_all()
+        self._log_file.close()
 
 
 class EntityManager:
@@ -370,6 +732,7 @@ class EntityManager:
         timing_output: Optional[TextIO] = None,
         enable_completion: bool = False,
         use_lstm_target: bool = False,
+        actor_logger: Optional[ActorCSVLogger] = None,
     ) -> None:
         self._world = world
         self._map = world.get_map()
@@ -385,9 +748,16 @@ class EntityManager:
         self._timing_header_written = False
         self._next_frame_sequence = 1
         self._active_frame_sequence: Optional[int] = None
+        self._current_payload_frame: Optional[int] = None
+        self._active_payload_frame: Optional[int] = None
+        self._actor_logger = actor_logger
 
         # autopilot 有効化済みかどうか
         self._autopilot_enabled = False
+
+    @property
+    def entities(self) -> Mapping[str, EntityRecord]:
+        return self._entities
 
     @property
     def timing_enabled(self) -> bool:
@@ -442,6 +812,7 @@ class EntityManager:
         self._actor_timings.clear()
         self._active_frame_sequence = self._next_frame_sequence
         self._next_frame_sequence += 1
+        self._active_payload_frame = self._current_payload_frame
 
     def end_frame(self, *, completed: bool, frame_id: Optional[int]) -> None:
         if not self._timing_enabled or self._frame_start_ns is None:
@@ -450,17 +821,23 @@ class EntityManager:
         frame_duration_ns = time.perf_counter_ns() - self._frame_start_ns
         actor_count = len(self._actor_timings)
         frame_sequence = self._active_frame_sequence or ""
-        carla_frame = frame_id if frame_id is not None else ""
+        payload_frame = self._active_payload_frame
+        if payload_frame is None:
+            payload_frame = self._current_payload_frame
+        if payload_frame is None:
+            payload_frame = ""
         if completed:
             LOGGER.info(
-                "Frame processed in %.3f ms (%d actor updates)",
+                "Frame processed in %.3f ms (payload frame %s, %d actor updates)",
                 frame_duration_ns / 1e6,
+                payload_frame,
                 actor_count,
             )
         else:
             LOGGER.info(
-                "Aborted frame after %.3f ms (%d actor updates)",
+                "Aborted frame after %.3f ms (payload frame %s, %d actor updates)",
                 frame_duration_ns / 1e6,
+                payload_frame,
                 actor_count,
             )
 
@@ -473,7 +850,7 @@ class EntityManager:
                 self._timing_writer.writerow(
                     [
                         "frame_sequence",
-                        "carla_frame",
+                        "payload_frame",
                         "frame_completed",
                         "frame_duration_ms",
                         "actor_count",
@@ -486,7 +863,7 @@ class EntityManager:
             self._timing_writer.writerow(
                 [
                     frame_sequence,
-                    carla_frame,
+                    payload_frame,
                     "yes" if completed else "no",
                     f"{frame_duration_ms:.6f}",
                     actor_count,
@@ -498,7 +875,7 @@ class EntityManager:
                 self._timing_writer.writerow(
                     [
                         frame_sequence,
-                        carla_frame,
+                        payload_frame,
                         "",
                         "",
                         "",
@@ -511,6 +888,17 @@ class EntityManager:
         self._frame_start_ns = None
         self._actor_timings.clear()
         self._active_frame_sequence = None
+        self._active_payload_frame = None
+
+    def update_payload_frame(self, payload_frame: Optional[int]) -> None:
+        if payload_frame is None:
+            return
+        self._current_payload_frame = payload_frame
+        self._active_payload_frame = payload_frame
+
+    @property
+    def current_payload_frame(self) -> Optional[int]:
+        return self._current_payload_frame
 
     def _select_blueprint(self, object_type: str) -> Optional[carla.ActorBlueprint]:
         filters = TYPE_FILTERS.get(object_type, [])
@@ -550,6 +938,7 @@ class EntityManager:
             last_update=now,
             last_observed_location=initial_observation,
             last_observed_time=now,
+            last_payload_frame=state.payload_frame,
         )
 
         if object_type in {"vehicle", "bicycle"}:
@@ -578,6 +967,9 @@ class EntityManager:
                 record.control_mode = "autopilot"
             except RuntimeError:
                 LOGGER.warning("Failed to enable autopilot for late join '%s'", state.object_id)
+
+        if self._actor_logger is not None:
+            self._actor_logger.register_actor(state.object_id, actor)
 
         return record
 
@@ -644,6 +1036,8 @@ class EntityManager:
         record.last_observed_time = timestamp
         record.previous_location = previous_target
         record.target = new_location
+        if state.payload_frame is not None:
+            record.last_payload_frame = state.payload_frame
         if not record.autopilot_enabled:
             record.control_mode = "tracking"
 
@@ -668,14 +1062,25 @@ class EntityManager:
             if actor.is_alive:
                 LOGGER.info("Destroying stale actor '%s'", object_id)
                 actor.destroy()
-
+            if record.collision_sensor is not None and record.collision_sensor.is_alive:
+                record.collision_sensor.stop()
+                record.collision_sensor.destroy()
+            
     def destroy_all(self) -> None:
         for object_id, record in list(self._entities.items()):
             actor = record.actor
             if actor.is_alive:
                 LOGGER.info("Destroying actor '%s'", object_id)
                 actor.destroy()
+            if record.collision_sensor is not None and record.collision_sensor.is_alive:
+                record.collision_sensor.stop()
+                record.collision_sensor.destroy()
             self._entities.pop(object_id, None)
+
+    def log_actor_states(self, logger: Optional[ActorCSVLogger], frame_id: Optional[int]) -> None:
+        if logger is None:
+            return
+        logger.log_frame(frame_id, self._entities)
 
     def step_all(self, dt: float) -> None:
         if not self._entities:
@@ -833,6 +1238,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
             "lead_time_seconds": None,
         }
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    actor_logger = ActorCSVLogger(args.actor_log, args.id_map_file)
 
     manager = EntityManager(
         world,
@@ -840,9 +1246,11 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         enable_timing=args.measure_update_times,
         timing_output=timing_file,
         enable_completion=args.enable_completion,
+        actor_logger=actor_logger,
     )
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
+    collision_logger = CollisionLogger(world)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
@@ -858,6 +1266,26 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     switch_frame: Optional[int] = None
     end_frame: Optional[int] = None
     first_frame: Optional[int] = None
+
+    switch_payload_frame = args.switch_payload_frame
+    end_payload_frame = args.end_payload_frame
+    computed_switch_payload_frame: Optional[int] = None
+    if (
+        switch_payload_frame is None
+        and end_payload_frame is not None
+        and args.lead_time_sec is not None
+        and args.fixed_delta > 0.0
+    ):
+        frame_offset = int(round(args.lead_time_sec / args.fixed_delta))
+        computed_switch_payload_frame = max(end_payload_frame - frame_offset, 0)
+        switch_payload_frame = computed_switch_payload_frame
+
+    if computed_switch_payload_frame is not None:
+        LOGGER.info(
+            "Computed switch payload frame %d using lead time %.3f s",
+            computed_switch_payload_frame,
+            args.lead_time_sec,
+        )
 
     # 追加: トラッキング開始時刻と future モードフラグ
     has_received_first_data = False
@@ -881,6 +1309,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                     # --- トラッキングフェーズか future フェーズかで処理を切り替える ---
 
+                    current_payload_frame = manager.current_payload_frame
+
                     if not future_mode:
                         # ===== トラッキングフェーズ =====
                         while True:
@@ -893,6 +1323,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 return 1
                             else:
                                 for raw_message in decode_messages(payload):
+                                    manager.update_payload_frame(
+                                        extract_payload_frame(raw_message)
+                                    )
                                     try:
                                         state = normalise_message(raw_message)
                                     except MissingTargetDataError as exc:
@@ -914,7 +1347,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                         # トラッキング開始から一定時間経過したら future モードへ
                         if (
-                            not future_mode
+                            switch_payload_frame is None
+                            and not future_mode
                             and has_received_first_data
                             and tracking_start_time is not None
                             and (now - tracking_start_time) >= TRACKING_PHASE_DURATION
@@ -926,7 +1360,36 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             )
                             future_mode = True
                             manager.enable_autopilot(traffic_manager)
-                            switch_wall_time = time.monotonic()
+                        elif (
+                            switch_payload_frame is not None
+                            and not future_mode
+                            and current_payload_frame is not None
+                            and current_payload_frame >= switch_payload_frame
+                        ):
+                            LOGGER.info(
+                                "Switching to future simulation mode (autopilot) "
+                                "at payload frame %d",
+                                current_payload_frame,
+                            )
+                            future_mode = True
+                            manager.enable_autopilot(traffic_manager)
+
+                    current_payload_frame = manager.current_payload_frame
+
+                    if (
+                        end_payload_frame is not None
+                        and current_payload_frame is not None
+                        and current_payload_frame >= end_payload_frame
+                    ):
+                        LOGGER.info(
+                            "Reached end payload frame %d; stopping replay",
+                            current_payload_frame,
+                        )
+                        break
+
+                    collision_logger.ensure_sensors_for_entities(
+                        manager.entities.values()
+                    )
 
                     current_time = time.monotonic()
                     elapsed = current_time - last_step_time
@@ -964,6 +1427,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
 
                     control_broadcaster.publish(manager.control_state_snapshot())
+                    manager.log_actor_states(actor_logger, carla_frame_id)
                 finally:
                     if manager.timing_enabled:
                         manager.end_frame(
@@ -974,9 +1438,11 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         LOGGER.info("Interrupted by user")
     finally:
         manager.destroy_all()
+        collision_logger.shutdown()
         sock.close()
         if timing_file is not None:
             timing_file.close()
+        actor_logger.close()
 
     if metadata is not None and metadata_path is not None:
         metadata["first_frame"] = first_frame
