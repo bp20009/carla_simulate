@@ -63,6 +63,30 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Optional maximum runtime in seconds (0 runs indefinitely)",
     )
     parser.add_argument(
+        "--switch-payload-frame",
+        type=int,
+        default=None,
+        help=(
+            "Payload frame at which to hand control over to autopilot; defaults to "
+            "time-based switch when unset"
+        ),
+    )
+    parser.add_argument(
+        "--end-payload-frame",
+        type=int,
+        default=None,
+        help="Payload frame at which to end the replay; runs indefinitely when unset",
+    )
+    parser.add_argument(
+        "--lead-time-sec",
+        type=float,
+        default=None,
+        help=(
+            "Optional lead time (seconds) used to compute the autopilot switch frame "
+            "when only an end payload frame is provided"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
@@ -375,6 +399,22 @@ def decode_messages(payload: bytes) -> Iterator[Mapping[str, object]]:
     yield from _iter_message_objects(data)
 
 
+def extract_payload_frame(message: Mapping[str, object]) -> Optional[int]:
+    frame = (
+        message.get("payload_frame")
+        or message.get("frame")
+        or message.get("frame_id")
+    )
+    if frame is None:
+        return None
+
+    try:
+        return int(frame)
+    except (TypeError, ValueError):
+        LOGGER.debug("Invalid payload frame value: %r", frame)
+        return None
+
+
 def normalise_message(message: Mapping[str, object]) -> IncomingState:
     object_id = message.get("id") or message.get("object_id")
     if object_id is None:
@@ -486,6 +526,8 @@ class EntityManager:
         self._timing_header_written = False
         self._next_frame_sequence = 1
         self._active_frame_sequence: Optional[int] = None
+        self._current_payload_frame: Optional[int] = None
+        self._active_payload_frame: Optional[int] = None
         self._actor_logger = actor_logger
 
         # autopilot 有効化済みかどうか
@@ -544,6 +586,7 @@ class EntityManager:
         self._actor_timings.clear()
         self._active_frame_sequence = self._next_frame_sequence
         self._next_frame_sequence += 1
+        self._active_payload_frame = self._current_payload_frame
 
     def end_frame(self, *, completed: bool, frame_id: Optional[int]) -> None:
         if not self._timing_enabled or self._frame_start_ns is None:
@@ -552,17 +595,23 @@ class EntityManager:
         frame_duration_ns = time.perf_counter_ns() - self._frame_start_ns
         actor_count = len(self._actor_timings)
         frame_sequence = self._active_frame_sequence or ""
-        carla_frame = frame_id if frame_id is not None else ""
+        payload_frame = self._active_payload_frame
+        if payload_frame is None:
+            payload_frame = self._current_payload_frame
+        if payload_frame is None:
+            payload_frame = ""
         if completed:
             LOGGER.info(
-                "Frame processed in %.3f ms (%d actor updates)",
+                "Frame processed in %.3f ms (payload frame %s, %d actor updates)",
                 frame_duration_ns / 1e6,
+                payload_frame,
                 actor_count,
             )
         else:
             LOGGER.info(
-                "Aborted frame after %.3f ms (%d actor updates)",
+                "Aborted frame after %.3f ms (payload frame %s, %d actor updates)",
                 frame_duration_ns / 1e6,
+                payload_frame,
                 actor_count,
             )
 
@@ -575,7 +624,7 @@ class EntityManager:
                 self._timing_writer.writerow(
                     [
                         "frame_sequence",
-                        "carla_frame",
+                        "payload_frame",
                         "frame_completed",
                         "frame_duration_ms",
                         "actor_count",
@@ -588,7 +637,7 @@ class EntityManager:
             self._timing_writer.writerow(
                 [
                     frame_sequence,
-                    carla_frame,
+                    payload_frame,
                     "yes" if completed else "no",
                     f"{frame_duration_ms:.6f}",
                     actor_count,
@@ -600,7 +649,7 @@ class EntityManager:
                 self._timing_writer.writerow(
                     [
                         frame_sequence,
-                        carla_frame,
+                        payload_frame,
                         "",
                         "",
                         "",
@@ -613,6 +662,17 @@ class EntityManager:
         self._frame_start_ns = None
         self._actor_timings.clear()
         self._active_frame_sequence = None
+        self._active_payload_frame = None
+
+    def update_payload_frame(self, payload_frame: Optional[int]) -> None:
+        if payload_frame is None:
+            return
+        self._current_payload_frame = payload_frame
+        self._active_payload_frame = payload_frame
+
+    @property
+    def current_payload_frame(self) -> Optional[int]:
+        return self._current_payload_frame
 
     def _select_blueprint(self, object_type: str) -> Optional[carla.ActorBlueprint]:
         filters = TYPE_FILTERS.get(object_type, [])
@@ -947,6 +1007,26 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     next_cleanup = start_time
     last_step_time = start_time
 
+    switch_payload_frame = args.switch_payload_frame
+    end_payload_frame = args.end_payload_frame
+    computed_switch_payload_frame: Optional[int] = None
+    if (
+        switch_payload_frame is None
+        and end_payload_frame is not None
+        and args.lead_time_sec is not None
+        and args.fixed_delta > 0.0
+    ):
+        frame_offset = int(round(args.lead_time_sec / args.fixed_delta))
+        computed_switch_payload_frame = max(end_payload_frame - frame_offset, 0)
+        switch_payload_frame = computed_switch_payload_frame
+
+    if computed_switch_payload_frame is not None:
+        LOGGER.info(
+            "Computed switch payload frame %d using lead time %.3f s",
+            computed_switch_payload_frame,
+            args.lead_time_sec,
+        )
+
     # 追加: トラッキング開始時刻と future モードフラグ
     has_received_first_data = False
     tracking_start_time: Optional[float] = None
@@ -969,6 +1049,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                     # --- トラッキングフェーズか future フェーズかで処理を切り替える ---
 
+                    current_payload_frame = manager.current_payload_frame
+
                     if not future_mode:
                         # ===== トラッキングフェーズ =====
                         while True:
@@ -981,6 +1063,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 return 1
                             else:
                                 for raw_message in decode_messages(payload):
+                                    manager.update_payload_frame(
+                                        extract_payload_frame(raw_message)
+                                    )
                                     try:
                                         state = normalise_message(raw_message)
                                     except MissingTargetDataError as exc:
@@ -1002,7 +1087,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                         # トラッキング開始から一定時間経過したら future モードへ
                         if (
-                            not future_mode
+                            switch_payload_frame is None
+                            and not future_mode
                             and has_received_first_data
                             and tracking_start_time is not None
                             and (now - tracking_start_time) >= TRACKING_PHASE_DURATION
@@ -1014,6 +1100,32 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             )
                             future_mode = True
                             manager.enable_autopilot(traffic_manager)
+                        elif (
+                            switch_payload_frame is not None
+                            and not future_mode
+                            and current_payload_frame is not None
+                            and current_payload_frame >= switch_payload_frame
+                        ):
+                            LOGGER.info(
+                                "Switching to future simulation mode (autopilot) "
+                                "at payload frame %d",
+                                current_payload_frame,
+                            )
+                            future_mode = True
+                            manager.enable_autopilot(traffic_manager)
+
+                    current_payload_frame = manager.current_payload_frame
+
+                    if (
+                        end_payload_frame is not None
+                        and current_payload_frame is not None
+                        and current_payload_frame >= end_payload_frame
+                    ):
+                        LOGGER.info(
+                            "Reached end payload frame %d; stopping replay",
+                            current_payload_frame,
+                        )
+                        break
 
                     current_time = time.monotonic()
                     elapsed = current_time - last_step_time
