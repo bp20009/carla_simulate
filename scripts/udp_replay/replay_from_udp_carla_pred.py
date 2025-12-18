@@ -118,6 +118,20 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--tm-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for the Traffic Manager",
+    )
+    parser.add_argument(
+        "--metadata-output",
+        default=None,
+        help=(
+            "Optional JSON file that captures run metadata for experiment "
+            "traceability"
+        ),
+    )
+    parser.add_argument(
         "--actor-log",
         default=None,
         help="CSV file path for actor pose states per frame (omit to disable)",
@@ -1230,6 +1244,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     traffic_manager = client.get_trafficmanager()
     # synchronous_mode のときは Traffic Manager も同期モードに
     traffic_manager.set_synchronous_mode(True)
+    if args.tm_seed is not None:
+        traffic_manager.set_random_device_seed(args.tm_seed)
 
     timing_file: Optional[TextIO] = None
     if args.measure_update_times:
@@ -1237,6 +1253,24 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         timing_file = output_path.open("w", newline="")
 
+    metadata_path = Path(args.metadata_output).expanduser() if args.metadata_output else None
+    metadata: Dict[str, object] | None = None
+    if metadata_path is not None:
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "input_identifiers": {
+                "carla": f"{args.carla_host}:{args.carla_port}",
+                "udp_listener": f"{args.listen_host}:{args.listen_port}",
+            },
+            "fixed_delta_seconds": args.fixed_delta,
+            "traffic_manager_seed": args.tm_seed,
+            "tracking_phase_duration_seconds": TRACKING_PHASE_DURATION,
+            "first_frame": None,
+            "switch_frame": None,
+            "end_frame": None,
+            "lead_time_seconds": None,
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     actor_logger = ActorCSVLogger(args.actor_log, args.id_map_file)
 
     manager = EntityManager(
@@ -1411,6 +1445,17 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                     # ここでは何もしない（world.tick() だけ進める）
 
                     carla_frame_id = world.tick()
+                    if first_frame is None:
+                        first_frame = carla_frame_id
+                    if future_mode and switch_frame is None:
+                        switch_frame = carla_frame_id
+                        if metadata is not None and tracking_start_time is not None:
+                            metadata["lead_time_seconds"] = (
+                                switch_wall_time - tracking_start_time
+                                if switch_wall_time
+                                else None
+                            )
+                    end_frame = carla_frame_id
                     frame_completed = True
                     last_step_time = time.monotonic()
 
@@ -1439,6 +1484,17 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         if timing_file is not None:
             timing_file.close()
         actor_logger.close()
+
+    if metadata is not None and metadata_path is not None:
+        metadata["first_frame"] = first_frame
+        metadata["switch_frame"] = switch_frame
+        metadata["end_frame"] = end_frame
+        metadata["lead_time_seconds"] = metadata.get("lead_time_seconds") or (
+            switch_wall_time - tracking_start_time
+            if switch_wall_time is not None and tracking_start_time is not None
+            else None
+        )
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     return 0
 
