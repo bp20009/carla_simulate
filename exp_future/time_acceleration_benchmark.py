@@ -75,11 +75,32 @@ def apply_sync_settings(
     world: carla.World, no_rendering: bool, fixed_delta: float | None
 ) -> Tuple[carla.WorldSettings, carla.WorldSettings]:
     original = world.get_settings()
-    new_settings = carla.WorldSettings(original)
+
+    def _copy_if_exists(target: carla.WorldSettings, source: carla.WorldSettings, name: str) -> None:
+        if hasattr(target, name) and hasattr(source, name):
+            setattr(target, name, getattr(source, name))
+
+    new_settings = carla.WorldSettings()
+    # Preserve original tunables so only the relevant sync settings change.
+    for field in (
+        "substepping",
+        "max_substep_delta_time",
+        "max_substeps",
+        "max_culling_distance",
+        "deterministic_ragdolls",
+        "tile_stream_distance",
+        "actor_active_distance",
+        "spectator_as_ego",
+    ):
+        _copy_if_exists(new_settings, original, field)
+
     new_settings.synchronous_mode = True
     new_settings.no_rendering_mode = no_rendering
     if fixed_delta is not None:
         new_settings.fixed_delta_seconds = fixed_delta
+    else:
+        _copy_if_exists(new_settings, original, "fixed_delta_seconds")
+
     return original, new_settings
 
 
