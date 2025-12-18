@@ -117,6 +117,16 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "downstream consumers"
         ),
     )
+    parser.add_argument(
+        "--actor-log",
+        default="actors.csv",
+        help="CSV file that stores actor pose states per frame",
+    )
+    parser.add_argument(
+        "--id-map-file",
+        default="id_map.csv",
+        help="CSV file that maps external object IDs to CARLA actor IDs/types",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -196,6 +206,110 @@ class ControlStateBroadcaster:
         except OSError:
             LOGGER.warning("Failed to write control state file '%s'", self._path)
 
+
+class ActorCSVLogger:
+    """Persist per-frame actor transforms and id mappings."""
+
+    def __init__(self, actor_log_path: Optional[str], id_map_path: Optional[str]) -> None:
+        self._actor_path = Path(actor_log_path).expanduser() if actor_log_path else None
+        self._id_map_path = Path(id_map_path).expanduser() if id_map_path else None
+        self._actor_file: Optional[TextIO] = None
+        self._actor_writer: Optional[csv.writer] = None
+        self._id_map: Dict[str, Tuple[int, str]] = {}
+
+        if self._actor_path is not None:
+            try:
+                self._actor_path.parent.mkdir(parents=True, exist_ok=True)
+                self._actor_file = self._actor_path.open("w", newline="")
+                self._actor_writer = csv.writer(self._actor_file)
+                self._actor_writer.writerow(
+                    [
+                        "frame",
+                        "id",
+                        "carla_actor_id",
+                        "type",
+                        "location_x",
+                        "location_y",
+                        "location_z",
+                        "rotation_roll",
+                        "rotation_pitch",
+                        "rotation_yaw",
+                        "autopilot_enabled",
+                        "control_mode",
+                    ]
+                )
+                self._actor_file.flush()
+            except OSError:
+                LOGGER.warning("Failed to open actor log file '%s'", self._actor_path)
+                self._actor_file = None
+                self._actor_writer = None
+
+        if self._id_map_path is not None:
+            try:
+                self._id_map_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                LOGGER.warning("Failed to create id map directory '%s'", self._id_map_path)
+                self._id_map_path = None
+
+    def register_actor(self, object_id: str, actor: carla.Actor) -> None:
+        if self._id_map_path is None:
+            return
+        self._id_map[object_id] = (actor.id, actor.type_id)
+        self._write_id_map()
+
+    def _write_id_map(self) -> None:
+        if self._id_map_path is None:
+            return
+        try:
+            with self._id_map_path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["object_id", "carla_actor_id", "carla_type"])
+                for object_id, (actor_id, actor_type) in sorted(self._id_map.items()):
+                    writer.writerow([object_id, actor_id, actor_type])
+        except OSError:
+            LOGGER.warning("Failed to write id map file '%s'", self._id_map_path)
+
+    def log_frame(self, frame_id: Optional[int], entities: Mapping[str, EntityRecord]) -> None:
+        if self._actor_writer is None or frame_id is None:
+            return
+
+        wrote_row = False
+        for object_id, record in entities.items():
+            actor = record.actor
+            if not actor.is_alive:
+                continue
+            try:
+                transform = actor.get_transform()
+            except RuntimeError:
+                continue
+
+            self._actor_writer.writerow(
+                [
+                    frame_id,
+                    object_id,
+                    actor.id,
+                    actor.type_id,
+                    transform.location.x,
+                    transform.location.y,
+                    transform.location.z,
+                    transform.rotation.roll,
+                    transform.rotation.pitch,
+                    transform.rotation.yaw,
+                    record.autopilot_enabled,
+                    record.control_mode,
+                ]
+            )
+            wrote_row = True
+
+        if wrote_row and self._actor_file is not None:
+            self._actor_file.flush()
+
+    def close(self) -> None:
+        if self._actor_file is not None:
+            self._actor_file.flush()
+            self._actor_file.close()
+            self._actor_file = None
+            self._actor_writer = None
 
 class PIDController:
     """Simple PID controller for throttle and steering outputs."""
@@ -396,6 +510,7 @@ class EntityManager:
         timing_output: Optional[TextIO] = None,
         enable_completion: bool = False,
         use_lstm_target: bool = False,
+        actor_logger: Optional[ActorCSVLogger] = None,
     ) -> None:
         self._world = world
         self._map = world.get_map()
@@ -413,6 +528,7 @@ class EntityManager:
         self._active_frame_sequence: Optional[int] = None
         self._current_payload_frame: Optional[int] = None
         self._active_payload_frame: Optional[int] = None
+        self._actor_logger = actor_logger
 
         # autopilot 有効化済みかどうか
         self._autopilot_enabled = False
@@ -625,6 +741,9 @@ class EntityManager:
             except RuntimeError:
                 LOGGER.warning("Failed to enable autopilot for late join '%s'", state.object_id)
 
+        if self._actor_logger is not None:
+            self._actor_logger.register_actor(state.object_id, actor)
+
         return record
 
     def apply_state(self, state: IncomingState, timestamp: float) -> bool:
@@ -722,6 +841,11 @@ class EntityManager:
                 LOGGER.info("Destroying actor '%s'", object_id)
                 actor.destroy()
             self._entities.pop(object_id, None)
+
+    def log_actor_states(self, logger: Optional[ActorCSVLogger], frame_id: Optional[int]) -> None:
+        if logger is None:
+            return
+        logger.log_frame(frame_id, self._entities)
 
     def step_all(self, dt: float) -> None:
         if not self._entities:
@@ -859,12 +983,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         timing_file = output_path.open("w", newline="")
 
+    actor_logger = ActorCSVLogger(args.actor_log, args.id_map_file)
+
     manager = EntityManager(
         world,
         blueprint_library,
         enable_timing=args.measure_update_times,
         timing_output=timing_file,
         enable_completion=args.enable_completion,
+        actor_logger=actor_logger,
     )
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
@@ -1025,6 +1152,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
 
                     control_broadcaster.publish(manager.control_state_snapshot())
+                    manager.log_actor_states(actor_logger, carla_frame_id)
                 finally:
                     if manager.timing_enabled:
                         manager.end_frame(
@@ -1038,6 +1166,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         sock.close()
         if timing_file is not None:
             timing_file.close()
+        actor_logger.close()
 
     return 0
 
