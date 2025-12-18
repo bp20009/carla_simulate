@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
 
 import carla
 
@@ -240,6 +240,7 @@ class ActorCSVLogger:
                 self._actor_writer.writerow(
                     [
                         "frame",
+                        "carla_frame",
                         "id",
                         "carla_actor_id",
                         "type",
@@ -284,8 +285,13 @@ class ActorCSVLogger:
         except OSError:
             LOGGER.warning("Failed to write id map file '%s'", self._id_map_path)
 
-    def log_frame(self, frame_id: Optional[int], entities: Mapping[str, EntityRecord]) -> None:
-        if self._actor_writer is None or frame_id is None:
+    def log_frame(
+        self,
+        payload_frame: Optional[int],
+        carla_frame: Optional[int],
+        entities: Mapping[str, EntityRecord],
+    ) -> None:
+        if self._actor_writer is None or payload_frame is None:
             return
 
         wrote_row = False
@@ -300,7 +306,8 @@ class ActorCSVLogger:
 
             self._actor_writer.writerow(
                 [
-                    frame_id,
+                    payload_frame,
+                    carla_frame,
                     object_id,
                     actor.id,
                     actor.type_id,
@@ -430,7 +437,9 @@ def extract_payload_frame(message: Mapping[str, object]) -> Optional[int]:
         return None
 
 
-def normalise_message(message: Mapping[str, object]) -> IncomingState:
+def normalise_message(
+    message: Mapping[str, object], *, payload_frame: Optional[int] = None
+) -> IncomingState:
     object_id = message.get("id") or message.get("object_id")
     if object_id is None:
         raise ValueError("Missing object identifier in message")
@@ -502,17 +511,6 @@ def normalise_message(message: Mapping[str, object]) -> IncomingState:
     pitch, _ = _extract_rotation("pitch")
     yaw, yaw_provided = _extract_rotation("yaw")
 
-    payload_frame: Optional[int] = None
-    for candidate in ("frame", "frame_id", "seq", "sequence", "payload_frame"):
-        value = message.get(candidate)
-        if value is None:
-            continue
-        try:
-            payload_frame = int(value)
-            break
-        except (TypeError, ValueError):
-            LOGGER.debug("Invalid payload frame value for key '%s': %r", candidate, value)
-
     return IncomingState(
         object_id=str(object_id),
         object_type=object_type,
@@ -534,7 +532,12 @@ class CollisionLogger:
     COOLDOWN_SEC = 0.5
     VEHICLE_ONLY = True
 
-    def __init__(self, world: carla.World) -> None:
+    def __init__(
+        self,
+        world: carla.World,
+        *,
+        payload_frame_getter: Optional[Callable[[], Optional[int]]] = None,
+    ) -> None:
         self._world = world
         self._blueprint = world.get_blueprint_library().find("sensor.other.collision")
         self._log_path = Path("pred_collisions.csv")
@@ -561,6 +564,7 @@ class CollisionLogger:
         self._pending_by_frame: Dict[Tuple[int, int], Tuple[List[object], float]] = {}
         self._last_flushed_frame = -1
         self._last_accident_time: Dict[int, float] = {}
+        self._payload_frame_getter = payload_frame_getter
 
     @staticmethod
     def _other_class(other_type: str) -> str:
@@ -605,9 +609,8 @@ class CollisionLogger:
         actor = record.actor
 
         def _on_collision(event: carla.CollisionEvent) -> None:
-            frame = int(event.frame)
+            carla_frame = int(event.frame)
             timestamp = getattr(event, "timestamp", time.monotonic())
-            self._flush_until(frame)
 
             other = event.other_actor
             other_id = other.id if other is not None else None
@@ -640,10 +643,21 @@ class CollisionLogger:
                     return
                 self._last_accident_time[actor.id] = timestamp
 
+            payload_frame = record.last_payload_frame
+            if payload_frame is None and self._payload_frame_getter is not None:
+                try:
+                    payload_frame = self._payload_frame_getter()
+                except Exception:
+                    payload_frame = None
+            if payload_frame is None:
+                payload_frame = carla_frame
+
+            self._flush_until(int(payload_frame))
+
             row = [
                 float(timestamp),
-                record.last_payload_frame,
-                frame,
+                payload_frame,
+                carla_frame,
                 actor.id,
                 record.object_type,
                 other_id,
@@ -655,7 +669,7 @@ class CollisionLogger:
                 float(intensity),
                 int(is_accident),
             ]
-            key = (actor.id, frame)
+            key = (actor.id, int(payload_frame))
             prev = self._pending_by_frame.get(key)
             if prev is None or intensity > prev[1]:
                 self._pending_by_frame[key] = (row, intensity)
@@ -665,7 +679,7 @@ class CollisionLogger:
                     "[ACCIDENT] time=%.3fs frame=%d actor_id=%d other_id=%s "
                     "loc=(%.2f,%.2f,%.2f) intensity=%.2f",
                     timestamp,
-                    frame,
+                    payload_frame,
                     actor.id,
                     str(other_id),
                     contact_point.x,
@@ -1077,10 +1091,15 @@ class EntityManager:
                 record.collision_sensor.destroy()
             self._entities.pop(object_id, None)
 
-    def log_actor_states(self, logger: Optional[ActorCSVLogger], frame_id: Optional[int]) -> None:
+    def log_actor_states(
+        self,
+        logger: Optional[ActorCSVLogger],
+        payload_frame: Optional[int],
+        carla_frame: Optional[int],
+    ) -> None:
         if logger is None:
             return
-        logger.log_frame(frame_id, self._entities)
+        logger.log_frame(payload_frame, carla_frame, self._entities)
 
     def step_all(self, dt: float) -> None:
         if not self._entities:
@@ -1250,7 +1269,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     )
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
-    collision_logger = CollisionLogger(world)
+    collision_logger = CollisionLogger(
+        world, payload_frame_getter=lambda: manager.current_payload_frame
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_host, args.listen_port))
@@ -1263,9 +1284,6 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     next_cleanup = start_time
     last_step_time = start_time
     switch_wall_time: Optional[float] = None
-    switch_frame: Optional[int] = None
-    end_frame: Optional[int] = None
-    first_frame: Optional[int] = None
 
     switch_payload_frame = args.switch_payload_frame
     end_payload_frame = args.end_payload_frame
@@ -1309,8 +1327,6 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                     # --- トラッキングフェーズか future フェーズかで処理を切り替える ---
 
-                    current_payload_frame = manager.current_payload_frame
-
                     if not future_mode:
                         # ===== トラッキングフェーズ =====
                         while True:
@@ -1323,11 +1339,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 return 1
                             else:
                                 for raw_message in decode_messages(payload):
-                                    manager.update_payload_frame(
-                                        extract_payload_frame(raw_message)
-                                    )
+                                    payload_frame = extract_payload_frame(raw_message)
+                                    manager.update_payload_frame(payload_frame)
                                     try:
-                                        state = normalise_message(raw_message)
+                                        state = normalise_message(
+                                            raw_message, payload_frame=payload_frame
+                                        )
                                     except MissingTargetDataError as exc:
                                         LOGGER.warning("Incomplete target data: %s", exc)
                                         continue
@@ -1338,12 +1355,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                     applied = manager.apply_state(
                                         state, time.monotonic()
                                     )
-                                    if applied and not has_received_first_data:
-                                        LOGGER.info(
-                                            "Received first complete tracking update"
-                                        )
-                                        has_received_first_data = True
-                                        tracking_start_time = time.monotonic()
+                            if applied and not has_received_first_data:
+                                LOGGER.info(
+                                    "Received first complete tracking update"
+                                )
+                                has_received_first_data = True
+                                tracking_start_time = time.monotonic()
+
+                        # 最新 payload_frame を取得した上で判定する
+                        current_payload_frame = manager.current_payload_frame
 
                         # トラッキング開始から一定時間経過したら future モードへ
                         if (
@@ -1358,6 +1378,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 "after %.1f seconds of tracking",
                                 TRACKING_PHASE_DURATION,
                             )
+                            switch_wall_time = time.monotonic()
                             future_mode = True
                             manager.enable_autopilot(traffic_manager)
                         elif (
@@ -1371,6 +1392,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 "at payload frame %d",
                                 current_payload_frame,
                             )
+                            switch_wall_time = time.monotonic()
                             future_mode = True
                             manager.enable_autopilot(traffic_manager)
 
@@ -1427,7 +1449,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         next_cleanup = now + max(args.stale_timeout * 0.5, 0.5)
 
                     control_broadcaster.publish(manager.control_state_snapshot())
-                    manager.log_actor_states(actor_logger, carla_frame_id)
+                    manager.log_actor_states(
+                        actor_logger, manager.current_payload_frame, carla_frame_id
+                    )
                 finally:
                     if manager.timing_enabled:
                         manager.end_frame(
