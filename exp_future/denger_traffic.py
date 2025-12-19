@@ -54,8 +54,8 @@ def main():
         '-n', '--number-of-vehicles', metavar='N', default=30, type=int,
         help='Number of vehicles (default: 30)')
     argparser.add_argument(
-        '-w', '--number-of-walkers', metavar='W', default=10, type=int,
-        help='Number of walkers (default: 10)')
+        '-w', '--number-of-walkers', metavar='W', default=0, type=int,
+        help='Number of walkers (default: 0)')
     argparser.add_argument(
         '--safe', action='store_true',
         help='Avoid spawning vehicles prone to accidents')
@@ -356,7 +356,7 @@ def main():
         # Configure a subset of vehicles with more aggressive parameters
         all_vehicle_actors = world.get_actors(vehicles_list)
         if len(all_vehicle_actors) > 0:
-            danger_ratio = 0.2
+            danger_ratio = 0.1
             num_danger = max(1, int(len(all_vehicle_actors) * danger_ratio))
             num_danger = min(num_danger, len(all_vehicle_actors))
             danger_actors = random.choice(list(all_vehicle_actors), size=num_danger, replace=False)
