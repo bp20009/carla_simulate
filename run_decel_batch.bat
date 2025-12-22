@@ -24,10 +24,10 @@ python %RUNNER_SCRIPT% ^
   --window-sec %WINDOW_SEC% ^
   --tracking-sec %TRACKING_SEC% ^
   --future-sec %FUTURE_SEC% ^
-  --fixed-delta 0.05 ^
-  --poll-interval 0.05 ^
-  --sender-interval 0.05 ^
-  --tm-seed 42 ^
+  --fixed-delta 0.1 ^
+  --poll-interval 0.1 ^
+  --sender-interval 0.1 ^
+  --tm-seed 20009 ^
   --outdir results
 
 endlocal
