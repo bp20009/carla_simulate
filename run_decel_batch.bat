@@ -8,7 +8,7 @@ REM * sender-script は send_data\send_udp_frames_from_csv.py を使う。
 
 REM --- 実行パラメータ（必要に応じて編集） ---
 set "SCRIPT_DIR=%~dp0"
-set "ROOT_DIR=%SCRIPT_DIR%.."
+set "ROOT_DIR=%SCRIPT_DIR%"
 set "REPLAY_SCRIPT=%SCRIPT_DIR%\exp_future\batch_run_and_analyze_decel.py"
 set "REPLAY_SCRIPT_PATH=%SCRIPT_DIR%scripts\udp_replay\replay_from_udp_carla_pred.py"
 set "SENDER_SCRIPT=%ROOT_DIR%\send_data\send_udp_frames_from_csv.py"
