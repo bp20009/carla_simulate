@@ -18,7 +18,7 @@ set "WINDOW_SEC=10"
 python "%REPLAY_SCRIPT%" ^
   --replay-script "%REPLAY_SCRIPT%" ^
   --sender-script "%SENDER_SCRIPT%" ^
-  --csv "%CSV%" ^
+  --csv-path "%CSV%" ^
   --runs "%RUNS%" ^
   --window-sec "%WINDOW_SEC%"
 
