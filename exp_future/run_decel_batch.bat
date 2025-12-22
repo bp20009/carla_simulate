@@ -11,7 +11,7 @@ set "SCRIPT_DIR=%~dp0"
 set "ROOT_DIR=%SCRIPT_DIR%.."
 set "REPLAY_SCRIPT=%SCRIPT_DIR%batch_run_and_analyze_decel.py"
 set "SENDER_SCRIPT=%ROOT_DIR%\send_data\send_udp_frames_from_csv.py"
-set "CSV=%SCRIPT_DIR%send_data\exp_accident.csv"
+set "CSV=%SCRIPT_DIR%\send_data\exp_accident.csv"
 set "RUNS=3"
 set "WINDOW_SEC=10"
 
