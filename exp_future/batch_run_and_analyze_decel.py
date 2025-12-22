@@ -34,6 +34,11 @@ class RunSummary:
     fixed_delta_seconds: Optional[float]
     min_accel: Optional[float]
     min_accel_actor: Optional[str]
+    min_accel_switch: Optional[float]
+    min_accel_switch_actor: Optional[str]
+    hard_brake_switch_count: int
+    switch_eval_ticks: int
+    hard_brake_threshold: float
 
 
 def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -49,6 +54,18 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Seconds after switch to compute min deceleration (default: 5.0)",
+    )
+    parser.add_argument(
+        "--switch-eval-ticks",
+        type=int,
+        default=2,
+        help="Evaluate deceleration using the first N ticks after switch (default: 2)",
+    )
+    parser.add_argument(
+        "--hard-brake-threshold",
+        type=float,
+        default=-5.0,
+        help="Threshold (m/s^2) to count hard braking right after switch (default: -5.0)",
     )
     parser.add_argument(
         "--tracking-sec",
@@ -203,10 +220,62 @@ def _parse_actor_log(actor_log_path: Path) -> Dict[str, List[Tuple[int, float, f
     return records
 
 
+def _analyze_decel_at_switch(
+    points: List[Tuple[int, float, float, float, str, str]],
+    *,
+    switch_frame: int,
+    fixed_delta: float,
+    eval_ticks: int,
+) -> Optional[float]:
+    """Return acceleration (m/s^2) right after switch using eval_ticks."""
+    if eval_ticks <= 0:
+        return None
+
+    points.sort(key=lambda item: item[0])
+
+    idx0 = None
+    for i, (frame_id, *_rest) in enumerate(points):
+        if frame_id >= switch_frame:
+            idx0 = i
+            break
+    if idx0 is None:
+        return None
+
+    need_points = eval_ticks + 1
+    if idx0 + need_points > len(points):
+        return None
+
+    seg_speeds: List[Tuple[float, float]] = []
+    for k in range(eval_ticks):
+        f1, x1, y1, z1, *_ = points[idx0 + k]
+        f2, x2, y2, z2, *_ = points[idx0 + k + 1]
+        frame_delta = f2 - f1
+        if frame_delta <= 0:
+            return None
+        dt = frame_delta * fixed_delta
+        dx = x2 - x1
+        dy = y2 - y1
+        dz = z2 - z1
+        speed = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+        seg_speeds.append((speed, dt))
+
+    if len(seg_speeds) < 2:
+        return None
+
+    v1, _dt1 = seg_speeds[0]
+    v2, dt2 = seg_speeds[1]
+    if dt2 <= 0:
+        return None
+    return (v2 - v1) / dt2
+
+
 def _analyze_deceleration(
     actor_log_path: Path,
     metadata_path: Path,
     window_sec: float,
+    *,
+    switch_eval_ticks: int,
+    hard_brake_threshold: float,
 ) -> Tuple[List[ActorDecelResult], RunSummary]:
     metadata = _load_metadata(metadata_path)
     fixed_delta_seconds = metadata.get("fixed_delta_seconds")
@@ -218,6 +287,9 @@ def _analyze_deceleration(
     results: List[ActorDecelResult] = []
     min_accel = None
     min_accel_actor = None
+    min_accel_switch = None
+    min_accel_switch_actor = None
+    hard_brake_switch_count = 0
 
     if fixed_delta is None or fixed_delta <= 0 or switch_frame_int is None:
         summary = RunSummary(
@@ -227,6 +299,11 @@ def _analyze_deceleration(
             fixed_delta_seconds=fixed_delta,
             min_accel=None,
             min_accel_actor=None,
+            min_accel_switch=None,
+            min_accel_switch_actor=None,
+            hard_brake_switch_count=0,
+            switch_eval_ticks=switch_eval_ticks,
+            hard_brake_threshold=hard_brake_threshold,
         )
         return results, summary
 
@@ -285,6 +362,18 @@ def _analyze_deceleration(
                 min_accel_frame=actor_min_frame,
             )
         )
+        a_switch = _analyze_decel_at_switch(
+            points,
+            switch_frame=switch_frame_int,
+            fixed_delta=fixed_delta,
+            eval_ticks=switch_eval_ticks,
+        )
+        if a_switch is not None:
+            if min_accel_switch is None or a_switch < min_accel_switch:
+                min_accel_switch = a_switch
+                min_accel_switch_actor = object_id
+            if a_switch <= hard_brake_threshold:
+                hard_brake_switch_count += 1
 
     summary = RunSummary(
         run_id=metadata_path.parent.parent.name,
@@ -293,6 +382,11 @@ def _analyze_deceleration(
         fixed_delta_seconds=fixed_delta,
         min_accel=min_accel,
         min_accel_actor=min_accel_actor,
+        min_accel_switch=min_accel_switch,
+        min_accel_switch_actor=min_accel_switch_actor,
+        hard_brake_switch_count=hard_brake_switch_count,
+        switch_eval_ticks=switch_eval_ticks,
+        hard_brake_threshold=hard_brake_threshold,
     )
     return results, summary
 
@@ -354,6 +448,11 @@ def _write_summary(output_path: Path, summaries: Sequence[RunSummary]) -> None:
                 "fixed_delta_seconds",
                 "min_accel",
                 "min_accel_actor",
+                "switch_eval_ticks",
+                "hard_brake_threshold",
+                "min_accel_switch",
+                "min_accel_switch_actor",
+                "hard_brake_switch_count",
             ]
         )
         for summary in summaries:
@@ -365,6 +464,11 @@ def _write_summary(output_path: Path, summaries: Sequence[RunSummary]) -> None:
                     summary.fixed_delta_seconds,
                     summary.min_accel,
                     summary.min_accel_actor,
+                    summary.switch_eval_ticks,
+                    summary.hard_brake_threshold,
+                    summary.min_accel_switch,
+                    summary.min_accel_switch_actor,
+                    summary.hard_brake_switch_count,
                 ]
             )
 
@@ -454,7 +558,11 @@ def run_experiment(args: argparse.Namespace) -> None:
                 replay_proc.wait(timeout=10)
 
         actor_results, summary = _analyze_deceleration(
-            actor_log_path, metadata_path, args.window_sec
+            actor_log_path,
+            metadata_path,
+            args.window_sec,
+            switch_eval_ticks=args.switch_eval_ticks,
+            hard_brake_threshold=args.hard_brake_threshold,
         )
         fixed_delta = summary.fixed_delta_seconds
         window_frames = (
