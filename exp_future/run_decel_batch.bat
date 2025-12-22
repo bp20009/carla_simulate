@@ -9,7 +9,7 @@ REM * sender-script は send_data\send_udp_frames_from_csv.py を使う。
 REM --- 実行パラメータ（必要に応じて編集） ---
 set REPLAY_SCRIPT=exp_future\batch_run_and_analyze_decel.py
 set SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py
-set CSV=exp_future\data\sample_decel.csv
+set CSV=send_data\exp_accident.csv
 set RUNS=3
 set WINDOW_SEC=10
 
