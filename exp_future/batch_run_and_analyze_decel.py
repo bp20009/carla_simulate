@@ -163,7 +163,7 @@ def _run_command(command: Sequence[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def _start_process(command: Sequence[str]) -> subprocess.Popen[str]:
+def _start_process(command: Sequence[str]) -> subprocess.Popen:
     LOGGER.debug("Starting process: %s", " ".join(command))
     return subprocess.Popen(command, text=True)
 
