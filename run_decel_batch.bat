@@ -1,26 +1,33 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM --- 注意 ---
-REM * CARLA は別起動しておく（本バッチは CARLA を起動しません）。
-REM * CSV/ポート設定は sender-script 側の入力 CSV と送信先ポートに合わせる。
-REM * sender-script は send_data\send_udp_frames_from_csv.py を使う。
+REM --- CARLA は別起動しておく ---
 
-REM --- 実行パラメータ（必要に応じて編集） ---
-set "SCRIPT_DIR=%~dp0"
-set "ROOT_DIR=%SCRIPT_DIR%"
-set "REPLAY_SCRIPT=%SCRIPT_DIR%\exp_future\batch_run_and_analyze_decel.py"
-set "REPLAY_SCRIPT_PATH=%SCRIPT_DIR%scripts\udp_replay\replay_from_udp_carla_pred.py"
-set "SENDER_SCRIPT=%ROOT_DIR%\send_data\send_udp_frames_from_csv.py"
-set "CSV=%SCRIPT_DIR%\send_data\exp_accident.csv"
-set "RUNS=3"
-set "WINDOW_SEC=10"
+REM --- 実行パラメータ ---
+set RUNNER_SCRIPT=exp_future\batch_run_and_analyze_decel.py
+set REPLAY_SCRIPT=scripts\udp_replay\replay_from_udp_carla_pred.py
+set SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py
+set CSV=send_data\exp_accident.csv
 
-python "%REPLAY_SCRIPT%" ^
-  --replay-script "%REPLAY_SCRIPT_PATH%" ^
-  --sender-script "%SENDER_SCRIPT%" ^
-  --csv-path "%CSV%" ^
-  --runs "%RUNS%" ^
-  --window-sec "%WINDOW_SEC%"
+set RUNS=3
+set WINDOW_SEC=2.0
+
+REM 追跡30s + 未来10s など（あなたの実験に合わせる）
+set TRACKING_SEC=30
+set FUTURE_SEC=10
+
+python %RUNNER_SCRIPT% ^
+  --replay-script %REPLAY_SCRIPT% ^
+  --sender-script %SENDER_SCRIPT% ^
+  --csv-path %CSV% ^
+  --runs %RUNS% ^
+  --window-sec %WINDOW_SEC% ^
+  --tracking-sec %TRACKING_SEC% ^
+  --future-sec %FUTURE_SEC% ^
+  --fixed-delta 0.05 ^
+  --poll-interval 0.05 ^
+  --sender-interval 0.05 ^
+  --tm-seed 42 ^
+  --outdir results
 
 endlocal
