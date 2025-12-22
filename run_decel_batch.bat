@@ -25,9 +25,6 @@ python %RUNNER_SCRIPT% ^
   --tracking-sec %TRACKING_SEC% ^
   --future-sec %FUTURE_SEC% ^
   --fixed-delta 0.05 ^
-  --poll-interval 0.05 ^
-  --sender-interval 0.05 ^
-  --tm-seed 42 ^
-  --outdir results
+  --sender-interval 0.05
 
 endlocal
