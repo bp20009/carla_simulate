@@ -10,13 +10,14 @@ REM --- 実行パラメータ（必要に応じて編集） ---
 set "SCRIPT_DIR=%~dp0"
 set "ROOT_DIR=%SCRIPT_DIR%.."
 set "REPLAY_SCRIPT=%SCRIPT_DIR%\exp_future\batch_run_and_analyze_decel.py"
+set "REPLAY_SCRIPT_PATH=%SCRIPT_DIR%scripts\udp_replay\replay_from_udp_carla_pred.py"
 set "SENDER_SCRIPT=%ROOT_DIR%\send_data\send_udp_frames_from_csv.py"
 set "CSV=%SCRIPT_DIR%\send_data\exp_accident.csv"
 set "RUNS=3"
 set "WINDOW_SEC=10"
 
 python "%REPLAY_SCRIPT%" ^
-  --replay-script "%REPLAY_SCRIPT%" ^
+  --replay-script "%REPLAY_SCRIPT_PATH%" ^
   --sender-script "%SENDER_SCRIPT%" ^
   --csv "%CSV%" ^
   --runs "%RUNS%" ^
