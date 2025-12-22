@@ -86,6 +86,12 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Fixed delta seconds for replay (default: 0.05)",
     )
     parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.05,
+        help="Seconds to wait for UDP data before ticking CARLA (default: 0.05)",
+    )
+    parser.add_argument(
         "--sender-interval",
         type=float,
         default=None,
@@ -96,6 +102,12 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Send every Nth frame via UDP (default: 1)",
+    )
+    parser.add_argument(
+        "--tm-seed",
+        type=int,
+        default=None,
+        help="Optional Traffic Manager random seed for replay",
     )
     parser.add_argument(
         "--replay-script",
@@ -171,6 +183,12 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Seconds to wait before starting sender (default: 1.0)",
+    )
+    parser.add_argument(
+        "--outdir",
+        type=Path,
+        default=Path("results"),
+        help="Output directory for run logs and summaries (default: results)",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -486,7 +504,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
     max_runtime = max(args.tracking_sec + args.future_sec, 0.0)
 
-    results_dir = Path("results")
+    results_dir = args.outdir
     summaries: List[RunSummary] = []
 
     for run_index in range(1, args.runs + 1):
@@ -508,6 +526,8 @@ def run_experiment(args: argparse.Namespace) -> None:
             args.listen_host,
             "--listen-port",
             str(args.listen_port),
+            "--poll-interval",
+            str(args.poll_interval),
             "--fixed-delta",
             str(args.fixed_delta),
             "--metadata-output",
@@ -525,6 +545,9 @@ def run_experiment(args: argparse.Namespace) -> None:
                 "--switch-payload-frame",
                 str(switch_payload_frame),
             ])
+
+        if args.tm_seed is not None:
+            replay_cmd.extend(["--tm-seed", str(args.tm_seed)])
 
         if max_runtime > 0:
             replay_cmd.extend(["--max-runtime", str(max_runtime)])
