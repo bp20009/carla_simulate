@@ -52,7 +52,7 @@ if errorlevel 1 (
   taskkill /PID %REPLAY_PID% /T /F >nul 2>&1
 )
 
-for /f %%a in ('python -c "import json,sys; p=r'%CALIB_META%';\ntry:\n m=json.load(open(p,'r',encoding='utf-8'));\n acc=m.get('accidents') or [];\n print(acc[0].get('payload_frame','')) if acc else print('')\nexcept Exception:\n print('')"') do set "ACCIDENT_PF=%%a"
+for /f %%a in ('python -c "import json,sys; p=r'%CALIB_META%'; d={}; exec(\"\"\"try:\\n d=json.load(open(p,'r',encoding='utf-8'))\\nexcept Exception:\\n d={}\\n\"\"\"); acc=d.get('accidents') or []; print(acc[0].get('payload_frame','') if acc else '')"') do set "ACCIDENT_PF=%%a"
 
 if "%ACCIDENT_PF%"=="" (
   echo Calibration failed: no accidents in %CALIB_META%
@@ -95,9 +95,9 @@ for %%M in (autopilot lstm) do (
         taskkill /PID !REPLAY_PID! /T /F >nul 2>&1
       )
 
-      for /f %%f in ('python -c "import json,sys; p=r'!RUN_META!';\ntry:\n m=json.load(open(p,'r',encoding='utf-8'));\n acc=m.get('accidents') or [];\n print(acc[0].get('payload_frame','')) if acc else print('')\nexcept Exception:\n print('')"') do set "FIRST_ACC_PF=%%f"
+      for /f %%f in ('python -c "import json,sys; p=r'!RUN_META!'; d={}; exec(\"\"\"try:\\n d=json.load(open(p,'r',encoding='utf-8'))\\nexcept Exception:\\n d={}\\n\"\"\"); acc=d.get('accidents') or []; print(acc[0].get('payload_frame','') if acc else '')"') do set "FIRST_ACC_PF=%%f"
 
-      for /f %%a in ('python -c "import json,sys; p=r'!RUN_META!';\ntry:\n m=json.load(open(p,'r',encoding='utf-8'));\n sw=m.get('switch_payload_frame_observed');\n sw=int(sw) if sw is not None else int(r'!SWITCH_PF!');\n hit=0;\n for e in (m.get('accidents') or []):\n  pf=e.get('payload_frame');\n  if pf is not None and int(pf)>=sw:\n   hit=1; break\n print(hit)\nexcept Exception:\n print(0)"') do set "AFTER_SWITCH=%%a"
+      for /f %%a in ('python -c "import json,sys; p=r'!RUN_META!'; d={}; exec(\"\"\"try:\\n d=json.load(open(p,'r',encoding='utf-8'))\\nexcept Exception:\\n d={}\\n\"\"\"); sw=d.get('switch_payload_frame_observed'); sw=int(sw) if sw is not None else int(r'!SWITCH_PF!'); acc=d.get('accidents') or []; hit=int(any((int(e.get('payload_frame'))>=sw) for e in acc if e.get('payload_frame') is not None)); print(hit)"') do set "AFTER_SWITCH=%%a"
 
       if "!FIRST_ACC_PF!"=="" set "FIRST_ACC_PF="
       if "!AFTER_SWITCH!"=="" set "AFTER_SWITCH=0"

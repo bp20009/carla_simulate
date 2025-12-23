@@ -13,9 +13,12 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
+from typing import Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
 
 import carla
+import torch
+import torch.nn as nn
+from collections import deque
 
 LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +99,13 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--collision-log",
         default=None,
         help="CSV path to write collision/accident events",
+    )
+    parser.add_argument("--lstm-model", default=None, help="Path to traj_lstm.pt")
+    parser.add_argument(
+        "--lstm-device",
+        default="cpu",
+        choices=("cpu", "cuda"),
+        help="Device for LSTM",
     )
     parser.add_argument(
         "--log-level",
@@ -208,6 +218,9 @@ class EntityRecord:
     control_mode: str = "direct"
     collision_sensor: Optional[carla.Sensor] = None
     last_payload_frame: Optional[int] = None
+    lstm_history: Optional[Deque[Tuple[float, float]]] = None
+    lstm_plan: Optional[List[Tuple[float, float]]] = None
+    lstm_step: int = 0
 
 
 class ControlStateBroadcaster:
@@ -397,6 +410,31 @@ class PIDController:
             output = max(low, min(output, high))
 
         return output
+
+
+class TrajLSTM(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int = 2,
+        hidden_dim: int = 64,
+        num_layers: int = 1,
+        horizon_steps: int = 10,
+    ) -> None:
+        super().__init__()
+        self.horizon_steps = horizon_steps
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.fc = nn.Linear(hidden_dim, horizon_steps * feature_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)
+        last = out[:, -1, :]
+        pred = self.fc(last)
+        return pred.view(pred.size(0), self.horizon_steps, -1)
 
 
 def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
@@ -789,6 +827,8 @@ class EntityManager:
         enable_completion: bool = False,
         use_lstm_target: bool = False,
         actor_logger: Optional[ActorCSVLogger] = None,
+        lstm_model_path: Optional[str] = None,
+        lstm_device: str = "cpu",
     ) -> None:
         self._world = world
         self._map = world.get_map()
@@ -810,6 +850,33 @@ class EntityManager:
 
         # autopilot 有効化済みかどうか
         self._autopilot_enabled = False
+        self._lstm: Optional[TrajLSTM] = None
+        self._lstm_history_steps: Optional[int] = None
+        self._lstm_horizon_steps: Optional[int] = None
+        self._lstm_device = lstm_device
+
+        if lstm_model_path:
+            ckpt = torch.load(lstm_model_path, map_location=lstm_device)
+            history_steps = int(ckpt.get("history_steps", 10))
+            horizon_steps = int(ckpt.get("horizon_steps", 50))
+            model = TrajLSTM(
+                feature_dim=2,
+                hidden_dim=64,
+                num_layers=1,
+                horizon_steps=horizon_steps,
+            )
+            model.load_state_dict(ckpt["state_dict"])
+            model.eval()
+            self._lstm = model.to(lstm_device)
+            self._lstm_history_steps = history_steps
+            self._lstm_horizon_steps = horizon_steps
+            LOGGER.info(
+                "Loaded LSTM model: %s (history=%d, horizon=%d, device=%s)",
+                lstm_model_path,
+                history_steps,
+                horizon_steps,
+                lstm_device,
+            )
 
     @property
     def entities(self) -> Mapping[str, EntityRecord]:
@@ -1096,6 +1163,16 @@ class EntityManager:
             record.last_payload_frame = state.payload_frame
         if not record.autopilot_enabled:
             record.control_mode = "tracking"
+        if (
+            record.object_type in {"vehicle", "bicycle"}
+            and self._lstm is not None
+            and self._lstm_history_steps is not None
+        ):
+            if record.lstm_history is None:
+                record.lstm_history = deque(maxlen=self._lstm_history_steps)
+            dx = float(new_location.x - previous_target.x)
+            dy = float(new_location.y - previous_target.y)
+            record.lstm_history.append((dx, dy))
 
         if timing_start_ns is not None and self._frame_start_ns is not None:
             self._actor_timings.append(
@@ -1142,6 +1219,67 @@ class EntityManager:
         if logger is None:
             return
         logger.log_frame(payload_frame, carla_frame, self._entities)
+
+    def prepare_lstm_plans(self) -> None:
+        if (
+            self._lstm is None
+            or self._lstm_history_steps is None
+            or self._lstm_horizon_steps is None
+        ):
+            LOGGER.warning("LSTM is not available; cannot prepare plans.")
+            return
+
+        for record in self._entities.values():
+            if record.object_type not in {"vehicle", "bicycle"}:
+                continue
+            if record.lstm_history is None or len(record.lstm_history) < self._lstm_history_steps:
+                LOGGER.warning(
+                    "Insufficient LSTM history for actor %d; len=%s",
+                    record.actor.id,
+                    0 if record.lstm_history is None else len(record.lstm_history),
+                )
+                record.lstm_plan = None
+                record.lstm_step = 0
+                continue
+
+            history = list(record.lstm_history)[-self._lstm_history_steps :]
+            x = torch.tensor(
+                history, dtype=torch.float32, device=self._lstm_device
+            ).unsqueeze(0)
+            with torch.no_grad():
+                pred = self._lstm(x)
+            plan = pred.squeeze(0).detach().cpu().tolist()
+            record.lstm_plan = [(float(d[0]), float(d[1])) for d in plan]
+            record.lstm_step = 0
+            LOGGER.info(
+                "Prepared LSTM plan for actor %d: steps=%d",
+                record.actor.id,
+                len(record.lstm_plan),
+            )
+
+    def update_lstm_targets(self) -> None:
+        if self._lstm is None:
+            return
+        for record in self._entities.values():
+            if record.object_type not in {"vehicle", "bicycle"}:
+                continue
+            if not record.actor.is_alive:
+                continue
+            if not record.lstm_plan or record.lstm_step >= len(record.lstm_plan):
+                continue
+
+            dx, dy = record.lstm_plan[record.lstm_step]
+            record.lstm_step += 1
+            try:
+                current_location = record.actor.get_transform().location
+            except RuntimeError:
+                continue
+
+            record.predicted_target = carla.Location(
+                x=float(current_location.x + dx),
+                y=float(current_location.y + dy),
+                z=float(current_location.z),
+            )
 
     def step_all(self, dt: float) -> None:
         if not self._entities:
@@ -1308,6 +1446,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         timing_output=timing_file,
         enable_completion=args.enable_completion,
         actor_logger=actor_logger,
+        lstm_model_path=args.lstm_model,
+        lstm_device=args.lstm_device,
     )
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
@@ -1446,6 +1586,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 manager.enable_autopilot(traffic_manager)
                             elif future_mode_kind == "lstm":
                                 manager._use_lstm_target = True
+                                manager.prepare_lstm_plans()
                         elif (
                             switch_payload_frame is not None
                             and not future_mode
@@ -1466,6 +1607,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 manager.enable_autopilot(traffic_manager)
                             elif future_mode_kind == "lstm":
                                 manager._use_lstm_target = True
+                                manager.prepare_lstm_plans()
 
                     current_payload_frame = manager.current_payload_frame
 
@@ -1491,6 +1633,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             time.sleep(args.fixed_delta - elapsed)
                         current_time = time.monotonic()
                         elapsed = args.fixed_delta
+
+                    if future_mode and future_mode_kind == "lstm":
+                        manager.update_lstm_targets()
 
                     # autopilot では future_mode 中は step_all しない．
                     # lstm では future_mode 中も predicted_target へ追従する．
