@@ -9,8 +9,9 @@ set REPLAY_SCRIPT=scripts\udp_replay\replay_from_udp_carla_pred.py
 set SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py
 set CSV=send_data\exp_accident.csv
 
-set RUNS=100
+set RUNS=5
 set WINDOW_SEC=2.0
+set SWITCH_EVAL_TICKS=2
 
 REM 追跡30s + 未来10s など（あなたの実験に合わせる）
 set TRACKING_SEC=30
