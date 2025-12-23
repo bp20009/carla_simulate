@@ -15,6 +15,7 @@ set "REPLAY_SCRIPT=scripts\udp_replay\replay_from_udp_future_exp.py"
 set "SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py"
 set "LSTM_MODEL=scripts\udp_replay\traj_lstm.pt"
 set "LSTM_DEVICE=cpu"
+set "META_TOOL=scripts\udp_replay\meta_tools.py"
 
 set "FIXED_DELTA=0.1"
 set "POLL_INTERVAL=0.1"
@@ -35,6 +36,8 @@ set "SENDER_PORT=5005"
 
 set /a "MAX_RUNTIME=%TRACKING_SEC%+%FUTURE_SEC%"
 set /a "WAIT_SEC=%MAX_RUNTIME%+30"
+if not defined CALIB_MAX_RUNTIME set "CALIB_MAX_RUNTIME=%MAX_RUNTIME%"
+set /a "CALIB_WAIT_SEC=%CALIB_MAX_RUNTIME%+30"
 
 set "CALIB_LOGS=%OUTDIR%\calibration\logs"
 set "CALIB_META=%CALIB_LOGS%\meta.json"
@@ -45,17 +48,17 @@ mkdir "%CALIB_LOGS%" >nul 2>&1
 echo [calibration] starting...
 for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen([sys.executable]+sys.argv[1:]); print(p.pid)" ^
   "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
-  --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%MAX_RUNTIME%" --tm-seed "%BASE_SEED%" ^
+  --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%CALIB_MAX_RUNTIME%" --tm-seed "%BASE_SEED%" ^
   --future-mode none --metadata-output "%CALIB_META%" --collision-log "%CALIB_COLL%"') do set "REPLAY_PID=%%p"
 
 timeout /t %STARTUP_DELAY% /nobreak >nul
 python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
-call :wait_for_pid %REPLAY_PID% %WAIT_SEC%
+call :wait_for_pid %REPLAY_PID% %CALIB_WAIT_SEC%
 if errorlevel 1 (
   taskkill /PID %REPLAY_PID% /T /F >nul 2>&1
 )
 
-for /f %%a in ('python -c "import json,sys; p=r'%CALIB_META%'; d={}; exec(\"\"\"try:\\n d=json.load(open(p,'r',encoding='utf-8'))\\nexcept Exception:\\n d={}\\n\"\"\"); acc=d.get('accidents') or []; print(acc[0].get('payload_frame','') if acc else '')"') do set "ACCIDENT_PF=%%a"
+for /f %%a in ('python "%META_TOOL%" first_accident_pf "%CALIB_META%"') do set "ACCIDENT_PF=%%a"
 
 if "%ACCIDENT_PF%"=="" (
   echo Calibration failed: no accidents in %CALIB_META%
@@ -67,7 +70,7 @@ echo method,lead_sec,rep,seed,switch_payload_frame,ran_ok,accident_after_switch,
 
 for %%M in (autopilot lstm) do (
   for /L %%L in (%LEAD_MIN%,1,%LEAD_MAX%) do (
-      for /f %%s in ('python -c "import math; lead=int(r'%%L'); delta=float(r'%FIXED_DELTA%'); frames=int(round(lead/delta)); sw=max(int(r'%ACCIDENT_PF%')-frames,0); print(sw)"') do set "SWITCH_PF=%%s"
+      for /f %%s in ('python "%META_TOOL%" switch_pf "%ACCIDENT_PF%" "%%L" "%FIXED_DELTA%"') do set "SWITCH_PF=%%s"
 
     for /L %%R in (1,1,%REPS%) do (
       set /a "SEED=%BASE_SEED%+%%R"
@@ -103,9 +106,9 @@ for %%M in (autopilot lstm) do (
         taskkill /PID !REPLAY_PID! /T /F >nul 2>&1
       )
 
-      for /f %%f in ('python -c "import json,sys; p=r'!RUN_META!'; d={}; exec(\"\"\"try:\\n d=json.load(open(p,'r',encoding='utf-8'))\\nexcept Exception:\\n d={}\\n\"\"\"); acc=d.get('accidents') or []; print(acc[0].get('payload_frame','') if acc else '')"') do set "FIRST_ACC_PF=%%f"
+      for /f %%f in ('python "%META_TOOL%" first_accident_pf "!RUN_META!"') do set "FIRST_ACC_PF=%%f"
 
-      for /f %%a in ('python -c "import json,sys; p=r'!RUN_META!'; d={}; exec(\"\"\"try:\\n d=json.load(open(p,'r',encoding='utf-8'))\\nexcept Exception:\\n d={}\\n\"\"\"); sw=d.get('switch_payload_frame_observed'); sw=int(sw) if sw is not None else int(r'!SWITCH_PF!'); acc=d.get('accidents') or []; hit=int(any((int(e.get('payload_frame'))>=sw) for e in acc if e.get('payload_frame') is not None)); print(hit)"') do set "AFTER_SWITCH=%%a"
+      for /f %%a in ('python "%META_TOOL%" accident_after_switch "!RUN_META!" "!SWITCH_PF!"') do set "AFTER_SWITCH=%%a"
 
       if "!FIRST_ACC_PF!"=="" set "FIRST_ACC_PF="
       if "!AFTER_SWITCH!"=="" set "AFTER_SWITCH=0"
