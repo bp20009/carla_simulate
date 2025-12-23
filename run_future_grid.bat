@@ -40,15 +40,19 @@ set "CALIB_COLL=%CALIB_LOGS%\collisions.csv"
 mkdir "%CALIB_LOGS%" >nul 2>&1
 
 echo [calibration] starting...
-for /f %%p in ('powershell -NoProfile -Command ^
-  "$p = Start-Process -FilePath python -ArgumentList @('%REPLAY_SCRIPT%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%LISTEN_PORT%','--poll-interval','%POLL_INTERVAL%','--fixed-delta','%FIXED_DELTA%','--max-runtime','%MAX_RUNTIME%','--tm-seed','%BASE_SEED%','--future-mode','none','--metadata-output','%CALIB_META%','--collision-log','%CALIB_COLL%') -PassThru; $p.Id"') do set "REPLAY_PID=%%p"
+for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen(sys.argv[1:]); print(p.pid)" ^
+  "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
+  --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%MAX_RUNTIME%" --tm-seed "%BASE_SEED%" ^
+  --future-mode none --metadata-output "%CALIB_META%" --collision-log "%CALIB_COLL%"') do set "REPLAY_PID=%%p"
 
 timeout /t %STARTUP_DELAY% /nobreak >nul
-python "%SENDER_SCRIPT%" "%CSV_PATH%" --host %SENDER_HOST% --port %SENDER_PORT% --interval %FIXED_DELTA%
-powershell -NoProfile -Command "Wait-Process -Id %REPLAY_PID% -Timeout %WAIT_SEC%" >nul
+python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
+call :wait_for_pid %REPLAY_PID% %WAIT_SEC%
+if errorlevel 1 (
+  taskkill /PID %REPLAY_PID% /T /F >nul 2>&1
+)
 
-for /f %%a in ('powershell -NoProfile -Command ^
-  "$m = Get-Content '%CALIB_META%' | ConvertFrom-Json; if ($m.accidents -and $m.accidents.Count -gt 0) { $m.accidents[0].payload_frame }"') do set "ACCIDENT_PF=%%a"
+for /f %%a in ('python -c "import json,sys; p=r'%CALIB_META%';\ntry:\n m=json.load(open(p,'r',encoding='utf-8'));\n acc=m.get('accidents') or [];\n print(acc[0].get('payload_frame','')) if acc else print('')\nexcept Exception:\n print('')"') do set "ACCIDENT_PF=%%a"
 
 if "%ACCIDENT_PF%"=="" (
   echo Calibration failed: no accidents in %CALIB_META%
@@ -60,8 +64,7 @@ echo method,lead_sec,rep,seed,switch_payload_frame,ran_ok,accident_after_switch,
 
 for %%M in (autopilot lstm) do (
   for /L %%L in (%LEAD_MIN%,1,%LEAD_MAX%) do (
-    for /f %%s in ('powershell -NoProfile -Command ^
-      "$lead = [int]%%L; $delta = [double]%FIXED_DELTA%; $frames = [int][math]::Round($lead / $delta); $sw = [int]([math]::Max(%ACCIDENT_PF% - $frames, 0)); $sw"') do set "SWITCH_PF=%%s"
+      for /f %%s in ('python -c "import math; lead=int(r'%%L'); delta=float(r'%FIXED_DELTA%'); frames=int(round(lead/delta)); sw=max(int(r'%ACCIDENT_PF%')-frames,0); print(sw)"') do set "SWITCH_PF=%%s"
 
     for /L %%R in (1,1,%REPS%) do (
       set /a "SEED=%BASE_SEED%+%%R"
@@ -77,22 +80,24 @@ for %%M in (autopilot lstm) do (
       set "RAN_OK=1"
       set "STATUS=ok"
 
-      for /f %%p in ('powershell -NoProfile -Command ^
-        "$p = Start-Process -FilePath python -ArgumentList @('%REPLAY_SCRIPT%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%LISTEN_PORT%','--poll-interval','%POLL_INTERVAL%','--fixed-delta','%FIXED_DELTA%','--max-runtime','%MAX_RUNTIME%','--tm-seed','!SEED!','--future-mode','%%M','--switch-payload-frame','!SWITCH_PF!','--metadata-output','!RUN_META!','--collision-log','!RUN_COLL!','--actor-log','!RUN_ACTOR!','--id-map-file','!RUN_IDMAP!') -PassThru; $p.Id"') do set "REPLAY_PID=%%p"
+      for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen(sys.argv[1:]); print(p.pid)" ^
+        "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
+        --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%MAX_RUNTIME%" --tm-seed "!SEED!" ^
+        --future-mode "%%M" --switch-payload-frame "!SWITCH_PF!" --metadata-output "!RUN_META!" --collision-log "!RUN_COLL!" ^
+        --actor-log "!RUN_ACTOR!" --id-map-file "!RUN_IDMAP!"') do set "REPLAY_PID=%%p"
 
       timeout /t %STARTUP_DELAY% /nobreak >nul
-      python "%SENDER_SCRIPT%" "%CSV_PATH%" --host %SENDER_HOST% --port %SENDER_PORT% --interval %FIXED_DELTA%
-      powershell -NoProfile -Command "Wait-Process -Id !REPLAY_PID! -Timeout %WAIT_SEC%" >nul
+      python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
+      call :wait_for_pid !REPLAY_PID! %WAIT_SEC%
       if errorlevel 1 (
         set "RAN_OK=0"
         set "STATUS=timeout"
+        taskkill /PID !REPLAY_PID! /T /F >nul 2>&1
       )
 
-      for /f %%f in ('powershell -NoProfile -Command ^
-        "$m = Get-Content '!RUN_META!' | ConvertFrom-Json; if ($m.accidents -and $m.accidents.Count -gt 0) { $m.accidents[0].payload_frame }"') do set "FIRST_ACC_PF=%%f"
+      for /f %%f in ('python -c "import json,sys; p=r'!RUN_META!';\ntry:\n m=json.load(open(p,'r',encoding='utf-8'));\n acc=m.get('accidents') or [];\n print(acc[0].get('payload_frame','')) if acc else print('')\nexcept Exception:\n print('')"') do set "FIRST_ACC_PF=%%f"
 
-      for /f %%a in ('powershell -NoProfile -Command ^
-        "$m = Get-Content '!RUN_META!' | ConvertFrom-Json; $sw = [int]!SWITCH_PF!; $hit = 0; if ($m.accidents) { foreach ($e in $m.accidents) { if ([int]$e.payload_frame -ge $sw) { $hit = 1; break } } }; $hit"') do set "AFTER_SWITCH=%%a"
+      for /f %%a in ('python -c "import json,sys; p=r'!RUN_META!';\ntry:\n m=json.load(open(p,'r',encoding='utf-8'));\n sw=m.get('switch_payload_frame_observed');\n sw=int(sw) if sw is not None else int(r'!SWITCH_PF!');\n hit=0;\n for e in (m.get('accidents') or []):\n  pf=e.get('payload_frame');\n  if pf is not None and int(pf)>=sw:\n   hit=1; break\n print(hit)\nexcept Exception:\n print(0)"') do set "AFTER_SWITCH=%%a"
 
       if "!FIRST_ACC_PF!"=="" set "FIRST_ACC_PF="
       if "!AFTER_SWITCH!"=="" set "AFTER_SWITCH=0"
@@ -104,3 +109,19 @@ for %%M in (autopilot lstm) do (
 
 echo Wrote: %SUMMARY%
 exit /b 0
+
+:wait_for_pid
+setlocal
+set "PID=%~1"
+set /a "REMAIN=%~2"
+:wait_loop
+tasklist /fi "PID eq %PID%" | findstr /i "%PID%" >nul
+if errorlevel 1 (
+  endlocal & exit /b 0
+)
+if %REMAIN% LEQ 0 (
+  endlocal & exit /b 1
+)
+set /a REMAIN-=1
+timeout /t 1 /nobreak >nul
+goto wait_loop
