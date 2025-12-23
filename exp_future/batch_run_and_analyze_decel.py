@@ -37,6 +37,10 @@ class RunSummary:
     min_accel_switch: Optional[float]
     min_accel_switch_actor: Optional[str]
     hard_brake_switch_count: int
+    min_accel_pre_switch: Optional[float]
+    min_accel_pre_switch_actor: Optional[str]
+    hard_brake_pre_switch_count: int
+    delta_min_accel_switch: Optional[float]
     switch_eval_ticks: int
     hard_brake_threshold: float
 
@@ -287,6 +291,63 @@ def _analyze_decel_at_switch(
     return (v2 - v1) / dt2
 
 
+def _analyze_decel_before_switch(
+    points: List[Tuple[int, float, float, float, str, str]],
+    *,
+    switch_frame: int,
+    fixed_delta: float,
+    eval_ticks: int,
+) -> Optional[float]:
+    """Return acceleration (m/s^2) immediately before switch using eval_ticks.
+
+    Robust definition:
+      - Find idx0 = first point whose frame_id >= switch_frame
+      - Use the eval_ticks segments just BEFORE idx0 (requires eval_ticks+1 points)
+      - Compute accel from the last two segment speeds in that pre-switch window
+    """
+    if eval_ticks <= 0:
+        return None
+
+    points.sort(key=lambda item: item[0])
+
+    idx0 = None
+    for i, (frame_id, *_rest) in enumerate(points):
+        if frame_id >= switch_frame:
+            idx0 = i
+            break
+    if idx0 is None:
+        return None
+
+    need_points = eval_ticks + 1
+    start = idx0 - need_points
+    end = idx0
+    if start < 0 or end - start < need_points:
+        return None
+
+    seg_speeds: List[Tuple[float, float]] = []
+    for idx in range(eval_ticks):
+        f1, x1, y1, z1, *_ = points[start + idx]
+        f2, x2, y2, z2, *_ = points[start + idx + 1]
+        frame_delta = f2 - f1
+        if frame_delta <= 0:
+            return None
+        dt = frame_delta * fixed_delta
+        dx = x2 - x1
+        dy = y2 - y1
+        dz = z2 - z1
+        speed = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+        seg_speeds.append((speed, dt))
+
+    if len(seg_speeds) < 2:
+        return None
+
+    v_prev, _dt_prev = seg_speeds[-2]
+    v_last, dt_last = seg_speeds[-1]
+    if dt_last <= 0:
+        return None
+    return (v_last - v_prev) / dt_last
+
+
 def _analyze_deceleration(
     actor_log_path: Path,
     metadata_path: Path,
@@ -308,6 +369,10 @@ def _analyze_deceleration(
     min_accel_switch = None
     min_accel_switch_actor = None
     hard_brake_switch_count = 0
+    min_accel_pre_switch = None
+    min_accel_pre_switch_actor = None
+    hard_brake_pre_switch_count = 0
+    delta_min_accel_switch = None
 
     if fixed_delta is None or fixed_delta <= 0 or switch_frame_int is None:
         summary = RunSummary(
@@ -320,6 +385,10 @@ def _analyze_deceleration(
             min_accel_switch=None,
             min_accel_switch_actor=None,
             hard_brake_switch_count=0,
+            min_accel_pre_switch=None,
+            min_accel_pre_switch_actor=None,
+            hard_brake_pre_switch_count=0,
+            delta_min_accel_switch=None,
             switch_eval_ticks=switch_eval_ticks,
             hard_brake_threshold=hard_brake_threshold,
         )
@@ -392,6 +461,21 @@ def _analyze_deceleration(
                 min_accel_switch_actor = object_id
             if a_switch <= hard_brake_threshold:
                 hard_brake_switch_count += 1
+        a_pre = _analyze_decel_before_switch(
+            points,
+            switch_frame=switch_frame_int,
+            fixed_delta=fixed_delta,
+            eval_ticks=switch_eval_ticks,
+        )
+        if a_pre is not None:
+            if min_accel_pre_switch is None or a_pre < min_accel_pre_switch:
+                min_accel_pre_switch = a_pre
+                min_accel_pre_switch_actor = object_id
+            if a_pre <= hard_brake_threshold:
+                hard_brake_pre_switch_count += 1
+
+    if min_accel_switch is not None and min_accel_pre_switch is not None:
+        delta_min_accel_switch = min_accel_switch - min_accel_pre_switch
 
     summary = RunSummary(
         run_id=metadata_path.parent.parent.name,
@@ -403,6 +487,10 @@ def _analyze_deceleration(
         min_accel_switch=min_accel_switch,
         min_accel_switch_actor=min_accel_switch_actor,
         hard_brake_switch_count=hard_brake_switch_count,
+        min_accel_pre_switch=min_accel_pre_switch,
+        min_accel_pre_switch_actor=min_accel_pre_switch_actor,
+        hard_brake_pre_switch_count=hard_brake_pre_switch_count,
+        delta_min_accel_switch=delta_min_accel_switch,
         switch_eval_ticks=switch_eval_ticks,
         hard_brake_threshold=hard_brake_threshold,
     )
@@ -471,6 +559,10 @@ def _write_summary(output_path: Path, summaries: Sequence[RunSummary]) -> None:
                 "min_accel_switch",
                 "min_accel_switch_actor",
                 "hard_brake_switch_count",
+                "min_accel_pre_switch",
+                "min_accel_pre_switch_actor",
+                "hard_brake_pre_switch_count",
+                "delta_min_accel_switch",
             ]
         )
         for summary in summaries:
@@ -487,6 +579,10 @@ def _write_summary(output_path: Path, summaries: Sequence[RunSummary]) -> None:
                     summary.min_accel_switch,
                     summary.min_accel_switch_actor,
                     summary.hard_brake_switch_count,
+                    summary.min_accel_pre_switch,
+                    summary.min_accel_pre_switch_actor,
+                    summary.hard_brake_pre_switch_count,
+                    summary.delta_min_accel_switch,
                 ]
             )
 
