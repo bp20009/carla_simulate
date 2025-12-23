@@ -2,13 +2,13 @@
 setlocal enabledelayedexpansion
 
 if "%~1"=="" (
-  echo Usage: %~nx0 path\to\reduced.csv [outdir]
-  exit /b 1
+  set "CSV_PATH=%~dp0send_data\exp_accident.csv"
+  set "OUTDIR=%~dp0results_grid_accident"
+) else (
+  set "CSV_PATH=%~1"
+  set "OUTDIR=%~2"
+  if "%OUTDIR%"=="" set "OUTDIR=results_grid"
 )
-
-set "CSV_PATH=%~1"
-set "OUTDIR=%~2"
-if "%OUTDIR%"=="" set "OUTDIR=results_grid"
 
 set "REPLAY_SCRIPT=scripts\udp_replay\replay_from_udp_future_exp.py"
 set "SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py"
