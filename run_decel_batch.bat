@@ -17,19 +17,21 @@ REM 追跡30s + 未来10s など（あなたの実験に合わせる）
 set TRACKING_SEC=30
 set FUTURE_SEC=10
 
-python %RUNNER_SCRIPT% ^
-  --replay-script %REPLAY_SCRIPT% ^
-  --sender-script %SENDER_SCRIPT% ^
-  --csv-path %CSV% ^
-  --runs %RUNS% ^
-  --window-sec %WINDOW_SEC% ^
-  --switch-eval-ticks %SWITCH_EVAL_TICKS% ^
-  --tracking-sec %TRACKING_SEC% ^
-  --future-sec %FUTURE_SEC% ^
-  --fixed-delta 0.1 ^
-  --poll-interval 0.1 ^
-  --sender-interval 0.1 ^
-  --tm-seed 20009 ^
-  --outdir results
+for %%T in (2 5 10) do (
+  python %RUNNER_SCRIPT% ^
+    --replay-script %REPLAY_SCRIPT% ^
+    --sender-script %SENDER_SCRIPT% ^
+    --csv-path %CSV% ^
+    --runs %RUNS% ^
+    --window-sec %WINDOW_SEC% ^
+    --switch-eval-ticks %%T ^
+    --tracking-sec %TRACKING_SEC% ^
+    --future-sec %FUTURE_SEC% ^
+    --fixed-delta 0.1 ^
+    --poll-interval 0.1 ^
+    --sender-interval 0.1 ^
+    --tm-seed 20009 ^
+    --outdir results_ticks%%T
+)
 
 endlocal
