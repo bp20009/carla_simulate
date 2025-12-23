@@ -84,7 +84,7 @@ for %%M in (autopilot lstm) do (
 
       set "LSTM_ARGS="
       if /I "%%M"=="lstm" (
-        set "LSTM_ARGS=--lstm-model ""%LSTM_MODEL%"" --lstm-device %LSTM_DEVICE%"
+        set "LSTM_ARGS=--lstm-model ""!LSTM_MODEL!"" --lstm-device !LSTM_DEVICE!"
       )
 
       for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen(sys.argv[1:]); print(p.pid)" ^
