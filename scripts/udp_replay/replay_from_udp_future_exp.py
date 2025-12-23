@@ -418,23 +418,28 @@ class TrajLSTM(nn.Module):
         feature_dim: int = 2,
         hidden_dim: int = 64,
         num_layers: int = 1,
-        horizon_steps: int = 10,
+        horizon_steps: int = 50,
     ) -> None:
         super().__init__()
         self.horizon_steps = horizon_steps
         self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=hidden_dim,
+            feature_dim,
+            hidden_dim,
             num_layers=num_layers,
             batch_first=True,
         )
-        self.fc = nn.Linear(hidden_dim, horizon_steps * feature_dim)
+        self.decoder = nn.Linear(hidden_dim, feature_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        last = out[:, -1, :]
-        pred = self.fc(last)
-        return pred.view(pred.size(0), self.horizon_steps, -1)
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        _, hidden = self.lstm(history)
+        step_input = history[:, -1:, :]
+        preds = []
+        for _ in range(self.horizon_steps):
+            step_out, hidden = self.lstm(step_input, hidden)
+            dxy = self.decoder(step_out[:, -1, :])
+            preds.append(dxy)
+            step_input = dxy.unsqueeze(1)
+        return torch.stack(preds, dim=1)
 
 
 def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
@@ -850,6 +855,7 @@ class EntityManager:
 
         # autopilot 有効化済みかどうか
         self._autopilot_enabled = False
+        self._tm_port: Optional[int] = None
         self._lstm: Optional[TrajLSTM] = None
         self._lstm_history_steps: Optional[int] = None
         self._lstm_horizon_steps: Optional[int] = None
@@ -893,6 +899,7 @@ class EntityManager:
         self._autopilot_enabled = True
 
         tm_port = traffic_manager.get_port()
+        self._tm_port = tm_port
         for object_id, record in self._entities.items():
             actor = record.actor
             if not actor.is_alive:
@@ -1085,7 +1092,10 @@ class EntityManager:
 
         if self._autopilot_enabled and object_type in {"vehicle", "bicycle"}:
             try:
-                actor.set_autopilot(True)
+                if self._tm_port is not None:
+                    actor.set_autopilot(True, self._tm_port)
+                else:
+                    actor.set_autopilot(True)
                 record.autopilot_enabled = True
                 record.control_mode = "autopilot"
             except RuntimeError:
@@ -1535,15 +1545,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 return 1
                             else:
                                 for raw_message in decode_messages(payload):
-                                payload_frame = extract_payload_frame(raw_message)
-                                manager.update_payload_frame(payload_frame)
-                                if payload_frame is not None:
-                                    if first_payload_frame is None:
-                                        first_payload_frame = payload_frame
-                                    last_payload_frame = payload_frame
-                                try:
-                                    state = normalise_message(
-                                        raw_message, payload_frame=payload_frame
+                                    payload_frame = extract_payload_frame(raw_message)
+                                    manager.update_payload_frame(payload_frame)
+                                    if payload_frame is not None:
+                                        if first_payload_frame is None:
+                                            first_payload_frame = payload_frame
+                                        last_payload_frame = payload_frame
+                                    try:
+                                        state = normalise_message(
+                                            raw_message, payload_frame=payload_frame
                                         )
                                     except MissingTargetDataError as exc:
                                         LOGGER.warning("Incomplete target data: %s", exc)
