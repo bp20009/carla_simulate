@@ -11,6 +11,7 @@ set CSV=send_data\exp_accident.csv
 
 set RUNS=10
 set WINDOW_SEC=2.0
+set SWITCH_EVAL_TICKS=2
 
 REM 追跡30s + 未来10s など（あなたの実験に合わせる）
 set TRACKING_SEC=30
@@ -22,6 +23,7 @@ python %RUNNER_SCRIPT% ^
   --csv-path %CSV% ^
   --runs %RUNS% ^
   --window-sec %WINDOW_SEC% ^
+  --switch-eval-ticks %SWITCH_EVAL_TICKS% ^
   --tracking-sec %TRACKING_SEC% ^
   --future-sec %FUTURE_SEC% ^
   --fixed-delta 0.1 ^
