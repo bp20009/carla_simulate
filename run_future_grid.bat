@@ -12,6 +12,8 @@ if "%OUTDIR%"=="" set "OUTDIR=results_grid"
 
 set "REPLAY_SCRIPT=scripts\udp_replay\replay_from_udp_future_exp.py"
 set "SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py"
+set "LSTM_MODEL=scripts\udp_replay\traj_lstm.pt"
+set "LSTM_DEVICE=cpu"
 
 set "FIXED_DELTA=0.1"
 set "POLL_INTERVAL=0.1"
@@ -80,11 +82,16 @@ for %%M in (autopilot lstm) do (
       set "RAN_OK=1"
       set "STATUS=ok"
 
+      set "LSTM_ARGS="
+      if /I "%%M"=="lstm" (
+        set "LSTM_ARGS=--lstm-model ""%LSTM_MODEL%"" --lstm-device %LSTM_DEVICE%"
+      )
+
       for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen(sys.argv[1:]); print(p.pid)" ^
         "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
         --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%MAX_RUNTIME%" --tm-seed "!SEED!" ^
         --future-mode "%%M" --switch-payload-frame "!SWITCH_PF!" --metadata-output "!RUN_META!" --collision-log "!RUN_COLL!" ^
-        --actor-log "!RUN_ACTOR!" --id-map-file "!RUN_IDMAP!"') do set "REPLAY_PID=%%p"
+        --actor-log "!RUN_ACTOR!" --id-map-file "!RUN_IDMAP!" !LSTM_ARGS!') do set "REPLAY_PID=%%p"
 
       timeout /t %STARTUP_DELAY% /nobreak >nul
       python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
