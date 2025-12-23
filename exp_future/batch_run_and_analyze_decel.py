@@ -302,10 +302,15 @@ def _analyze_decel_at_switch(
     switch_frame: int,
     fixed_delta: float,
     eval_ticks: int,
+    mode: Literal["post", "pre"] = "post",
 ) -> Tuple[Optional[float], str]:
-    """Return (accel(m/s^2), status) right around switch using eval_ticks."""
+    """Return (min_accel(m/s^2), status) around switch."""
     if eval_ticks <= 0:
         return None, "eval_ticks<=0"
+    if fixed_delta <= 0:
+        return None, "fixed_delta<=0"
+    if not points:
+        return None, "no_points"
 
     points.sort(key=lambda item: item[0])
 
@@ -315,36 +320,69 @@ def _analyze_decel_at_switch(
             i1 = i
             break
     if i1 is None:
-        return None, "no_point_after_switch"
-    if i1 == 0:
-        return None, "no_point_before_switch"
+        return None, "no_point_at_or_after_switch"
 
-    start = i1 - 1
-    need_points = eval_ticks + 2
-    if start + need_points > len(points):
-        return None, "not_enough_points"
-
-    speeds: List[float] = []
-    dts: List[float] = []
-    for k in range(eval_ticks + 1):
-        f1, x1, y1, z1, *_ = points[start + k]
-        f2, x2, y2, z2, *_ = points[start + k + 1]
+    def _speed_between(
+        p1: Tuple[int, float, float, float, str, str],
+        p2: Tuple[int, float, float, float, str, str],
+    ) -> Tuple[Optional[float], str, Optional[float]]:
+        f1, x1, y1, z1, *_ = p1
+        f2, x2, y2, z2, *_ = p2
         frame_delta = f2 - f1
         if frame_delta <= 0:
-            return None, "non_increasing_frame"
+            return None, "non_increasing_frame", None
         dt = frame_delta * fixed_delta
         if dt <= 0:
-            return None, "non_positive_dt"
+            return None, "non_positive_dt", None
         dx = x2 - x1
         dy = y2 - y1
         dz = z2 - z1
         v = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+        return v, "ok", dt
+
+    if mode == "post":
+        start = i1 - 1
+        if start < 0:
+            return None, "no_point_before_switch"
+        end = start + (eval_ticks + 1)
+        if end + 1 >= len(points):
+            return None, "not_enough_points_post"
+        base_idx = start
+    else:
+        end_point = i1 - 1
+        if end_point <= 0:
+            return None, "not_enough_points_pre"
+        start_point = end_point - (eval_ticks + 1)
+        if start_point < 0:
+            return None, "not_enough_points_pre"
+        base_idx = start_point
+        if base_idx + (eval_ticks + 2) > len(points):
+            return None, "not_enough_points_pre"
+
+    speeds: List[float] = []
+    dts: List[float] = []
+
+    for k in range(eval_ticks + 1):
+        p1 = points[base_idx + k]
+        p2 = points[base_idx + k + 1]
+        v, status, dt = _speed_between(p1, p2)
+        if v is None or dt is None:
+            return None, status
         speeds.append(v)
         dts.append(dt)
 
-    if len(speeds) < 2 or dts[1] <= 0:
-        return None, "insufficient_segments"
-    return (speeds[1] - speeds[0]) / dts[1], "ok"
+    min_accel: Optional[float] = None
+    for k in range(eval_ticks):
+        dt = dts[k + 1]
+        if dt <= 0:
+            continue
+        accel = (speeds[k + 1] - speeds[k]) / dt
+        if min_accel is None or accel < min_accel:
+            min_accel = accel
+
+    if min_accel is None:
+        return None, "no_valid_accel"
+    return min_accel, "ok"
 
 
 def _analyze_deceleration(
