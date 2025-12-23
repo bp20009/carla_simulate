@@ -13,9 +13,12 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
+from typing import Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
 
 import carla
+import torch
+import torch.nn as nn
+from collections import deque
 
 LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +88,24 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "Optional lead time (seconds) used to compute the autopilot switch frame "
             "when only an end payload frame is provided"
         ),
+    )
+    parser.add_argument(
+        "--future-mode",
+        default="autopilot",
+        choices=("autopilot", "lstm", "none"),
+        help="Future simulation method after switch (default: autopilot)",
+    )
+    parser.add_argument(
+        "--collision-log",
+        default=None,
+        help="CSV path to write collision/accident events",
+    )
+    parser.add_argument("--lstm-model", default=None, help="Path to traj_lstm.pt")
+    parser.add_argument(
+        "--lstm-device",
+        default="cpu",
+        choices=("cpu", "cuda"),
+        help="Device for LSTM",
     )
     parser.add_argument(
         "--log-level",
@@ -197,6 +218,9 @@ class EntityRecord:
     control_mode: str = "direct"
     collision_sensor: Optional[carla.Sensor] = None
     last_payload_frame: Optional[int] = None
+    lstm_history: Optional[Deque[Tuple[float, float]]] = None
+    lstm_plan: Optional[List[Tuple[float, float]]] = None
+    lstm_step: int = 0
 
 
 class ControlStateBroadcaster:
@@ -340,6 +364,7 @@ class ActorCSVLogger:
             self._actor_file = None
             self._actor_writer = None
 
+
 class PIDController:
     """Simple PID controller for throttle and steering outputs."""
 
@@ -385,6 +410,31 @@ class PIDController:
             output = max(low, min(output, high))
 
         return output
+
+
+class TrajLSTM(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int = 2,
+        hidden_dim: int = 64,
+        num_layers: int = 1,
+        horizon_steps: int = 10,
+    ) -> None:
+        super().__init__()
+        self.horizon_steps = horizon_steps
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.fc = nn.Linear(hidden_dim, horizon_steps * feature_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)
+        last = out[:, -1, :]
+        pred = self.fc(last)
+        return pred.view(pred.size(0), self.horizon_steps, -1)
 
 
 def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
@@ -544,10 +594,12 @@ class CollisionLogger:
         world: carla.World,
         *,
         payload_frame_getter: Optional[Callable[[], Optional[int]]] = None,
+        log_path: Optional[str] = None,
     ) -> None:
         self._world = world
         self._blueprint = world.get_blueprint_library().find("sensor.other.collision")
-        self._log_path = Path("pred_collisions.csv")
+        self._log_path = Path(log_path) if log_path else Path("pred_collisions.csv")
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_file = self._log_path.open("w", newline="")
         self._writer = csv.writer(self._log_file)
         self._writer.writerow(
@@ -572,6 +624,7 @@ class CollisionLogger:
         self._pending_by_frame: Dict[Tuple[int, int], Tuple[List[object], float]] = {}
         self._last_flushed_frame = -1
         self._last_accident_time: Dict[int, float] = {}
+        self._accident_summaries: List[Dict[str, object]] = []
         self._payload_frame_getter = payload_frame_getter
 
     @staticmethod
@@ -701,6 +754,16 @@ class CollisionLogger:
                     contact_point.z,
                     intensity,
                 )
+                self._accident_summaries.append(
+                    {
+                        "time_sec": float(timestamp),
+                        "payload_frame": int(payload_frame),
+                        "carla_frame": int(carla_frame),
+                        "actor_id": int(actor.id),
+                        "other_id": int(other_id) if other_id is not None else None,
+                        "intensity": float(intensity),
+                    }
+                )
 
         return _on_collision
 
@@ -749,6 +812,9 @@ class CollisionLogger:
         self.flush_all()
         self._log_file.close()
 
+    def accident_summaries(self) -> List[Dict[str, object]]:
+        return list(self._accident_summaries)
+
 
 class EntityManager:
     def __init__(
@@ -761,6 +827,8 @@ class EntityManager:
         enable_completion: bool = False,
         use_lstm_target: bool = False,
         actor_logger: Optional[ActorCSVLogger] = None,
+        lstm_model_path: Optional[str] = None,
+        lstm_device: str = "cpu",
     ) -> None:
         self._world = world
         self._map = world.get_map()
@@ -782,6 +850,33 @@ class EntityManager:
 
         # autopilot 有効化済みかどうか
         self._autopilot_enabled = False
+        self._lstm: Optional[TrajLSTM] = None
+        self._lstm_history_steps: Optional[int] = None
+        self._lstm_horizon_steps: Optional[int] = None
+        self._lstm_device = lstm_device
+
+        if lstm_model_path:
+            ckpt = torch.load(lstm_model_path, map_location=lstm_device)
+            history_steps = int(ckpt.get("history_steps", 10))
+            horizon_steps = int(ckpt.get("horizon_steps", 50))
+            model = TrajLSTM(
+                feature_dim=2,
+                hidden_dim=64,
+                num_layers=1,
+                horizon_steps=horizon_steps,
+            )
+            model.load_state_dict(ckpt["state_dict"])
+            model.eval()
+            self._lstm = model.to(lstm_device)
+            self._lstm_history_steps = history_steps
+            self._lstm_horizon_steps = horizon_steps
+            LOGGER.info(
+                "Loaded LSTM model: %s (history=%d, horizon=%d, device=%s)",
+                lstm_model_path,
+                history_steps,
+                horizon_steps,
+                lstm_device,
+            )
 
     @property
     def entities(self) -> Mapping[str, EntityRecord]:
@@ -1068,6 +1163,16 @@ class EntityManager:
             record.last_payload_frame = state.payload_frame
         if not record.autopilot_enabled:
             record.control_mode = "tracking"
+        if (
+            record.object_type in {"vehicle", "bicycle"}
+            and self._lstm is not None
+            and self._lstm_history_steps is not None
+        ):
+            if record.lstm_history is None:
+                record.lstm_history = deque(maxlen=self._lstm_history_steps)
+            dx = float(new_location.x - previous_target.x)
+            dy = float(new_location.y - previous_target.y)
+            record.lstm_history.append((dx, dy))
 
         if timing_start_ns is not None and self._frame_start_ns is not None:
             self._actor_timings.append(
@@ -1114,6 +1219,67 @@ class EntityManager:
         if logger is None:
             return
         logger.log_frame(payload_frame, carla_frame, self._entities)
+
+    def prepare_lstm_plans(self) -> None:
+        if (
+            self._lstm is None
+            or self._lstm_history_steps is None
+            or self._lstm_horizon_steps is None
+        ):
+            LOGGER.warning("LSTM is not available; cannot prepare plans.")
+            return
+
+        for record in self._entities.values():
+            if record.object_type not in {"vehicle", "bicycle"}:
+                continue
+            if record.lstm_history is None or len(record.lstm_history) < self._lstm_history_steps:
+                LOGGER.warning(
+                    "Insufficient LSTM history for actor %d; len=%s",
+                    record.actor.id,
+                    0 if record.lstm_history is None else len(record.lstm_history),
+                )
+                record.lstm_plan = None
+                record.lstm_step = 0
+                continue
+
+            history = list(record.lstm_history)[-self._lstm_history_steps :]
+            x = torch.tensor(
+                history, dtype=torch.float32, device=self._lstm_device
+            ).unsqueeze(0)
+            with torch.no_grad():
+                pred = self._lstm(x)
+            plan = pred.squeeze(0).detach().cpu().tolist()
+            record.lstm_plan = [(float(d[0]), float(d[1])) for d in plan]
+            record.lstm_step = 0
+            LOGGER.info(
+                "Prepared LSTM plan for actor %d: steps=%d",
+                record.actor.id,
+                len(record.lstm_plan),
+            )
+
+    def update_lstm_targets(self) -> None:
+        if self._lstm is None:
+            return
+        for record in self._entities.values():
+            if record.object_type not in {"vehicle", "bicycle"}:
+                continue
+            if not record.actor.is_alive:
+                continue
+            if not record.lstm_plan or record.lstm_step >= len(record.lstm_plan):
+                continue
+
+            dx, dy = record.lstm_plan[record.lstm_step]
+            record.lstm_step += 1
+            try:
+                current_location = record.actor.get_transform().location
+            except RuntimeError:
+                continue
+
+            record.predicted_target = carla.Location(
+                x=float(current_location.x + dx),
+                y=float(current_location.y + dy),
+                z=float(current_location.z),
+            )
 
     def step_all(self, dt: float) -> None:
         if not self._entities:
@@ -1280,11 +1446,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         timing_output=timing_file,
         enable_completion=args.enable_completion,
         actor_logger=actor_logger,
+        lstm_model_path=args.lstm_model,
+        lstm_device=args.lstm_device,
     )
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
     collision_logger = CollisionLogger(
-        world, payload_frame_getter=lambda: manager.current_payload_frame
+        world,
+        payload_frame_getter=lambda: manager.current_payload_frame,
+        log_path=args.collision_log,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1302,8 +1472,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     switch_payload_frame = args.switch_payload_frame
     end_payload_frame = args.end_payload_frame
     computed_switch_payload_frame: Optional[int] = None
+    future_mode_kind = args.future_mode
+    if future_mode_kind == "none":
+        switch_payload_frame = None
     if (
         switch_payload_frame is None
+        and future_mode_kind != "none"
         and end_payload_frame is not None
         and args.lead_time_sec is not None
         and args.fixed_delta > 0.0
@@ -1326,6 +1500,10 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     first_frame: Optional[int] = None
     switch_frame: Optional[int] = None
     end_frame: Optional[int] = None
+    first_payload_frame: Optional[int] = None
+    last_payload_frame: Optional[int] = None
+    switch_payload_frame_observed: Optional[int] = None
+    switch_reason: Optional[str] = None
 
     try:
         with synchronous_mode(world, args.fixed_delta):
@@ -1357,11 +1535,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 return 1
                             else:
                                 for raw_message in decode_messages(payload):
-                                    payload_frame = extract_payload_frame(raw_message)
-                                    manager.update_payload_frame(payload_frame)
-                                    try:
-                                        state = normalise_message(
-                                            raw_message, payload_frame=payload_frame
+                                payload_frame = extract_payload_frame(raw_message)
+                                manager.update_payload_frame(payload_frame)
+                                if payload_frame is not None:
+                                    if first_payload_frame is None:
+                                        first_payload_frame = payload_frame
+                                    last_payload_frame = payload_frame
+                                try:
+                                    state = normalise_message(
+                                        raw_message, payload_frame=payload_frame
                                         )
                                     except MissingTargetDataError as exc:
                                         LOGGER.warning("Incomplete target data: %s", exc)
@@ -1389,6 +1571,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             and has_received_first_data
                             and tracking_start_time is not None
                             and (now - tracking_start_time) >= TRACKING_PHASE_DURATION
+                            and future_mode_kind != "none"
                         ):
                             LOGGER.info(
                                 "Switching to future simulation mode (autopilot) "
@@ -1397,12 +1580,19 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             )
                             switch_wall_time = time.monotonic()
                             future_mode = True
-                            manager.enable_autopilot(traffic_manager)
+                            switch_reason = "time_based"
+                            switch_payload_frame_observed = current_payload_frame
+                            if future_mode_kind == "autopilot":
+                                manager.enable_autopilot(traffic_manager)
+                            elif future_mode_kind == "lstm":
+                                manager._use_lstm_target = True
+                                manager.prepare_lstm_plans()
                         elif (
                             switch_payload_frame is not None
                             and not future_mode
                             and current_payload_frame is not None
                             and current_payload_frame >= switch_payload_frame
+                            and future_mode_kind != "none"
                         ):
                             LOGGER.info(
                                 "Switching to future simulation mode (autopilot) "
@@ -1411,7 +1601,13 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             )
                             switch_wall_time = time.monotonic()
                             future_mode = True
-                            manager.enable_autopilot(traffic_manager)
+                            switch_reason = "payload_frame"
+                            switch_payload_frame_observed = current_payload_frame
+                            if future_mode_kind == "autopilot":
+                                manager.enable_autopilot(traffic_manager)
+                            elif future_mode_kind == "lstm":
+                                manager._use_lstm_target = True
+                                manager.prepare_lstm_plans()
 
                     current_payload_frame = manager.current_payload_frame
 
@@ -1438,8 +1634,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         current_time = time.monotonic()
                         elapsed = args.fixed_delta
 
-                    # トラッキングフェーズ中だけ自前 PID で target へ追従
-                    if not future_mode:
+                    if future_mode and future_mode_kind == "lstm":
+                        manager.update_lstm_targets()
+
+                    # autopilot では future_mode 中は step_all しない．
+                    # lstm では future_mode 中も predicted_target へ追従する．
+                    if (not future_mode) or (future_mode and future_mode_kind == "lstm"):
                         manager.step_all(elapsed)
                     # future_mode のときは Traffic Manager / autopilot が制御するので
                     # ここでは何もしない（world.tick() だけ進める）
@@ -1489,6 +1689,16 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         metadata["first_frame"] = first_frame
         metadata["switch_frame"] = switch_frame
         metadata["end_frame"] = end_frame
+        metadata["future_mode"] = future_mode_kind
+        metadata["first_payload_frame"] = first_payload_frame
+        metadata["last_payload_frame"] = last_payload_frame
+        metadata["switch_payload_frame_raw"] = args.switch_payload_frame
+        metadata["switch_payload_frame_used"] = switch_payload_frame
+        metadata["switch_payload_frame_observed"] = switch_payload_frame_observed
+        metadata["switch_reason"] = switch_reason
+        metadata["end_payload_frame"] = end_payload_frame
+        metadata["computed_switch_payload_frame"] = computed_switch_payload_frame
+        metadata["accidents"] = collision_logger.accident_summaries()
         metadata["lead_time_seconds"] = metadata.get("lead_time_seconds") or (
             switch_wall_time - tracking_start_time
             if switch_wall_time is not None and tracking_start_time is not None
