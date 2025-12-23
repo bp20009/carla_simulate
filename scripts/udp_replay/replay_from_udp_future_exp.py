@@ -87,6 +87,17 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--future-mode",
+        default="autopilot",
+        choices=("autopilot", "lstm", "none"),
+        help="Future simulation method after switch (default: autopilot)",
+    )
+    parser.add_argument(
+        "--collision-log",
+        default=None,
+        help="CSV path to write collision/accident events",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
@@ -340,6 +351,7 @@ class ActorCSVLogger:
             self._actor_file = None
             self._actor_writer = None
 
+
 class PIDController:
     """Simple PID controller for throttle and steering outputs."""
 
@@ -544,10 +556,12 @@ class CollisionLogger:
         world: carla.World,
         *,
         payload_frame_getter: Optional[Callable[[], Optional[int]]] = None,
+        log_path: Optional[str] = None,
     ) -> None:
         self._world = world
         self._blueprint = world.get_blueprint_library().find("sensor.other.collision")
-        self._log_path = Path("pred_collisions.csv")
+        self._log_path = Path(log_path) if log_path else Path("pred_collisions.csv")
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_file = self._log_path.open("w", newline="")
         self._writer = csv.writer(self._log_file)
         self._writer.writerow(
@@ -572,6 +586,7 @@ class CollisionLogger:
         self._pending_by_frame: Dict[Tuple[int, int], Tuple[List[object], float]] = {}
         self._last_flushed_frame = -1
         self._last_accident_time: Dict[int, float] = {}
+        self._accident_summaries: List[Dict[str, object]] = []
         self._payload_frame_getter = payload_frame_getter
 
     @staticmethod
@@ -701,6 +716,16 @@ class CollisionLogger:
                     contact_point.z,
                     intensity,
                 )
+                self._accident_summaries.append(
+                    {
+                        "time_sec": float(timestamp),
+                        "payload_frame": int(payload_frame),
+                        "carla_frame": int(carla_frame),
+                        "actor_id": int(actor.id),
+                        "other_id": int(other_id) if other_id is not None else None,
+                        "intensity": float(intensity),
+                    }
+                )
 
         return _on_collision
 
@@ -748,6 +773,9 @@ class CollisionLogger:
     def shutdown(self) -> None:
         self.flush_all()
         self._log_file.close()
+
+    def accident_summaries(self) -> List[Dict[str, object]]:
+        return list(self._accident_summaries)
 
 
 class EntityManager:
@@ -1284,7 +1312,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
     collision_logger = CollisionLogger(
-        world, payload_frame_getter=lambda: manager.current_payload_frame
+        world,
+        payload_frame_getter=lambda: manager.current_payload_frame,
+        log_path=args.collision_log,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1302,8 +1332,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     switch_payload_frame = args.switch_payload_frame
     end_payload_frame = args.end_payload_frame
     computed_switch_payload_frame: Optional[int] = None
+    future_mode_kind = args.future_mode
+    if future_mode_kind == "none":
+        switch_payload_frame = None
     if (
         switch_payload_frame is None
+        and future_mode_kind != "none"
         and end_payload_frame is not None
         and args.lead_time_sec is not None
         and args.fixed_delta > 0.0
@@ -1326,6 +1360,10 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     first_frame: Optional[int] = None
     switch_frame: Optional[int] = None
     end_frame: Optional[int] = None
+    first_payload_frame: Optional[int] = None
+    last_payload_frame: Optional[int] = None
+    switch_payload_frame_observed: Optional[int] = None
+    switch_reason: Optional[str] = None
 
     try:
         with synchronous_mode(world, args.fixed_delta):
@@ -1357,11 +1395,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 return 1
                             else:
                                 for raw_message in decode_messages(payload):
-                                    payload_frame = extract_payload_frame(raw_message)
-                                    manager.update_payload_frame(payload_frame)
-                                    try:
-                                        state = normalise_message(
-                                            raw_message, payload_frame=payload_frame
+                                payload_frame = extract_payload_frame(raw_message)
+                                manager.update_payload_frame(payload_frame)
+                                if payload_frame is not None:
+                                    if first_payload_frame is None:
+                                        first_payload_frame = payload_frame
+                                    last_payload_frame = payload_frame
+                                try:
+                                    state = normalise_message(
+                                        raw_message, payload_frame=payload_frame
                                         )
                                     except MissingTargetDataError as exc:
                                         LOGGER.warning("Incomplete target data: %s", exc)
@@ -1389,6 +1431,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             and has_received_first_data
                             and tracking_start_time is not None
                             and (now - tracking_start_time) >= TRACKING_PHASE_DURATION
+                            and future_mode_kind != "none"
                         ):
                             LOGGER.info(
                                 "Switching to future simulation mode (autopilot) "
@@ -1397,12 +1440,18 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             )
                             switch_wall_time = time.monotonic()
                             future_mode = True
-                            manager.enable_autopilot(traffic_manager)
+                            switch_reason = "time_based"
+                            switch_payload_frame_observed = current_payload_frame
+                            if future_mode_kind == "autopilot":
+                                manager.enable_autopilot(traffic_manager)
+                            elif future_mode_kind == "lstm":
+                                manager._use_lstm_target = True
                         elif (
                             switch_payload_frame is not None
                             and not future_mode
                             and current_payload_frame is not None
                             and current_payload_frame >= switch_payload_frame
+                            and future_mode_kind != "none"
                         ):
                             LOGGER.info(
                                 "Switching to future simulation mode (autopilot) "
@@ -1411,7 +1460,12 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             )
                             switch_wall_time = time.monotonic()
                             future_mode = True
-                            manager.enable_autopilot(traffic_manager)
+                            switch_reason = "payload_frame"
+                            switch_payload_frame_observed = current_payload_frame
+                            if future_mode_kind == "autopilot":
+                                manager.enable_autopilot(traffic_manager)
+                            elif future_mode_kind == "lstm":
+                                manager._use_lstm_target = True
 
                     current_payload_frame = manager.current_payload_frame
 
@@ -1438,8 +1492,9 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         current_time = time.monotonic()
                         elapsed = args.fixed_delta
 
-                    # トラッキングフェーズ中だけ自前 PID で target へ追従
-                    if not future_mode:
+                    # autopilot では future_mode 中は step_all しない．
+                    # lstm では future_mode 中も predicted_target へ追従する．
+                    if (not future_mode) or (future_mode and future_mode_kind == "lstm"):
                         manager.step_all(elapsed)
                     # future_mode のときは Traffic Manager / autopilot が制御するので
                     # ここでは何もしない（world.tick() だけ進める）
@@ -1489,6 +1544,16 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         metadata["first_frame"] = first_frame
         metadata["switch_frame"] = switch_frame
         metadata["end_frame"] = end_frame
+        metadata["future_mode"] = future_mode_kind
+        metadata["first_payload_frame"] = first_payload_frame
+        metadata["last_payload_frame"] = last_payload_frame
+        metadata["switch_payload_frame_raw"] = args.switch_payload_frame
+        metadata["switch_payload_frame_used"] = switch_payload_frame
+        metadata["switch_payload_frame_observed"] = switch_payload_frame_observed
+        metadata["switch_reason"] = switch_reason
+        metadata["end_payload_frame"] = end_payload_frame
+        metadata["computed_switch_payload_frame"] = computed_switch_payload_frame
+        metadata["accidents"] = collision_logger.accident_summaries()
         metadata["lead_time_seconds"] = metadata.get("lead_time_seconds") or (
             switch_wall_time - tracking_start_time
             if switch_wall_time is not None and tracking_start_time is not None
