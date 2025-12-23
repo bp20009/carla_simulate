@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 setlocal enabledelayedexpansion
 
 if "%~1"=="" (
@@ -42,7 +43,7 @@ set "CALIB_COLL=%CALIB_LOGS%\collisions.csv"
 mkdir "%CALIB_LOGS%" >nul 2>&1
 
 echo [calibration] starting...
-for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen(sys.argv[1:]); print(p.pid)" ^
+for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen([sys.executable]+sys.argv[1:]); print(p.pid)" ^
   "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
   --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%MAX_RUNTIME%" --tm-seed "%BASE_SEED%" ^
   --future-mode none --metadata-output "%CALIB_META%" --collision-log "%CALIB_COLL%"') do set "REPLAY_PID=%%p"
@@ -87,7 +88,7 @@ for %%M in (autopilot lstm) do (
         set "LSTM_ARGS=--lstm-model ""!LSTM_MODEL!"" --lstm-device !LSTM_DEVICE!"
       )
 
-      for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen(sys.argv[1:]); print(p.pid)" ^
+      for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen([sys.executable]+sys.argv[1:]); print(p.pid)" ^
         "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
         --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%MAX_RUNTIME%" --tm-seed "!SEED!" ^
         --future-mode "%%M" --switch-payload-frame "!SWITCH_PF!" --metadata-output "!RUN_META!" --collision-log "!RUN_COLL!" ^
