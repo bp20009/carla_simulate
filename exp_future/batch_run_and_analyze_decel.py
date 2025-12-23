@@ -362,6 +362,63 @@ def _analyze_decel_at_switch(
     return (v2 - v1) / dt2
 
 
+def _analyze_decel_before_switch(
+    points: List[Tuple[int, float, float, float, str, str]],
+    *,
+    switch_frame: int,
+    fixed_delta: float,
+    eval_ticks: int,
+) -> Optional[float]:
+    """Return acceleration (m/s^2) immediately before switch using eval_ticks.
+
+    Robust definition:
+      - Find idx0 = first point whose frame_id >= switch_frame
+      - Use the eval_ticks segments just BEFORE idx0 (requires eval_ticks+1 points)
+      - Compute accel from the last two segment speeds in that pre-switch window
+    """
+    if eval_ticks <= 0:
+        return None
+
+    points.sort(key=lambda item: item[0])
+
+    idx0 = None
+    for i, (frame_id, *_rest) in enumerate(points):
+        if frame_id >= switch_frame:
+            idx0 = i
+            break
+    if idx0 is None:
+        return None
+
+    need_points = eval_ticks + 1
+    start = idx0 - need_points
+    end = idx0
+    if start < 0 or end - start < need_points:
+        return None
+
+    seg_speeds: List[Tuple[float, float]] = []
+    for idx in range(eval_ticks):
+        f1, x1, y1, z1, *_ = points[start + idx]
+        f2, x2, y2, z2, *_ = points[start + idx + 1]
+        frame_delta = f2 - f1
+        if frame_delta <= 0:
+            return None
+        dt = frame_delta * fixed_delta
+        dx = x2 - x1
+        dy = y2 - y1
+        dz = z2 - z1
+        speed = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+        seg_speeds.append((speed, dt))
+
+    if len(seg_speeds) < 2:
+        return None
+
+    v_prev, _dt_prev = seg_speeds[-2]
+    v_last, dt_last = seg_speeds[-1]
+    if dt_last <= 0:
+        return None
+    return (v_last - v_prev) / dt_last
+
+
 def _analyze_deceleration(
     actor_log_path: Path,
     metadata_path: Path,
