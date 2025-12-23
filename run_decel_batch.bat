@@ -9,7 +9,7 @@ set REPLAY_SCRIPT=scripts\udp_replay\replay_from_udp_carla_pred.py
 set SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py
 set CSV=send_data\exp_accident.csv
 
-set RUNS=100
+set RUNS=10
 set WINDOW_SEC=2.0
 set SWITCH_EVAL_TICKS=2
 
