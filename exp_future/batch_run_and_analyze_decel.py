@@ -45,6 +45,9 @@ class RunSummary:
     switch_frame_used_reason: str
     switch_eval_ticks: int
     hard_brake_threshold: float
+    run_status: str
+    switch_eval_status: str
+    pre_switch_eval_status: str
 
 
 def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -238,35 +241,35 @@ def _coerce_float(value: object) -> Optional[float]:
         return None
 
 
-def _normalize_switch_frame(
+def _decide_switch_frame_from_metadata(
     metadata: Dict[str, object],
+    *,
+    tracking_sec: float,
+    fixed_delta: float,
+    tolerance_ticks: int = 2,
 ) -> Tuple[Optional[int], Optional[int], str]:
-    """Return (switch_frame_raw, switch_frame_used, reason)."""
-    first_frame = _coerce_int(metadata.get("first_frame"))
-    switch_raw = _coerce_int(metadata.get("switch_frame"))
+    raw = _coerce_int(metadata.get("switch_frame"))
+    first = _coerce_int(metadata.get("first_frame"))
     end_frame = _coerce_int(metadata.get("end_frame"))
-    fixed_delta = _coerce_float(metadata.get("fixed_delta_seconds"))
-    tracking_sec = _coerce_float(metadata.get("tracking_phase_duration_seconds"))
-    lead_time = _coerce_float(metadata.get("lead_time_seconds"))
 
-    if switch_raw is None:
-        return None, None, "raw_is_none"
+    if first is None or fixed_delta <= 0 or tracking_sec <= 0:
+        return raw, raw, "use_raw_or_missing_first"
 
-    if (
-        first_frame is not None
-        and fixed_delta is not None
-        and fixed_delta > 0
-        and tracking_sec is not None
-        and tracking_sec > 0
-        and (lead_time is None or abs(lead_time) < 1e-9)
-        and switch_raw == first_frame
-    ):
-        expected = first_frame + int(round(tracking_sec / fixed_delta))
-        if end_frame is not None:
-            expected = min(expected, end_frame)
-        return switch_raw, expected, "expected_from_first+tracking"
+    expected = first + int(round(tracking_sec / fixed_delta))
+    if raw is None:
+        return expected, raw, "raw_missing_expected_from_first+tracking"
 
-    return switch_raw, switch_raw, "use_raw"
+    suspicious = False
+    if raw == first:
+        suspicious = True
+    if end_frame is not None and raw == end_frame:
+        suspicious = True
+    if abs(raw - expected) > tolerance_ticks:
+        suspicious = True
+
+    if suspicious:
+        return expected, raw, "expected_from_first+tracking"
+    return raw, raw, "use_raw"
 
 
 def _parse_actor_log(actor_log_path: Path) -> Dict[str, List[Tuple[int, float, float, float, str, str]]]:
@@ -299,124 +302,49 @@ def _analyze_decel_at_switch(
     switch_frame: int,
     fixed_delta: float,
     eval_ticks: int,
-    mode: Literal["pre", "post"],
-) -> Optional[float]:
-    """Return acceleration (m/s^2) right around switch using eval_ticks=2 convention.
-
-    eval_ticks=2 -> need 3 points, compute 2 segment speeds, then accel=(v2-v1)/dt2.
-    mode="pre"  -> use [idx0-2, idx0-1, idx0]
-    mode="post" -> use [idx0, idx0+1, idx0+2]
-    """
+) -> Tuple[Optional[float], str]:
+    """Return (accel(m/s^2), status) right around switch using eval_ticks."""
     if eval_ticks <= 0:
-        return None
-    if eval_ticks != 2:
-        return None
+        return None, "eval_ticks<=0"
 
     points.sort(key=lambda item: item[0])
 
-    idx0 = None
+    i1 = None
     for i, (frame_id, *_rest) in enumerate(points):
         if frame_id >= switch_frame:
-            idx0 = i
+            i1 = i
             break
-    if idx0 is None:
-        return None
+    if i1 is None:
+        return None, "no_point_after_switch"
+    if i1 == 0:
+        return None, "no_point_before_switch"
 
-    if mode == "pre":
-        if idx0 - 2 < 0:
-            return None
-        p0 = points[idx0 - 2]
-        p1 = points[idx0 - 1]
-        p2 = points[idx0]
-    else:
-        if idx0 + 2 >= len(points):
-            return None
-        p0 = points[idx0]
-        p1 = points[idx0 + 1]
-        p2 = points[idx0 + 2]
+    start = i1 - 1
+    need_points = eval_ticks + 2
+    if start + need_points > len(points):
+        return None, "not_enough_points"
 
-    def _speed(
-        pa: Tuple[int, float, float, float, str, str],
-        pb: Tuple[int, float, float, float, str, str],
-    ) -> Optional[Tuple[float, float]]:
-        f1, x1, y1, z1, *_ = pa
-        f2, x2, y2, z2, *_ = pb
+    speeds: List[float] = []
+    dts: List[float] = []
+    for k in range(eval_ticks + 1):
+        f1, x1, y1, z1, *_ = points[start + k]
+        f2, x2, y2, z2, *_ = points[start + k + 1]
         frame_delta = f2 - f1
         if frame_delta <= 0:
-            return None
+            return None, "non_increasing_frame"
         dt = frame_delta * fixed_delta
         if dt <= 0:
-            return None
+            return None, "non_positive_dt"
         dx = x2 - x1
         dy = y2 - y1
         dz = z2 - z1
         v = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
-        return v, dt
+        speeds.append(v)
+        dts.append(dt)
 
-    s01 = _speed(p0, p1)
-    s12 = _speed(p1, p2)
-    if s01 is None or s12 is None:
-        return None
-    v1, _dt1 = s01
-    v2, dt2 = s12
-    return (v2 - v1) / dt2
-
-
-def _analyze_decel_before_switch(
-    points: List[Tuple[int, float, float, float, str, str]],
-    *,
-    switch_frame: int,
-    fixed_delta: float,
-    eval_ticks: int,
-) -> Optional[float]:
-    """Return acceleration (m/s^2) immediately before switch using eval_ticks.
-
-    Robust definition:
-      - Find idx0 = first point whose frame_id >= switch_frame
-      - Use the eval_ticks segments just BEFORE idx0 (requires eval_ticks+1 points)
-      - Compute accel from the last two segment speeds in that pre-switch window
-    """
-    if eval_ticks <= 0:
-        return None
-
-    points.sort(key=lambda item: item[0])
-
-    idx0 = None
-    for i, (frame_id, *_rest) in enumerate(points):
-        if frame_id >= switch_frame:
-            idx0 = i
-            break
-    if idx0 is None:
-        return None
-
-    need_points = eval_ticks + 1
-    start = idx0 - need_points
-    end = idx0
-    if start < 0 or end - start < need_points:
-        return None
-
-    seg_speeds: List[Tuple[float, float]] = []
-    for idx in range(eval_ticks):
-        f1, x1, y1, z1, *_ = points[start + idx]
-        f2, x2, y2, z2, *_ = points[start + idx + 1]
-        frame_delta = f2 - f1
-        if frame_delta <= 0:
-            return None
-        dt = frame_delta * fixed_delta
-        dx = x2 - x1
-        dy = y2 - y1
-        dz = z2 - z1
-        speed = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
-        seg_speeds.append((speed, dt))
-
-    if len(seg_speeds) < 2:
-        return None
-
-    v_prev, _dt_prev = seg_speeds[-2]
-    v_last, dt_last = seg_speeds[-1]
-    if dt_last <= 0:
-        return None
-    return (v_last - v_prev) / dt_last
+    if len(speeds) < 2 or dts[1] <= 0:
+        return None, "insufficient_segments"
+    return (speeds[1] - speeds[0]) / dts[1], "ok"
 
 
 def _analyze_deceleration(
@@ -429,9 +357,18 @@ def _analyze_deceleration(
 ) -> Tuple[List[ActorDecelResult], RunSummary]:
     metadata = _load_metadata(metadata_path)
     fixed_delta_seconds = metadata.get("fixed_delta_seconds")
-    switch_raw, switch_used, switch_reason = _normalize_switch_frame(metadata)
-
     fixed_delta = float(fixed_delta_seconds) if fixed_delta_seconds else None
+
+    if fixed_delta is not None and fixed_delta > 0:
+        switch_used, switch_raw, switch_reason = _decide_switch_frame_from_metadata(
+            metadata,
+            tracking_sec=float(metadata.get("tracking_phase_duration_seconds") or 0.0),
+            fixed_delta=fixed_delta,
+            tolerance_ticks=2,
+        )
+    else:
+        switch_used, switch_raw, switch_reason = (None, None, "no_fixed_delta")
+
     switch_frame_int = switch_used
 
     results: List[ActorDecelResult] = []
@@ -444,6 +381,8 @@ def _analyze_deceleration(
     min_accel_pre_switch_actor = None
     hard_brake_pre_switch_count = 0
     delta_min_accel_switch = None
+    switch_eval_status = "not_evaluated"
+    pre_switch_eval_status = "not_evaluated"
 
     if fixed_delta is None or fixed_delta <= 0 or switch_frame_int is None:
         summary = RunSummary(
@@ -464,6 +403,9 @@ def _analyze_deceleration(
             switch_frame_used_reason=switch_reason,
             switch_eval_ticks=switch_eval_ticks,
             hard_brake_threshold=hard_brake_threshold,
+            run_status="invalid_metadata",
+            switch_eval_status="invalid_metadata",
+            pre_switch_eval_status="invalid_metadata",
         )
         return results, summary
 
@@ -471,6 +413,30 @@ def _analyze_deceleration(
     window_end_frame = switch_frame_int + max(window_frames, 0)
 
     records = _parse_actor_log(actor_log_path)
+    if not records:
+        summary = RunSummary(
+            run_id=metadata_path.parent.parent.name,
+            switch_frame=switch_frame_int,
+            switch_frame_raw=switch_raw,
+            window_sec=window_sec,
+            fixed_delta_seconds=fixed_delta,
+            min_accel=None,
+            min_accel_actor=None,
+            min_accel_switch=None,
+            min_accel_switch_actor=None,
+            hard_brake_switch_count=0,
+            min_accel_pre_switch=None,
+            min_accel_pre_switch_actor=None,
+            hard_brake_pre_switch_count=0,
+            delta_min_accel_switch=None,
+            switch_frame_used_reason=switch_reason,
+            switch_eval_ticks=switch_eval_ticks,
+            hard_brake_threshold=hard_brake_threshold,
+            run_status="no_actor_records",
+            switch_eval_status="run_failed_or_no_data",
+            pre_switch_eval_status="run_failed_or_no_data",
+        )
+        return results, summary
     for object_id, points in records.items():
         if points and (points[0][5] or "").lower().startswith("walker."):
             continue
@@ -524,7 +490,7 @@ def _analyze_deceleration(
                 min_accel_frame=actor_min_frame,
             )
         )
-        a_post = _analyze_decel_at_switch(
+        a_post, a_post_status = _analyze_decel_at_switch(
             points,
             switch_frame=switch_frame_int,
             fixed_delta=fixed_delta,
@@ -537,12 +503,11 @@ def _analyze_deceleration(
                 min_accel_switch_actor = object_id
             if a_post <= hard_brake_threshold:
                 hard_brake_switch_count += 1
-        a_pre = _analyze_decel_at_switch(
+        a_pre, a_pre_status = _analyze_decel_at_switch(
             points,
-            switch_frame=switch_frame_int,
+            switch_frame=max(switch_frame_int - 1, 0),
             fixed_delta=fixed_delta,
             eval_ticks=switch_eval_ticks,
-            mode="pre",
         )
         if a_pre is not None:
             if min_accel_pre_switch is None or a_pre < min_accel_pre_switch:
@@ -550,6 +515,14 @@ def _analyze_deceleration(
                 min_accel_pre_switch_actor = object_id
             if a_pre <= hard_brake_threshold:
                 hard_brake_pre_switch_count += 1
+        if a_post_status == "ok":
+            switch_eval_status = "ok"
+        elif switch_eval_status != "ok" and switch_eval_status == "not_evaluated":
+            switch_eval_status = a_post_status
+        if a_pre_status == "ok":
+            pre_switch_eval_status = "ok"
+        elif pre_switch_eval_status != "ok" and pre_switch_eval_status == "not_evaluated":
+            pre_switch_eval_status = a_pre_status
 
     if min_accel_switch is not None and min_accel_pre_switch is not None:
         delta_min_accel_switch = min_accel_switch - min_accel_pre_switch
@@ -572,6 +545,9 @@ def _analyze_deceleration(
         switch_frame_used_reason=switch_reason,
         switch_eval_ticks=switch_eval_ticks,
         hard_brake_threshold=hard_brake_threshold,
+        run_status="ok",
+        switch_eval_status=switch_eval_status,
+        pre_switch_eval_status=pre_switch_eval_status,
     )
     return results, summary
 
@@ -644,6 +620,9 @@ def _write_summary(output_path: Path, summaries: Sequence[RunSummary]) -> None:
                 "min_accel_pre_switch_actor",
                 "hard_brake_pre_switch_count",
                 "delta_min_accel_switch",
+                "run_status",
+                "switch_eval_status",
+                "pre_switch_eval_status",
             ]
         )
         for summary in summaries:
@@ -666,6 +645,9 @@ def _write_summary(output_path: Path, summaries: Sequence[RunSummary]) -> None:
                     summary.min_accel_pre_switch_actor,
                     summary.hard_brake_pre_switch_count,
                     summary.delta_min_accel_switch,
+                    summary.run_status,
+                    summary.switch_eval_status,
+                    summary.pre_switch_eval_status,
                 ]
             )
 
