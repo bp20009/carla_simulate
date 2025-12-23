@@ -533,6 +533,7 @@ def _analyze_deceleration(
             switch_frame=switch_frame_int,
             fixed_delta=fixed_delta,
             eval_ticks=switch_eval_ticks,
+            mode="post",
         )
         if a_post is not None:
             if min_accel_switch is None or a_post < min_accel_switch:

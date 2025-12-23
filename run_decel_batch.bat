@@ -11,6 +11,7 @@ set CSV=send_data\exp_accident.csv
 
 set RUNS=100
 set WINDOW_SEC=2.0
+set SWITCH_EVAL_TICKS=2
 
 REM 追跡30s + 未来10s など（あなたの実験に合わせる）
 set TRACKING_SEC=30
