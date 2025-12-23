@@ -36,10 +36,16 @@ def cmd_switch_pf(args: argparse.Namespace) -> int:
 def cmd_accident_after_switch(args: argparse.Namespace) -> int:
     data = load_meta(args.meta_path)
     accidents = data.get("accidents") or []
+    observed_switch_pf = data.get("switch_payload_frame_observed")
     try:
         switch_pf = int(args.switch_pf)
     except ValueError:
         switch_pf = 0
+    if observed_switch_pf is not None:
+        try:
+            switch_pf = int(observed_switch_pf)
+        except (TypeError, ValueError):
+            pass
     hit = 0
     for accident in accidents:
         payload_frame = accident.get("payload_frame")
