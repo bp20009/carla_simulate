@@ -23,6 +23,9 @@ python "%RUNNER_SCRIPT%" ^
   --csv-path "%CSV%" ^
   --runs "%RUNS%" ^
   --window-sec "%WINDOW_SEC%" ^
-  --switch-eval-ticks "%SWITCH_EVAL_TICKS%"
+  --switch-eval-ticks "%SWITCH_EVAL_TICKS%" ^
+  --center-payload-frame 25411 ^
+  --pre-sec 60 ^
+  --post-sec 30
 
 endlocal

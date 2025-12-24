@@ -25,6 +25,9 @@ for %%T in (2 5 10) do (
     --runs %RUNS% ^
     --window-sec %WINDOW_SEC% ^
     --switch-eval-ticks %%T ^
+    --center-payload-frame 25411 ^
+    --pre-sec 60 ^
+    --post-sec 30 ^
     --tracking-sec %TRACKING_SEC% ^
     --future-sec %FUTURE_SEC% ^
     --fixed-delta 0.1 ^
