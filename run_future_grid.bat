@@ -42,6 +42,8 @@ set "LISTEN_PORT=5005"
 set "SENDER_HOST=127.0.0.1"
 set "SENDER_PORT=5005"
 set "PY=python"
+set "BASE_PF=25411"
+set "ACCIDENT_PF=%BASE_PF%"
 
 set "MAX_RUNTIME=100"
 set /a "WAIT_BASE=%MAX_RUNTIME%+30"
@@ -49,31 +51,24 @@ set /a "WAIT_SEC=%WAIT_BASE%"
 if not defined CALIB_MAX_RUNTIME set "CALIB_MAX_RUNTIME=%MAX_RUNTIME%"
 set /a "CALIB_WAIT_SEC=%CALIB_MAX_RUNTIME%+30"
 
-for /f %%a in ('python "%META_TOOL%" accident_pf_from_collisions "%ACC_REF%"') do set "ACCIDENT_PF=%%a"
-
-set /a "START_FRAME=ACCIDENT_PF-(PRE_SEC*PF_PER_SEC)"
-set /a "END_FRAME=ACCIDENT_PF+(POST_SEC*PF_PER_SEC)"
+set /a "START_FRAME=BASE_PF-(PRE_SEC*PF_PER_SEC)"
+set /a "END_FRAME=BASE_PF+(POST_SEC*PF_PER_SEC)"
 if %START_FRAME% LSS 0 set "START_FRAME=0"
 
-echo ACCIDENT_PF=%ACCIDENT_PF%
+echo BASE_PF=%BASE_PF%
 echo SENDER_RANGE=%START_FRAME%..%END_FRAME%  (pre=%PRE_SEC%s post=%POST_SEC%s)
 
 for /f %%w in ('
   powershell -NoProfile -Command ^
     "$ErrorActionPreference='Stop';" ^
-    "$delta=[double]$env:FIXED_DELTA;" ^
-    "$start=[int]$env:START_FRAME;" ^
-    "$end=[int]$env:END_FRAME;" ^
+    "$delta=%FIXED_DELTA%;" ^
+    "$start=%START_FRAME%;" ^
+    "$end=%END_FRAME%;" ^
     "$sendDuration=($end - $start + 1) * $delta;" ^
-    "$wait=[int][math]::Ceiling($sendDuration + [double]$env:STARTUP_DELAY + 5);" ^
-    "$waitBound=[int][math]::Max($wait,[int]$env:WAIT_SEC);" ^
+    "$wait=[int][math]::Ceiling($sendDuration + %STARTUP_DELAY% + 5);" ^
+    "$waitBound=[int][math]::Max($wait,%WAIT_BASE%);" ^
     "Write-Output $waitBound"
-') do set "SEND_WAIT_SEC=%%w"
-
-if "%ACCIDENT_PF%"=="" (
-  echo Failed: no accident frame found in %ACC_REF%
-  exit /b 1
-)
+') do set "WAIT_SEC=%%w"
 
 set /a "START_FRAME=ACCIDENT_PF-(PRE_SEC*PF_PER_SEC)"
 set /a "END_FRAME=ACCIDENT_PF+(POST_SEC*PF_PER_SEC)"
