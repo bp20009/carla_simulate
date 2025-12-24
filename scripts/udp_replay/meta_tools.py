@@ -15,9 +15,15 @@ def load_meta(meta_path: str) -> dict:
 def cmd_first_accident_pf(args: argparse.Namespace) -> int:
     data = load_meta(args.meta_path)
     accidents = data.get("accidents") or []
-    if accidents:
-        pf = accidents[0].get("payload_frame", "")
-        sys.stdout.write(str(pf))
+    payload_frames = []
+    for accident in accidents:
+        pf = accident.get("payload_frame")
+        try:
+            payload_frames.append(int(pf))
+        except (TypeError, ValueError):
+            continue
+    if payload_frames:
+        sys.stdout.write(str(min(payload_frames)))
     return 0
 
 
@@ -37,28 +43,40 @@ def cmd_switch_pf(args: argparse.Namespace) -> int:
 def cmd_accident_after_switch(args: argparse.Namespace) -> int:
     data = load_meta(args.meta_path)
     accidents = data.get("accidents") or []
-    observed_switch_pf = data.get("switch_payload_frame_observed")
     try:
         switch_pf = int(args.switch_pf)
     except ValueError:
-        switch_pf = 0
-    if observed_switch_pf is not None:
-        try:
-            switch_pf = int(observed_switch_pf)
-        except (TypeError, ValueError):
-            pass
-    hit = 0
+        return 1
     for accident in accidents:
         payload_frame = accident.get("payload_frame")
-        if payload_frame is None:
-            continue
         try:
-            if int(payload_frame) >= switch_pf:
-                hit = 1
-                break
+            if payload_frame is not None and int(payload_frame) >= switch_pf:
+                sys.stdout.write("1")
+                return 0
         except (TypeError, ValueError):
             continue
-    sys.stdout.write(str(hit))
+    sys.stdout.write("0")
+    return 0
+
+
+def cmd_first_accident_pf_after_switch(args: argparse.Namespace) -> int:
+    data = load_meta(args.meta_path)
+    accidents = data.get("accidents") or []
+    try:
+        switch_pf = int(args.switch_pf)
+    except ValueError:
+        return 1
+    payload_frames = []
+    for accident in accidents:
+        payload_frame = accident.get("payload_frame")
+        try:
+            pf_int = int(payload_frame)
+        except (TypeError, ValueError):
+            continue
+        if pf_int >= switch_pf:
+            payload_frames.append(pf_int)
+    if payload_frames:
+        sys.stdout.write(str(min(payload_frames)))
     return 0
 
 
@@ -104,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     accident_after_switch.add_argument("meta_path")
     accident_after_switch.add_argument("switch_pf")
     accident_after_switch.set_defaults(func=cmd_accident_after_switch)
+
+    first_accident_after_switch = subparsers.add_parser("first_accident_pf_after_switch")
+    first_accident_after_switch.add_argument("meta_path")
+    first_accident_after_switch.add_argument("switch_pf")
+    first_accident_after_switch.set_defaults(func=cmd_first_accident_pf_after_switch)
 
     accident_pf = subparsers.add_parser("accident_pf_from_collisions")
     accident_pf.add_argument("collisions_path")

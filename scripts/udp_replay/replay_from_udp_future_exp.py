@@ -710,9 +710,13 @@ class CollisionLogger:
         self._accident_summaries: List[Dict[str, object]] = []
         self._payload_frame_getter = payload_frame_getter
         self._ignore_before_time: Optional[float] = None
+        self._min_payload_frame: Optional[int] = None
 
     def set_min_timestamp(self, timestamp: Optional[float]) -> None:
         self._ignore_before_time = timestamp
+
+    def set_min_payload_frame(self, payload_frame: Optional[int]) -> None:
+        self._min_payload_frame = int(payload_frame) if payload_frame is not None else None
 
     @staticmethod
     def _other_class(other_type: str) -> str:
@@ -814,6 +818,10 @@ class CollisionLogger:
             if payload_frame is None:
                 payload_frame = carla_frame
                 payload_frame_source = "carla_fallback"
+
+            # future 開始 payload_frame より前の衝突は記録しない
+            if self._min_payload_frame is not None and int(payload_frame) < self._min_payload_frame:
+                return
 
             self._flush_until(int(payload_frame))
 
@@ -1696,8 +1704,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
             future_tick_budget_remaining = args.future_duration_ticks
         elif args.future_duration_sec is not None:
             future_time_budget_remaining = args.future_duration_sec
-        if future_start_sim_time is not None:
-            collision_logger.set_min_timestamp(future_start_sim_time)
+        collision_logger.set_min_payload_frame(observed_payload_frame)
         if future_mode_kind == "autopilot":
             manager.enable_autopilot(traffic_manager)
         elif future_mode_kind == "lstm":
