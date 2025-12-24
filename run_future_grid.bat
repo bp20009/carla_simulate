@@ -34,6 +34,7 @@ set "LISTEN_HOST=0.0.0.0"
 set "LISTEN_PORT=5005"
 set "SENDER_HOST=127.0.0.1"
 set "SENDER_PORT=5005"
+set "PY=python"
 
 set /a "MAX_RUNTIME=%TRACKING_SEC%+%FUTURE_SEC%"
 set /a "WAIT_SEC=%MAX_RUNTIME%+30"
@@ -73,11 +74,16 @@ for %%M in (autopilot lstm) do (
         set "LSTM_ARGS=--lstm-model ""!LSTM_MODEL!"" --lstm-device !LSTM_DEVICE!"
       )
 
-      for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen([sys.executable]+sys.argv[1:]); print(p.pid)" ^
-        "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
-        --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%MAX_RUNTIME%" --tm-seed "!SEED!" ^
-        --future-mode "%%M" --switch-payload-frame "!SWITCH_PF!" --metadata-output "!RUN_META!" --collision-log "!RUN_COLL!" ^
-        --actor-log "!RUN_ACTOR!" --id-map-file "!RUN_IDMAP!" !LSTM_ARGS!') do set "REPLAY_PID=%%p"
+      set "RECV_LOG=!RUN_LOGS!\receiver.log"
+
+      for /f %%p in ('
+        powershell -NoProfile -Command ^
+          "$ErrorActionPreference='Stop';" ^
+          "$argsList=@($env:REPLAY_SCRIPT,'--carla-host',$env:CARLA_HOST,'--carla-port',$env:CARLA_PORT,'--listen-host',$env:LISTEN_HOST,'--listen-port',$env:LISTEN_PORT,'--poll-interval',$env:POLL_INTERVAL,'--fixed-delta',$env:FIXED_DELTA,'--max-runtime',$env:MAX_RUNTIME,'--tm-seed',$env:SEED,'--future-mode','%%M','--switch-payload-frame',$env:SWITCH_PF,'--metadata-output',$env:RUN_META,'--collision-log',$env:RUN_COLL,'--actor-log',$env:RUN_ACTOR,'--id-map-file',$env:RUN_IDMAP);" ^
+          "if ($env:LSTM_ARGS) { $argsList += $env:LSTM_ARGS -split ' ' };" ^
+          "$p=Start-Process -FilePath $env:PY -ArgumentList $argsList -RedirectStandardOutput $env:RECV_LOG -RedirectStandardError $env:RECV_LOG -NoNewWindow -PassThru;" ^
+          "$p.Id"
+      ') do set "REPLAY_PID=%%p"
 
       timeout /t %STARTUP_DELAY% /nobreak >nul
       python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
