@@ -115,7 +115,8 @@ for %%M in (autopilot lstm) do (
       set "RAN_OK=1"
       set "STATUS=ok"
 
-      set "RECV_LOG=!RUN_LOGS!\receiver.log"
+      set "RECV_OUT=!RUN_LOGS!\receiver.out.log"
+      set "RECV_ERR=!RUN_LOGS!\receiver.err.log"
       set "PID_VALID=1"
 
       set "PID_FILE=!RUN_LOGS!\replay.pid"
@@ -125,7 +126,7 @@ for %%M in (autopilot lstm) do (
         "$ErrorActionPreference='Stop';" ^
         "$argsList=@('%REPLAY_SCRIPT%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%LISTEN_PORT%','--poll-interval','%POLL_INTERVAL%','--fixed-delta','%FIXED_DELTA%','--max-runtime','%MAX_RUNTIME%','--tm-seed','!SEED!','--future-mode','%%M','--switch-payload-frame','!SWITCH_PF!','--metadata-output','!RUN_META!','--collision-log','!RUN_COLL!','--actor-log','!RUN_ACTOR!','--id-map-file','!RUN_IDMAP!');" ^
         "if ('%%M' -eq 'lstm') { $argsList += @('--lstm-model','%LSTM_MODEL%','--lstm-device','%LSTM_DEVICE%','--lstm-sample-interval','%FIXED_DELTA%') };" ^
-        "$p=Start-Process -FilePath '%PY%' -ArgumentList $argsList -RedirectStandardOutput '!RECV_LOG!' -RedirectStandardError '!RECV_LOG!' -NoNewWindow -PassThru;" ^
+        "$p=Start-Process -FilePath '%PY%' -ArgumentList $argsList -RedirectStandardOutput '!RECV_OUT!' -RedirectStandardError '!RECV_ERR!' -NoNewWindow -PassThru;" ^
         "Set-Content -Path '!PID_FILE!' -Value $p.Id -NoNewline;"
 
       set "REPLAY_PID="
@@ -134,7 +135,8 @@ for %%M in (autopilot lstm) do (
       echo(!REPLAY_PID!| findstr /r "^[0-9][0-9]*$" >nul
       if errorlevel 1 (
         echo Failed: REPLAY_PID invalid: "!REPLAY_PID!"
-        if exist "!RECV_LOG!" type "!RECV_LOG!"
+        if exist "!RECV_OUT!" type "!RECV_OUT!"
+        if exist "!RECV_ERR!" type "!RECV_ERR!"
         set "RAN_OK=0"
         set "STATUS=pid_invalid"
         set "PID_VALID=0"
