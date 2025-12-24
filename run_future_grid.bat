@@ -76,6 +76,7 @@ echo method,lead_sec,rep,seed,switch_payload_frame,ran_ok,accident_after_switch,
 for %%M in (autopilot lstm) do (
   for /L %%L in (%LEAD_MIN%,1,%LEAD_MAX%) do (
       for /f %%s in ('python "%META_TOOL%" switch_pf "%ACCIDENT_PF%" "%%L" "%FIXED_DELTA%"') do set "SWITCH_PF=%%s"
+      set /a "SWITCH_PF_EVAL=!SWITCH_PF!+BUFFER_PF_AFTER"
 
     for /L %%R in (1,1,%REPS%) do (
       set /a "SEED=%BASE_SEED%+%%R"
@@ -132,8 +133,8 @@ for %%M in (autopilot lstm) do (
       set "FIRST_ACC_PF="
       set "AFTER_SWITCH=0"
       if exist "!RUN_META!" (
-        for /f %%f in ('python "%META_TOOL%" first_accident_pf "!RUN_META!"') do set "FIRST_ACC_PF=%%f"
-        for /f %%a in ('python "%META_TOOL%" accident_after_switch "!RUN_META!" "!SWITCH_PF!"') do set "AFTER_SWITCH=%%a"
+        for /f %%f in ('python "%META_TOOL%" first_accident_pf_after_switch "!RUN_META!" "!SWITCH_PF_EVAL!"') do set "FIRST_ACC_PF=%%f"
+        for /f %%a in ('python "%META_TOOL%" accident_after_switch "!RUN_META!" "!SWITCH_PF_EVAL!"') do set "AFTER_SWITCH=%%a"
       )
 
       if "!AFTER_SWITCH!"=="" set "AFTER_SWITCH=0"
