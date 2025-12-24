@@ -31,7 +31,7 @@ set "WINDOW_SEC_BEFORE=60"
 set "WINDOW_SEC_AFTER=30"
 set "LEAD_MIN=1"
 set "LEAD_MAX=10"
-set "REPS=5"
+set "REPS=10"
 set "BASE_SEED=20009"
 set "STARTUP_DELAY=1"
 
