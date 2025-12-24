@@ -107,6 +107,24 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Override sender interval in seconds (default: fixed-delta)",
     )
     parser.add_argument(
+        "--center-payload-frame",
+        type=int,
+        default=None,
+        help="Center payload frame id for sender range (e.g., 25411). If set, sender transmits [center-pre .. center+post].",
+    )
+    parser.add_argument(
+        "--pre-sec",
+        type=float,
+        default=60.0,
+        help="Seconds before center payload frame to send (default: 60.0)",
+    )
+    parser.add_argument(
+        "--post-sec",
+        type=float,
+        default=30.0,
+        help="Seconds after center payload frame to send (default: 30.0)",
+    )
+    parser.add_argument(
         "--frame-stride",
         type=int,
         default=1,
@@ -703,6 +721,26 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
     max_runtime = max(args.tracking_sec + args.future_sec, 0.0)
 
+    start_frame: Optional[int] = None
+    end_frame: Optional[int] = None
+    if args.center_payload_frame is not None:
+        if args.fixed_delta <= 0:
+            raise ValueError("fixed-delta must be > 0 when using --center-payload-frame")
+        pf_per_sec = int(round(1.0 / args.fixed_delta))
+        pre_pf = int(round(args.pre_sec * pf_per_sec))
+        post_pf = int(round(args.post_sec * pf_per_sec))
+        start_frame = max(args.center_payload_frame - pre_pf, 0)
+        end_frame = args.center_payload_frame + post_pf
+        LOGGER.info(
+            "Sender range computed: center=%d pre=%.1fs post=%.1fs -> %d..%d (pf_per_sec=%d)",
+            args.center_payload_frame,
+            args.pre_sec,
+            args.post_sec,
+            start_frame,
+            end_frame,
+            pf_per_sec,
+        )
+
     results_dir = args.outdir
     summaries: List[RunSummary] = []
 
@@ -766,18 +804,32 @@ def run_experiment(args: argparse.Namespace) -> None:
             "--log-level",
             args.sender_log_level,
         ]
+        if start_frame is not None:
+            sender_cmd.extend(["--start-frame", str(start_frame)])
+        if end_frame is not None:
+            sender_cmd.extend(["--end-frame", str(end_frame)])
 
         logs_dir.mkdir(parents=True, exist_ok=True)
+        replay_log_path = logs_dir / "replay.log"
+        sender_log_path = logs_dir / "sender.log"
+
         LOGGER.info("Starting run %s", run_id)
-        replay_proc = _start_process(replay_cmd)
-        try:
-            time.sleep(max(args.startup_delay, 0.0))
-            _run_command(sender_cmd)
-            replay_proc.wait(timeout=max_runtime + 30.0 if max_runtime > 0 else None)
-        finally:
-            if replay_proc.poll() is None:
-                replay_proc.terminate()
-                replay_proc.wait(timeout=10)
+        with replay_log_path.open("w", encoding="utf-8", newline="") as rlog:
+            replay_proc = subprocess.Popen(
+                replay_cmd,
+                stdout=rlog,
+                stderr=rlog,
+                text=True,
+            )
+            try:
+                time.sleep(max(args.startup_delay, 0.0))
+                with sender_log_path.open("w", encoding="utf-8", newline="") as slog:
+                    subprocess.run(sender_cmd, check=True, stdout=slog, stderr=slog, text=True)
+                replay_proc.wait(timeout=max_runtime + 30.0 if max_runtime > 0 else None)
+            finally:
+                if replay_proc.poll() is None:
+                    replay_proc.terminate()
+                    replay_proc.wait(timeout=10)
 
         actor_results, summary = _analyze_deceleration(
             actor_log_path,
