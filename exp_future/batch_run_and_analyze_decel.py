@@ -220,16 +220,6 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
-def _run_command(command: Sequence[str]) -> None:
-    LOGGER.debug("Running command: %s", " ".join(command))
-    subprocess.run(command, check=True)
-
-
-def _start_process(command: Sequence[str]) -> subprocess.Popen:
-    LOGGER.debug("Starting process: %s", " ".join(command))
-    return subprocess.Popen(command, text=True)
-
-
 def _compute_switch_payload_frame(tracking_sec: float, fixed_delta: float) -> Optional[int]:
     if tracking_sec <= 0 or fixed_delta <= 0:
         return None
@@ -748,6 +738,8 @@ def run_experiment(args: argparse.Namespace) -> None:
         run_id = f"run_{run_index:04d}"
         run_dir = results_dir / run_id
         logs_dir = run_dir / "logs"
+        replay_log_path = logs_dir / "replay.log"
+        sender_log_path = logs_dir / "sender.log"
         actor_log_path = logs_dir / "actor.csv"
         metadata_path = logs_dir / "meta.json"
         id_map_path = logs_dir / "id_map.csv"
@@ -814,22 +806,19 @@ def run_experiment(args: argparse.Namespace) -> None:
         sender_log_path = logs_dir / "sender.log"
 
         LOGGER.info("Starting run %s", run_id)
-        with replay_log_path.open("w", encoding="utf-8", newline="") as rlog:
-            replay_proc = subprocess.Popen(
-                replay_cmd,
-                stdout=rlog,
-                stderr=rlog,
-                text=True,
-            )
+        wait_timeout = max_runtime + 30.0 if max_runtime > 0 else None
+        with replay_log_path.open("w", encoding="utf-8") as rlog, sender_log_path.open(
+            "w", encoding="utf-8"
+        ) as slog:
+            replay_proc = subprocess.Popen(replay_cmd, stdout=rlog, stderr=rlog, text=True)
             try:
                 time.sleep(max(args.startup_delay, 0.0))
-                with sender_log_path.open("w", encoding="utf-8", newline="") as slog:
-                    subprocess.run(sender_cmd, check=True, stdout=slog, stderr=slog, text=True)
-                replay_proc.wait(timeout=max_runtime + 30.0 if max_runtime > 0 else None)
+                subprocess.run(sender_cmd, check=True, stdout=slog, stderr=slog, text=True)
+                replay_proc.wait(timeout=wait_timeout)
             finally:
                 if replay_proc.poll() is None:
                     replay_proc.terminate()
-                    replay_proc.wait(timeout=10)
+                    replay_proc.wait(timeout=wait_timeout)
 
         actor_results, summary = _analyze_deceleration(
             actor_log_path,
