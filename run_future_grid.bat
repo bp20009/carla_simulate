@@ -22,6 +22,8 @@ set "FIXED_DELTA=0.1"
 set "POLL_INTERVAL=0.1"
 set "TRACKING_SEC=30"
 set "FUTURE_SEC=10"
+set "BUFFER_PF_BEFORE=2"
+set "BUFFER_PF_AFTER=2"
 set "LEAD_MIN=1"
 set "LEAD_MAX=10"
 set "REPS=5"
@@ -64,6 +66,10 @@ for %%M in (autopilot lstm) do (
       set "RUN_ACTOR=!RUN_LOGS!\actor.csv"
       set "RUN_IDMAP=!RUN_LOGS!\id_map.csv"
 
+      set "START_FRAME="
+      set "END_FRAME="
+      set "RUN_WAIT_SEC=%WAIT_SEC%"
+
       mkdir "!RUN_LOGS!" >nul 2>&1
 
       set "RAN_OK=1"
@@ -77,6 +83,30 @@ for %%M in (autopilot lstm) do (
       set "RECV_LOG=!RUN_LOGS!\receiver.log"
       set "PID_VALID=1"
 
+      for /f "tokens=1,2,3" %%u in ('
+        powershell -NoProfile -Command ^
+          "$ErrorActionPreference='Stop';" ^
+          "$tracking=[double]$env:TRACKING_SEC;" ^
+          "$future=[double]$env:FUTURE_SEC;" ^
+          "$delta=[double]$env:FIXED_DELTA;" ^
+          "$switch=[int]$env:SWITCH_PF;" ^
+          "$accident=[int]$env:ACCIDENT_PF;" ^
+          "$bufferBefore=[int]$env:BUFFER_PF_BEFORE;" ^
+          "$bufferAfter=[int]$env:BUFFER_PF_AFTER;" ^
+          "$trackingFrames=[int][math]::Ceiling($tracking / $delta);" ^
+          "$futureFrames=[int][math]::Ceiling($future / $delta);" ^
+          "$start=[math]::Max($switch - $trackingFrames - $bufferBefore, 0);" ^
+          "$end=[math]::Max($switch + $futureFrames + $bufferAfter, $accident + $bufferAfter);" ^
+          "$sendDuration=($end - $start + 1) * $delta;" ^
+          "$wait=[int][math]::Ceiling($sendDuration + [double]$env:STARTUP_DELAY + 5);" ^
+          "$waitBound=[int][math]::Max($wait,[int]$env:WAIT_SEC);" ^
+          "Write-Output \"$start $end $waitBound\""
+      ') do (
+        set "START_FRAME=%%u"
+        set "END_FRAME=%%v"
+        set "RUN_WAIT_SEC=%%w"
+      )
+
       for /f %%p in ('
         powershell -NoProfile -Command ^
           "$ErrorActionPreference='Stop';" ^
@@ -86,7 +116,9 @@ for %%M in (autopilot lstm) do (
           "$p.Id"
       ') do set "REPLAY_PID=%%p"
 
-      echo !REPLAY_PID! | findstr /r "^[0-9][0-9]*$" >nul
+      timeout /t %STARTUP_DELAY% /nobreak >nul
+      python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%" --start-frame "!START_FRAME!" --end-frame "!END_FRAME!"
+      call :wait_for_pid !REPLAY_PID! !RUN_WAIT_SEC!
       if errorlevel 1 (
         echo Failed: invalid replay PID "!REPLAY_PID!"
         if exist "!RECV_LOG!" type "!RECV_LOG!"
