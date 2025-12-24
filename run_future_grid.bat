@@ -24,6 +24,8 @@ set "TRACKING_SEC=30"
 set "FUTURE_SEC=10"
 set "BUFFER_PF_BEFORE=2"
 set "BUFFER_PF_AFTER=2"
+set "WINDOW_SEC_BEFORE=60"
+set "WINDOW_SEC_AFTER=30"
 set "LEAD_MIN=1"
 set "LEAD_MAX=10"
 set "REPS=5"
@@ -81,17 +83,14 @@ for %%M in (autopilot lstm) do (
       for /f "tokens=1,2,3" %%u in ('
         powershell -NoProfile -Command ^
           "$ErrorActionPreference='Stop';" ^
-          "$tracking=[double]$env:TRACKING_SEC;" ^
-          "$future=[double]$env:FUTURE_SEC;" ^
           "$delta=[double]$env:FIXED_DELTA;" ^
-          "$switch=[int]$env:SWITCH_PF;" ^
           "$accident=[int]$env:ACCIDENT_PF;" ^
-          "$bufferBefore=[int]$env:BUFFER_PF_BEFORE;" ^
-          "$bufferAfter=[int]$env:BUFFER_PF_AFTER;" ^
-          "$trackingFrames=[int][math]::Ceiling($tracking / $delta);" ^
-          "$futureFrames=[int][math]::Ceiling($future / $delta);" ^
-          "$start=[math]::Max($switch - $trackingFrames - $bufferBefore, 0);" ^
-          "$end=[math]::Max($switch + $futureFrames + $bufferAfter, $accident + $bufferAfter);" ^
+          "$beforeSec=[double]$env:WINDOW_SEC_BEFORE;" ^
+          "$afterSec=[double]$env:WINDOW_SEC_AFTER;" ^
+          "$beforeFrames=[int][math]::Ceiling($beforeSec / $delta);" ^
+          "$afterFrames=[int][math]::Ceiling($afterSec / $delta);" ^
+          "$start=[math]::Max($accident - $beforeFrames, 0);" ^
+          "$end=[math]::Max($accident + $afterFrames, 0);" ^
           "$sendDuration=($end - $start + 1) * $delta;" ^
           "$wait=[int][math]::Ceiling($sendDuration + [double]$env:STARTUP_DELAY + 5);" ^
           "$waitBound=[int][math]::Max($wait,[int]$env:WAIT_SEC);" ^
@@ -124,7 +123,7 @@ for %%M in (autopilot lstm) do (
 
       if "!PID_VALID!"=="1" (
         timeout /t %STARTUP_DELAY% /nobreak >nul
-        python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
+        python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%" --start-frame "!START_FRAME!" --end-frame "!END_FRAME!"
         call :wait_for_pid !REPLAY_PID! %WAIT_SEC%
         if errorlevel 1 (
           set "RAN_OK=0"
