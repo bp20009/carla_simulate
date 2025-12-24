@@ -75,11 +75,6 @@ for %%M in (autopilot lstm) do (
       set "RAN_OK=1"
       set "STATUS=ok"
 
-      set "LSTM_ARGS="
-      if /I "%%M"=="lstm" (
-        set "LSTM_ARGS=--lstm-model ""!LSTM_MODEL!"" --lstm-device !LSTM_DEVICE!"
-      )
-
       set "RECV_LOG=!RUN_LOGS!\receiver.log"
       set "PID_VALID=1"
 
@@ -111,7 +106,7 @@ for %%M in (autopilot lstm) do (
         powershell -NoProfile -Command ^
           "$ErrorActionPreference='Stop';" ^
           "$argsList=@($env:REPLAY_SCRIPT,'--carla-host',$env:CARLA_HOST,'--carla-port',$env:CARLA_PORT,'--listen-host',$env:LISTEN_HOST,'--listen-port',$env:LISTEN_PORT,'--poll-interval',$env:POLL_INTERVAL,'--fixed-delta',$env:FIXED_DELTA,'--max-runtime',$env:MAX_RUNTIME,'--tm-seed',$env:SEED,'--future-mode','%%M','--switch-payload-frame',$env:SWITCH_PF,'--metadata-output',$env:RUN_META,'--collision-log',$env:RUN_COLL,'--actor-log',$env:RUN_ACTOR,'--id-map-file',$env:RUN_IDMAP);" ^
-          "if ($env:LSTM_ARGS) { $argsList += $env:LSTM_ARGS -split ' ' };" ^
+          "if ('%%M' -eq 'lstm') { $argsList += @('--lstm-model', $env:LSTM_MODEL, '--lstm-device', $env:LSTM_DEVICE, '--lstm-sample-interval', $env:FIXED_DELTA) };" ^
           "$p=Start-Process -FilePath $env:PY -ArgumentList $argsList -RedirectStandardOutput $env:RECV_LOG -RedirectStandardError $env:RECV_LOG -NoNewWindow -PassThru;" ^
           "$p.Id"
       ') do set "REPLAY_PID=%%p"
