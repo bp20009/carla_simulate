@@ -70,25 +70,6 @@ for /f %%w in ('
     "Write-Output $waitBound"
 ') do set "WAIT_SEC=%%w"
 
-set /a "START_FRAME=ACCIDENT_PF-(PRE_SEC*PF_PER_SEC)"
-set /a "END_FRAME=ACCIDENT_PF+(POST_SEC*PF_PER_SEC)"
-if %START_FRAME% LSS 0 set "START_FRAME=0"
-
-echo ACCIDENT_PF=%ACCIDENT_PF%
-echo SENDER_RANGE=%START_FRAME%..%END_FRAME%  (pre=%PRE_SEC%s post=%POST_SEC%s)
-
-for /f %%w in ('
-  powershell -NoProfile -Command ^
-    "$ErrorActionPreference='Stop';" ^
-    "$delta=%FIXED_DELTA%;" ^
-    "$start=%START_FRAME%;" ^
-    "$end=%END_FRAME%;" ^
-    "$sendDuration=($end - $start + 1) * $delta;" ^
-    "$wait=[int][math]::Ceiling($sendDuration + %STARTUP_DELAY% + 5);" ^
-    "$waitBound=[int][math]::Max($wait,%WAIT_BASE%);" ^
-    "Write-Output $waitBound"
-') do set "WAIT_SEC=%%w"
-
 set "SUMMARY=%OUTDIR%\summary_grid.csv"
 echo method,lead_sec,rep,seed,switch_payload_frame,ran_ok,accident_after_switch,first_accident_payload_frame,status,accident_payload_frame_ref > "%SUMMARY%"
 
