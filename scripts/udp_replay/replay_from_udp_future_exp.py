@@ -710,15 +710,19 @@ class CollisionLogger:
                     return
                 self._last_accident_time[actor.id] = timestamp
 
-            payload_frame_source = "record"
-            payload_frame = record.last_payload_frame
-            if payload_frame is None and self._payload_frame_getter is not None:
+            payload_frame = None
+            payload_frame_source = "getter"
+
+            if self._payload_frame_getter is not None:
                 try:
                     payload_frame = self._payload_frame_getter()
-                    payload_frame_source = "getter"
                 except Exception:
                     payload_frame = None
-                    payload_frame_source = "getter"
+
+            if payload_frame is None:
+                payload_frame = record.last_payload_frame
+                payload_frame_source = "record"
+
             if payload_frame is None:
                 payload_frame = carla_frame
                 payload_frame_source = "carla_fallback"
@@ -1301,7 +1305,9 @@ class EntityManager:
                 continue
 
             target = (
-                record.predicted_target if self._use_lstm_target else record.target
+                record.predicted_target
+                if (self._use_lstm_target and record.predicted_target is not None)
+                else record.target
             )
             if target is None:
                 continue
@@ -1653,6 +1659,17 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         manager.step_all(elapsed)
                     # future_mode のときは Traffic Manager / autopilot が制御するので
                     # ここでは何もしない（world.tick() だけ進める）
+
+                    # future_mode 中は UDP から payload_frame が増えないので，疑似的に進める
+                    if future_mode:
+                        pf = manager.current_payload_frame
+                        if pf is None:
+                            pf = first_payload_frame
+                        if pf is not None:
+                            pf_next = int(pf) + 1
+                            manager.update_payload_frame(pf_next)
+                            for rec in manager.entities.values():
+                                rec.last_payload_frame = pf_next
 
                     carla_frame_id = world.tick()
                     if first_frame is None:

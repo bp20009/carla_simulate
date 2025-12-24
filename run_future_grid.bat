@@ -16,6 +16,7 @@ set "SENDER_SCRIPT=send_data\send_udp_frames_from_csv.py"
 set "LSTM_MODEL=scripts\udp_replay\traj_lstm.pt"
 set "LSTM_DEVICE=cpu"
 set "META_TOOL=scripts\udp_replay\meta_tools.py"
+set "ACC_REF=%~dp0exp_future\collisions_exp_accident.csv"
 
 set "FIXED_DELTA=0.1"
 set "POLL_INTERVAL=0.1"
@@ -39,29 +40,10 @@ set /a "WAIT_SEC=%MAX_RUNTIME%+30"
 if not defined CALIB_MAX_RUNTIME set "CALIB_MAX_RUNTIME=%MAX_RUNTIME%"
 set /a "CALIB_WAIT_SEC=%CALIB_MAX_RUNTIME%+30"
 
-set "CALIB_LOGS=%OUTDIR%\calibration\logs"
-set "CALIB_META=%CALIB_LOGS%\meta.json"
-set "CALIB_COLL=%CALIB_LOGS%\collisions.csv"
-
-mkdir "%CALIB_LOGS%" >nul 2>&1
-
-echo [calibration] starting...
-for /f %%p in ('python -c "import subprocess,sys; p=subprocess.Popen([sys.executable]+sys.argv[1:]); print(p.pid)" ^
-  "%REPLAY_SCRIPT%" --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" --listen-host "%LISTEN_HOST%" --listen-port "%LISTEN_PORT%" ^
-  --poll-interval "%POLL_INTERVAL%" --fixed-delta "%FIXED_DELTA%" --max-runtime "%CALIB_MAX_RUNTIME%" --tm-seed "%BASE_SEED%" ^
-  --future-mode none --metadata-output "%CALIB_META%" --collision-log "%CALIB_COLL%"') do set "REPLAY_PID=%%p"
-
-timeout /t %STARTUP_DELAY% /nobreak >nul
-python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
-call :wait_for_pid %REPLAY_PID% %CALIB_WAIT_SEC%
-if errorlevel 1 (
-  taskkill /PID %REPLAY_PID% /T /F >nul 2>&1
-)
-
-for /f %%a in ('python "%META_TOOL%" first_accident_pf "%CALIB_META%"') do set "ACCIDENT_PF=%%a"
+for /f %%a in ('python "%META_TOOL%" accident_pf_from_collisions "%ACC_REF%"') do set "ACCIDENT_PF=%%a"
 
 if "%ACCIDENT_PF%"=="" (
-  echo Calibration failed: no accidents in %CALIB_META%
+  echo Failed: no accident frame found in %ACC_REF%
   exit /b 1
 )
 

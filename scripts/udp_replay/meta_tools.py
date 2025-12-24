@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -61,6 +62,30 @@ def cmd_accident_after_switch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_accident_pf_from_collisions(args: argparse.Namespace) -> int:
+    try:
+        with Path(args.collisions_path).open(
+            encoding="utf-8", errors="ignore", newline=""
+        ) as handle:
+            reader = csv.DictReader(handle)
+            min_frame = None
+            for row in reader:
+                if str(row.get("is_accident", "")).strip() != "1":
+                    continue
+                frame_value = row.get("frame")
+                try:
+                    frame_int = int(float(frame_value))
+                except (TypeError, ValueError):
+                    continue
+                if min_frame is None or frame_int < min_frame:
+                    min_frame = frame_int
+    except OSError:
+        return 1
+    if min_frame is not None:
+        sys.stdout.write(str(min_frame))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -79,6 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
     accident_after_switch.add_argument("meta_path")
     accident_after_switch.add_argument("switch_pf")
     accident_after_switch.set_defaults(func=cmd_accident_after_switch)
+
+    accident_pf = subparsers.add_parser("accident_pf_from_collisions")
+    accident_pf.add_argument("collisions_path")
+    accident_pf.set_defaults(func=cmd_accident_pf_from_collisions)
 
     return parser
 
