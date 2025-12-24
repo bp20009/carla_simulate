@@ -711,26 +711,6 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
     max_runtime = max(args.tracking_sec + args.future_sec, 0.0)
 
-    start_frame: Optional[int] = None
-    end_frame: Optional[int] = None
-    if args.center_payload_frame is not None:
-        if args.fixed_delta <= 0:
-            raise ValueError("fixed-delta must be > 0 when using --center-payload-frame")
-        pf_per_sec = int(round(1.0 / args.fixed_delta))
-        pre_pf = int(round(args.pre_sec * pf_per_sec))
-        post_pf = int(round(args.post_sec * pf_per_sec))
-        start_frame = max(args.center_payload_frame - pre_pf, 0)
-        end_frame = args.center_payload_frame + post_pf
-        LOGGER.info(
-            "Sender range computed: center=%d pre=%.1fs post=%.1fs -> %d..%d (pf_per_sec=%d)",
-            args.center_payload_frame,
-            args.pre_sec,
-            args.post_sec,
-            start_frame,
-            end_frame,
-            pf_per_sec,
-        )
-
     results_dir = args.outdir
     summaries: List[RunSummary] = []
 
@@ -780,6 +760,26 @@ def run_experiment(args: argparse.Namespace) -> None:
 
         if max_runtime > 0:
             replay_cmd.extend(["--max-runtime", str(max_runtime)])
+
+        start_frame: Optional[int] = None
+        end_frame: Optional[int] = None
+        if args.center_payload_frame is not None:
+            if args.fixed_delta <= 0:
+                raise ValueError("fixed-delta must be > 0 when using --center-payload-frame")
+            pf_per_sec = round(1.0 / args.fixed_delta)
+            pre_pf = round(args.pre_sec * pf_per_sec)
+            post_pf = round(args.post_sec * pf_per_sec)
+            start_frame = max(args.center_payload_frame - pre_pf, 0)
+            end_frame = args.center_payload_frame + post_pf
+            LOGGER.info(
+                "Sender range computed: center=%d pre=%.1fs post=%.1fs -> %d..%d (pf_per_sec=%d)",
+                args.center_payload_frame,
+                args.pre_sec,
+                args.post_sec,
+                start_frame,
+                end_frame,
+                pf_per_sec,
+            )
 
         sender_cmd = [
             sys.executable,
