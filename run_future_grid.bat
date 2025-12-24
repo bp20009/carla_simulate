@@ -51,6 +51,25 @@ set /a "CALIB_WAIT_SEC=%CALIB_MAX_RUNTIME%+30"
 
 for /f %%a in ('python "%META_TOOL%" accident_pf_from_collisions "%ACC_REF%"') do set "ACCIDENT_PF=%%a"
 
+set /a "START_FRAME=ACCIDENT_PF-(PRE_SEC*PF_PER_SEC)"
+set /a "END_FRAME=ACCIDENT_PF+(POST_SEC*PF_PER_SEC)"
+if %START_FRAME% LSS 0 set "START_FRAME=0"
+
+echo ACCIDENT_PF=%ACCIDENT_PF%
+echo SENDER_RANGE=%START_FRAME%..%END_FRAME%  (pre=%PRE_SEC%s post=%POST_SEC%s)
+
+for /f %%w in ('
+  powershell -NoProfile -Command ^
+    "$ErrorActionPreference='Stop';" ^
+    "$delta=[double]$env:FIXED_DELTA;" ^
+    "$start=[int]$env:START_FRAME;" ^
+    "$end=[int]$env:END_FRAME;" ^
+    "$sendDuration=($end - $start + 1) * $delta;" ^
+    "$wait=[int][math]::Ceiling($sendDuration + [double]$env:STARTUP_DELAY + 5);" ^
+    "$waitBound=[int][math]::Max($wait,[int]$env:WAIT_SEC);" ^
+    "Write-Output $waitBound"
+') do set "SEND_WAIT_SEC=%%w"
+
 if "%ACCIDENT_PF%"=="" (
   echo Failed: no accident frame found in %ACC_REF%
   exit /b 1
