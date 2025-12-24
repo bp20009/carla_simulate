@@ -58,6 +58,18 @@ def parse_args() -> argparse.Namespace:
         help="Only send every Nth frame (default: 1, send all frames)",
     )
     parser.add_argument(
+        "--start-frame",
+        type=int,
+        default=None,
+        help="First payload frame id to send (inclusive)",
+    )
+    parser.add_argument(
+        "--end-frame",
+        type=int,
+        default=None,
+        help="Last payload frame id to send (inclusive)",
+    )
+    parser.add_argument(
         "csv_path",
         type=Path,
         help=(
@@ -112,6 +124,14 @@ def _coerce_float(value: str | None) -> float | None:
         return None
 
 
+def _parse_frame_id(frame_id: str) -> int | None:
+    try:
+        return int(frame_id)
+    except (TypeError, ValueError):
+        LOGGER.warning("Skipping frame with non-integer id '%s'", frame_id)
+        return None
+
+
 def build_frame_payload(
     frame_id: str, rows: FrameRows, *, max_actors: int | None = None
 ) -> Payload:
@@ -138,6 +158,8 @@ def send_frames(
     delay_column: str | None,
     encoding: str,
     frame_stride: int,
+    start_frame: int | None,
+    end_frame: int | None,
 ) -> None:
     host, port = destination
     sent_frames = 0
@@ -148,6 +170,27 @@ def send_frames(
             if not frame_rows:
                 continue
 
+            if start_frame is not None or end_frame is not None:
+                numeric_frame_id = _parse_frame_id(frame_id)
+                if numeric_frame_id is None:
+                    continue
+
+                if start_frame is not None and numeric_frame_id < start_frame:
+                    LOGGER.debug(
+                        "Skipping frame %s below start_frame %d",
+                        frame_id,
+                        start_frame,
+                    )
+                    continue
+
+                if end_frame is not None and numeric_frame_id > end_frame:
+                    LOGGER.debug(
+                        "Stopping at frame %s beyond end_frame %d",
+                        frame_id,
+                        end_frame,
+                    )
+                    break
+
             if index % frame_stride != 0:
                 LOGGER.debug(
                     "Skipping frame %s (index %d) due to frame_stride=%d",
@@ -157,19 +200,7 @@ def send_frames(
                 )
                 continue
 
-            max_actors = min(len(frame_rows), index + 1)
-            staged_send = max_actors < len(frame_rows)
-
-            if staged_send:
-                LOGGER.debug(
-                    "Staged send for frame %s (index %d): sending %d of %d actors",
-                    frame_id,
-                    index,
-                    max_actors,
-                    len(frame_rows),
-                )
-
-            payload_dict = build_frame_payload(frame_id, frame_rows, max_actors=max_actors)
+            payload_dict = build_frame_payload(frame_id, frame_rows)
             payload_text = json.dumps(payload_dict, ensure_ascii=False)
             LOGGER.debug(
                 "Sending frame %s payload to %s:%d: %s", frame_id, host, port, payload_text
@@ -225,6 +256,8 @@ def main() -> None:
         delay_column=args.delay_column,
         encoding=args.encoding,
         frame_stride=args.frame_stride,
+        start_frame=args.start_frame,
+        end_frame=args.end_frame,
     )
 
 
