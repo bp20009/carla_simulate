@@ -13,13 +13,26 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, TextIO, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    TextIO,
+    Tuple,
+)
 
 import carla
-import torch
-import torch.nn as nn
 from collections import deque
 
+if TYPE_CHECKING:
+    import torch
+    import torch.nn as nn
 LOGGER = logging.getLogger(__name__)
 
 # 秒数だけ外部トラッキングを行い，その後は CARLA の autopilot に制御を渡す
@@ -126,6 +139,15 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Device for LSTM",
     )
     parser.add_argument(
+        "--lstm-sample-interval",
+        type=float,
+        default=None,
+        help=(
+            "Expected sampling interval (seconds) for the LSTM model. When unset, "
+            "defaults to the fixed delta time."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
@@ -220,6 +242,13 @@ class MissingTargetDataError(ValueError):
 
 
 @dataclass
+class LSTMHistoryStep:
+    dx: float
+    dy: float
+    dt: float
+
+
+@dataclass
 class EntityRecord:
     actor: carla.Actor
     object_type: str
@@ -236,7 +265,7 @@ class EntityRecord:
     control_mode: str = "direct"
     collision_sensor: Optional[carla.Sensor] = None
     last_payload_frame: Optional[int] = None
-    lstm_history: Optional[Deque[Tuple[float, float]]] = None
+    lstm_history: Optional[Deque[LSTMHistoryStep]] = None
     lstm_plan: Optional[List[Tuple[float, float]]] = None
     lstm_step: int = 0
 
@@ -430,34 +459,65 @@ class PIDController:
         return output
 
 
-class TrajLSTM(nn.Module):
-    def __init__(
-        self,
-        feature_dim: int = 2,
-        hidden_dim: int = 64,
-        num_layers: int = 1,
-        horizon_steps: int = 50,
-    ) -> None:
-        super().__init__()
-        self.horizon_steps = horizon_steps
-        self.lstm = nn.LSTM(
-            feature_dim,
-            hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-        )
-        self.decoder = nn.Linear(hidden_dim, feature_dim)
+def _require_torch() -> Tuple["torch", "nn"]:
+    try:
+        import torch  # type: ignore
+        import torch.nn as nn  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "LSTM mode requires PyTorch; install torch to enable LSTM predictions or "
+            "use --future-mode autopilot."
+        ) from exc
+    return torch, nn
 
-    def forward(self, history: torch.Tensor) -> torch.Tensor:
-        _, hidden = self.lstm(history)
-        step_input = history[:, -1:, :]
-        preds = []
-        for _ in range(self.horizon_steps):
-            step_out, hidden = self.lstm(step_input, hidden)
-            dxy = self.decoder(step_out[:, -1, :])
-            preds.append(dxy)
-            step_input = dxy.unsqueeze(1)
-        return torch.stack(preds, dim=1)
+
+def _load_lstm_model(
+    lstm_model_path: str, lstm_device: str
+) -> Tuple[object, int, int, "torch"]:
+    torch, nn = _require_torch()
+
+    class TrajLSTM(nn.Module):
+        def __init__(
+            self,
+            feature_dim: int = 2,
+            hidden_dim: int = 64,
+            num_layers: int = 1,
+            horizon_steps: int = 50,
+        ) -> None:
+            super().__init__()
+            self.horizon_steps = horizon_steps
+            self.lstm = nn.LSTM(
+                feature_dim,
+                hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+            )
+            self.decoder = nn.Linear(hidden_dim, feature_dim)
+
+        def forward(self, history: "torch.Tensor") -> "torch.Tensor":
+            _, hidden = self.lstm(history)
+            step_input = history[:, -1:, :]
+            preds = []
+            for _ in range(self.horizon_steps):
+                step_out, hidden = self.lstm(step_input, hidden)
+                dxy = self.decoder(step_out[:, -1, :])
+                preds.append(dxy)
+                step_input = dxy.unsqueeze(1)
+            return torch.stack(preds, dim=1)
+
+    ckpt = torch.load(lstm_model_path, map_location=lstm_device)
+    history_steps = int(ckpt.get("history_steps", 10))
+    horizon_steps = int(ckpt.get("horizon_steps", 50))
+    model = TrajLSTM(
+        feature_dim=2,
+        hidden_dim=64,
+        num_layers=1,
+        horizon_steps=horizon_steps,
+    )
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    lstm_model = model.to(lstm_device)
+    return lstm_model, history_steps, horizon_steps, torch
 
 
 def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
@@ -866,6 +926,8 @@ class EntityManager:
         actor_logger: Optional[ActorCSVLogger] = None,
         lstm_model_path: Optional[str] = None,
         lstm_device: str = "cpu",
+        lstm_sample_interval: Optional[float] = None,
+        simulation_step_interval: Optional[float] = None,
     ) -> None:
         self._world = world
         self._map = world.get_map()
@@ -888,24 +950,26 @@ class EntityManager:
         # autopilot 有効化済みかどうか
         self._autopilot_enabled = False
         self._tm_port: Optional[int] = None
-        self._lstm: Optional[TrajLSTM] = None
+        self._lstm: Optional[object] = None
         self._lstm_history_steps: Optional[int] = None
         self._lstm_horizon_steps: Optional[int] = None
         self._lstm_device = lstm_device
+        self._torch: Optional["torch"] = None
+        self._lstm_reference_dt = lstm_sample_interval
+        self._lstm_step_dt = simulation_step_interval or lstm_sample_interval
+        if self._lstm_reference_dt is None:
+            self._lstm_reference_dt = self._lstm_step_dt
+        if self._lstm_step_dt is None:
+            self._lstm_step_dt = self._lstm_reference_dt
 
         if lstm_model_path:
-            ckpt = torch.load(lstm_model_path, map_location=lstm_device)
-            history_steps = int(ckpt.get("history_steps", 10))
-            horizon_steps = int(ckpt.get("horizon_steps", 50))
-            model = TrajLSTM(
-                feature_dim=2,
-                hidden_dim=64,
-                num_layers=1,
-                horizon_steps=horizon_steps,
+            lstm_model_path = str(lstm_model_path)
+            lstm_device = str(lstm_device)
+            model, history_steps, horizon_steps, torch_module = _load_lstm_model(
+                lstm_model_path, lstm_device
             )
-            model.load_state_dict(ckpt["state_dict"])
-            model.eval()
-            self._lstm = model.to(lstm_device)
+            self._lstm = model
+            self._torch = torch_module
             self._lstm_history_steps = history_steps
             self._lstm_horizon_steps = horizon_steps
             LOGGER.info(
@@ -915,6 +979,12 @@ class EntityManager:
                 horizon_steps,
                 lstm_device,
             )
+            if self._lstm_reference_dt is not None and self._lstm_step_dt is not None:
+                LOGGER.info(
+                    "Normalizing LSTM history to %.3f s steps and scaling predictions to %.3f s steps",
+                    self._lstm_reference_dt,
+                    self._lstm_step_dt,
+                )
 
     @property
     def entities(self) -> Mapping[str, EntityRecord]:
@@ -923,6 +993,23 @@ class EntityManager:
     @property
     def timing_enabled(self) -> bool:
         return self._timing_enabled
+
+    def _record_lstm_delta(
+        self, record: EntityRecord, dx: float, dy: float, dt_obs: Optional[float]
+    ) -> None:
+        if self._lstm_history_steps is None:
+            return
+        if record.lstm_history is None:
+            record.lstm_history = deque(maxlen=self._lstm_history_steps)
+        sample_dt = float(dt_obs) if dt_obs is not None else 0.0
+        norm_dx, norm_dy = dx, dy
+        if self._lstm_reference_dt is not None and sample_dt > 0.0:
+            scale = self._lstm_reference_dt / sample_dt
+            norm_dx *= scale
+            norm_dy *= scale
+        record.lstm_history.append(
+            LSTMHistoryStep(dx=norm_dx, dy=norm_dy, dt=sample_dt)
+        )
 
     def enable_autopilot(self, traffic_manager: carla.TrafficManager) -> None:
         """現在の vehicle / bicycle アクターを CARLA の autopilot 配下に移行する．"""
@@ -1175,6 +1262,7 @@ class EntityManager:
         )
         actor.set_transform(transform)
 
+        dt_obs: Optional[float] = None
         observed_velocity = carla.Vector3D(0.0, 0.0, 0.0)
         if record.last_observed_location is not None and record.last_observed_time is not None:
             dt_obs = timestamp - record.last_observed_time
@@ -1210,11 +1298,9 @@ class EntityManager:
             and self._lstm is not None
             and self._lstm_history_steps is not None
         ):
-            if record.lstm_history is None:
-                record.lstm_history = deque(maxlen=self._lstm_history_steps)
             dx = float(new_location.x - previous_target.x)
             dy = float(new_location.y - previous_target.y)
-            record.lstm_history.append((dx, dy))
+            self._record_lstm_delta(record, dx, dy, dt_obs)
 
         if timing_start_ns is not None and self._frame_start_ns is not None:
             self._actor_timings.append(
@@ -1270,6 +1356,11 @@ class EntityManager:
         ):
             LOGGER.warning("LSTM is not available; cannot prepare plans.")
             return
+        if self._torch is None:
+            LOGGER.error("PyTorch is not available; cannot prepare LSTM plans.")
+            return
+
+        torch = self._torch
 
         for record in self._entities.values():
             if record.object_type not in {"vehicle", "bicycle"}:
@@ -1284,14 +1375,24 @@ class EntityManager:
                 record.lstm_step = 0
                 continue
 
-            history = list(record.lstm_history)[-self._lstm_history_steps :]
+            history_steps = list(record.lstm_history)[-self._lstm_history_steps :]
+            history = [(step.dx, step.dy) for step in history_steps]
             x = torch.tensor(
                 history, dtype=torch.float32, device=self._lstm_device
             ).unsqueeze(0)
             with torch.no_grad():
                 pred = self._lstm(x)
             plan = pred.squeeze(0).detach().cpu().tolist()
-            record.lstm_plan = [(float(d[0]), float(d[1])) for d in plan]
+            plan_scale = 1.0
+            if (
+                self._lstm_reference_dt
+                and self._lstm_step_dt
+                and self._lstm_reference_dt > 0.0
+            ):
+                plan_scale = self._lstm_step_dt / self._lstm_reference_dt
+            record.lstm_plan = [
+                (float(d[0] * plan_scale), float(d[1] * plan_scale)) for d in plan
+            ]
             record.lstm_step = 0
             LOGGER.info(
                 "Prepared LSTM plan for actor %d: steps=%d",
@@ -1445,6 +1546,17 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_arguments(argv)
     logging.basicConfig(level=getattr(logging, args.log_level))
 
+    lstm_sample_interval = args.lstm_sample_interval or args.fixed_delta
+    if args.future_mode == "lstm":
+        if args.lstm_model is None:
+            LOGGER.error("LSTM future mode requested but --lstm-model was not provided.")
+            return 1
+        if lstm_sample_interval is not None and lstm_sample_interval <= 0:
+            LOGGER.error(
+                "LSTM sample interval must be positive; got %.3f", lstm_sample_interval
+            )
+            return 1
+
     client = carla.Client(args.carla_host, args.carla_port)
     client.set_timeout(args.timeout)
     world = client.get_world()
@@ -1486,20 +1598,29 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
             "switch_frame": None,
             "end_frame": None,
             "lead_time_seconds": None,
+            "lstm_sample_interval_seconds": lstm_sample_interval
+            if args.lstm_model is not None
+            else None,
         }
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     actor_logger = ActorCSVLogger(args.actor_log, args.id_map_file)
 
-    manager = EntityManager(
-        world,
-        blueprint_library,
-        enable_timing=args.measure_update_times,
-        timing_output=timing_file,
-        enable_completion=args.enable_completion,
-        actor_logger=actor_logger,
-        lstm_model_path=args.lstm_model,
-        lstm_device=args.lstm_device,
-    )
+    try:
+        manager = EntityManager(
+            world,
+            blueprint_library,
+            enable_timing=args.measure_update_times,
+            timing_output=timing_file,
+            enable_completion=args.enable_completion,
+            actor_logger=actor_logger,
+            lstm_model_path=args.lstm_model if args.future_mode == "lstm" else None,
+            lstm_device=args.lstm_device,
+            lstm_sample_interval=lstm_sample_interval,
+            simulation_step_interval=args.fixed_delta,
+        )
+    except RuntimeError as exc:
+        LOGGER.error("%s", exc)
+        return 1
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
     collision_logger = CollisionLogger(

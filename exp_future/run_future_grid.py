@@ -166,6 +166,8 @@ def main() -> int:
                         str(args.lstm_model),
                         "--lstm-device",
                         args.lstm_device,
+                        "--lstm-sample-interval",
+                        str(sender_interval),
                     ]
 
                 sender_cmd = [
