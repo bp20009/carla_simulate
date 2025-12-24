@@ -66,6 +66,24 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Optional maximum runtime in seconds (0 runs indefinitely)",
     )
     parser.add_argument(
+        "--future-duration-ticks",
+        type=int,
+        default=None,
+        help=(
+            "Optional maximum number of simulation ticks to run after entering "
+            "future mode; unlimited when unset"
+        ),
+    )
+    parser.add_argument(
+        "--future-duration-sec",
+        type=float,
+        default=None,
+        help=(
+            "Optional maximum simulated seconds to run after entering future mode; "
+            "ignored when --future-duration-ticks is provided; unlimited when unset"
+        ),
+    )
+    parser.add_argument(
         "--switch-payload-frame",
         type=int,
         default=None,
@@ -631,6 +649,10 @@ class CollisionLogger:
         self._last_accident_time: Dict[int, float] = {}
         self._accident_summaries: List[Dict[str, object]] = []
         self._payload_frame_getter = payload_frame_getter
+        self._ignore_before_time: Optional[float] = None
+
+    def set_min_timestamp(self, timestamp: Optional[float]) -> None:
+        self._ignore_before_time = timestamp
 
     @staticmethod
     def _other_class(other_type: str) -> str:
@@ -677,7 +699,13 @@ class CollisionLogger:
 
         def _on_collision(event: carla.CollisionEvent) -> None:
             carla_frame = int(event.frame)
-            timestamp = getattr(event, "timestamp", time.monotonic())
+            timestamp = float(getattr(event, "timestamp", time.monotonic()))
+
+            if (
+                self._ignore_before_time is not None
+                and timestamp < self._ignore_before_time
+            ):
+                return
 
             other = event.other_actor
             other_id = other.id if other is not None else None
@@ -1447,6 +1475,13 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
             "fixed_delta_seconds": args.fixed_delta,
             "traffic_manager_seed": args.tm_seed,
             "tracking_phase_duration_seconds": TRACKING_PHASE_DURATION,
+            "future_duration_ticks": args.future_duration_ticks,
+            "future_duration_seconds": (
+                args.future_duration_ticks * args.fixed_delta
+                if args.future_duration_ticks is not None and args.fixed_delta > 0.0
+                else args.future_duration_sec
+            ),
+            "future_start_time_seconds": None,
             "first_frame": None,
             "switch_frame": None,
             "end_frame": None,
@@ -1520,6 +1555,33 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     last_payload_frame: Optional[int] = None
     switch_payload_frame_observed: Optional[int] = None
     switch_reason: Optional[str] = None
+    future_tick_budget_remaining: Optional[int] = None
+    future_time_budget_remaining: Optional[float] = None
+    future_start_sim_time: Optional[float] = None
+    snapshot = world.get_snapshot()
+    timestamp = getattr(snapshot, "timestamp", None)
+    latest_sim_time: float = float(getattr(timestamp, "elapsed_seconds", 0.0)) if timestamp else 0.0
+    latest_sim_delta: float = float(getattr(timestamp, "delta_seconds", args.fixed_delta)) if timestamp else args.fixed_delta
+
+    def enter_future_mode(reason: str, observed_payload_frame: Optional[int]) -> None:
+        nonlocal future_mode, switch_wall_time, switch_reason, switch_payload_frame_observed
+        nonlocal future_tick_budget_remaining, future_time_budget_remaining, future_start_sim_time
+        switch_wall_time = time.monotonic()
+        future_mode = True
+        switch_reason = reason
+        switch_payload_frame_observed = observed_payload_frame
+        future_start_sim_time = latest_sim_time
+        if args.future_duration_ticks is not None:
+            future_tick_budget_remaining = args.future_duration_ticks
+        elif args.future_duration_sec is not None:
+            future_time_budget_remaining = args.future_duration_sec
+        if future_start_sim_time is not None:
+            collision_logger.set_min_timestamp(future_start_sim_time)
+        if future_mode_kind == "autopilot":
+            manager.enable_autopilot(traffic_manager)
+        elif future_mode_kind == "lstm":
+            manager._use_lstm_target = True
+            manager.prepare_lstm_plans()
 
     try:
         with synchronous_mode(world, args.fixed_delta):
@@ -1594,15 +1656,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 "after %.1f seconds of tracking",
                                 TRACKING_PHASE_DURATION,
                             )
-                            switch_wall_time = time.monotonic()
-                            future_mode = True
-                            switch_reason = "time_based"
-                            switch_payload_frame_observed = current_payload_frame
-                            if future_mode_kind == "autopilot":
-                                manager.enable_autopilot(traffic_manager)
-                            elif future_mode_kind == "lstm":
-                                manager._use_lstm_target = True
-                                manager.prepare_lstm_plans()
+                            enter_future_mode("time_based", current_payload_frame)
                         elif (
                             switch_payload_frame is not None
                             and not future_mode
@@ -1615,15 +1669,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 "at payload frame %d",
                                 current_payload_frame,
                             )
-                            switch_wall_time = time.monotonic()
-                            future_mode = True
-                            switch_reason = "payload_frame"
-                            switch_payload_frame_observed = current_payload_frame
-                            if future_mode_kind == "autopilot":
-                                manager.enable_autopilot(traffic_manager)
-                            elif future_mode_kind == "lstm":
-                                manager._use_lstm_target = True
-                                manager.prepare_lstm_plans()
+                            enter_future_mode("payload_frame", current_payload_frame)
 
                     current_payload_frame = manager.current_payload_frame
 
@@ -1672,6 +1718,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 rec.last_payload_frame = pf_next
 
                     carla_frame_id = world.tick()
+                    snapshot = world.get_snapshot()
+                    timestamp = getattr(snapshot, "timestamp", None)
+                    if timestamp is not None:
+                        latest_sim_time = float(
+                            getattr(timestamp, "elapsed_seconds", latest_sim_time)
+                        )
+                        latest_sim_delta = float(
+                            getattr(timestamp, "delta_seconds", latest_sim_delta)
+                        )
                     if first_frame is None:
                         first_frame = carla_frame_id
                     if future_mode and switch_frame is None:
@@ -1686,6 +1741,15 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                     frame_completed = True
                     last_step_time = time.monotonic()
 
+                    budget_exhausted = False
+                    if future_mode:
+                        if future_tick_budget_remaining is not None:
+                            future_tick_budget_remaining -= 1
+                            budget_exhausted = future_tick_budget_remaining <= 0
+                        elif future_time_budget_remaining is not None:
+                            future_time_budget_remaining -= latest_sim_delta
+                            budget_exhausted = future_time_budget_remaining <= 0
+
                     now = last_step_time
                     # stale アクタの自動 destroy は future_mode では無効化しておく
                     if not future_mode and now >= next_cleanup:
@@ -1696,6 +1760,18 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                     manager.log_actor_states(
                         actor_logger, manager.current_payload_frame, carla_frame_id
                     )
+                    if budget_exhausted:
+                        if args.future_duration_ticks is not None:
+                            LOGGER.info(
+                                "Future duration exhausted after %d ticks; stopping replay",
+                                args.future_duration_ticks,
+                            )
+                        else:
+                            LOGGER.info(
+                                "Future duration exhausted after %.3f seconds; stopping replay",
+                                args.future_duration_sec,
+                            )
+                        break
                 finally:
                     if manager.timing_enabled:
                         manager.end_frame(
@@ -1726,6 +1802,13 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         metadata["end_payload_frame"] = end_payload_frame
         metadata["computed_switch_payload_frame"] = computed_switch_payload_frame
         metadata["accidents"] = collision_logger.accident_summaries()
+        metadata["future_start_time_seconds"] = future_start_sim_time
+        metadata["future_duration_ticks"] = args.future_duration_ticks
+        metadata["future_duration_seconds"] = (
+            args.future_duration_ticks * args.fixed_delta
+            if args.future_duration_ticks is not None and args.fixed_delta > 0.0
+            else args.future_duration_sec
+        )
         metadata["lead_time_seconds"] = metadata.get("lead_time_seconds") or (
             switch_wall_time - tracking_start_time
             if switch_wall_time is not None and tracking_start_time is not None
