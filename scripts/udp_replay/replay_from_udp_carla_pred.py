@@ -1300,10 +1300,18 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                 else args.future_duration_sec
             ),
             "future_start_time_seconds": None,
+            "first_payload_frame": None,
+            "last_payload_frame": None,
             "first_frame": None,
             "switch_frame": None,
             "end_frame": None,
             "lead_time_seconds": None,
+            "switch_payload_frame_raw": args.switch_payload_frame,
+            "switch_payload_frame_used": None,
+            "switch_payload_frame_observed": None,
+            "computed_switch_payload_frame": None,
+            "end_payload_frame": args.end_payload_frame,
+            "switch_reason": None,
         }
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     actor_logger = ActorCSVLogger(args.actor_log, args.id_map_file)
@@ -1337,22 +1345,43 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     switch_payload_frame = args.switch_payload_frame
     end_payload_frame = args.end_payload_frame
     computed_switch_payload_frame: Optional[int] = None
-    if (
-        switch_payload_frame is None
-        and end_payload_frame is not None
-        and args.lead_time_sec is not None
-        and args.fixed_delta > 0.0
-    ):
-        frame_offset = int(round(args.lead_time_sec / args.fixed_delta))
-        computed_switch_payload_frame = max(end_payload_frame - frame_offset, 0)
-        switch_payload_frame = computed_switch_payload_frame
+    lead_time_reference_end_pf: Optional[int] = None
+    last_logged_computed_switch: Optional[int] = None
 
-    if computed_switch_payload_frame is not None:
-        LOGGER.info(
-            "Computed switch payload frame %d using lead time %.3f s",
-            computed_switch_payload_frame,
-            args.lead_time_sec,
+    def _refresh_switch_payload_frame() -> None:
+        nonlocal computed_switch_payload_frame, switch_payload_frame, lead_time_reference_end_pf, last_logged_computed_switch
+        should_compute = (
+            end_payload_frame is not None
+            and args.lead_time_sec is not None
+            and args.fixed_delta > 0.0
+            and (
+                switch_payload_frame is None
+                or computed_switch_payload_frame is not None
+                or lead_time_reference_end_pf != end_payload_frame
+            )
         )
+        if should_compute:
+            frame_offset = int(round(args.lead_time_sec / args.fixed_delta))
+            computed_switch_payload_frame = max(end_payload_frame - frame_offset, 0)
+            lead_time_reference_end_pf = end_payload_frame
+            if switch_payload_frame is None or switch_payload_frame == computed_switch_payload_frame:
+                switch_payload_frame = computed_switch_payload_frame
+        if metadata is not None:
+            metadata["switch_payload_frame_used"] = switch_payload_frame
+            metadata["computed_switch_payload_frame"] = computed_switch_payload_frame
+        if (
+            computed_switch_payload_frame is not None
+            and switch_payload_frame == computed_switch_payload_frame
+            and computed_switch_payload_frame != last_logged_computed_switch
+        ):
+            LOGGER.info(
+                "Computed switch payload frame %d using lead time %.3f s",
+                computed_switch_payload_frame,
+                args.lead_time_sec,
+            )
+            last_logged_computed_switch = computed_switch_payload_frame
+
+    _refresh_switch_payload_frame()
 
     # 追加: トラッキング開始時刻と future モードフラグ
     has_received_first_data = False
@@ -1361,6 +1390,11 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     first_frame: Optional[int] = None
     switch_frame: Optional[int] = None
     end_frame: Optional[int] = None
+    first_payload_frame: Optional[int] = None
+    last_payload_frame: Optional[int] = None
+    switch_payload_frame_observed: Optional[int] = None
+    switch_reason: Optional[str] = None
+    payload_frame_offsets_checked = False
     future_tick_budget_remaining: Optional[int] = None
     future_time_budget_remaining: Optional[float] = None
     future_start_sim_time: Optional[float] = None
@@ -1369,10 +1403,13 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     latest_sim_time: float = float(getattr(timestamp, "elapsed_seconds", 0.0)) if timestamp else 0.0
     latest_sim_delta: float = float(getattr(timestamp, "delta_seconds", args.fixed_delta)) if timestamp else args.fixed_delta
 
-    def enter_future_mode() -> None:
+    def enter_future_mode(reason: str, observed_payload_frame: Optional[int]) -> None:
         nonlocal future_mode, switch_wall_time, future_tick_budget_remaining, future_time_budget_remaining, future_start_sim_time
+        nonlocal switch_reason, switch_payload_frame_observed
         switch_wall_time = time.monotonic()
         future_mode = True
+        switch_reason = reason
+        switch_payload_frame_observed = observed_payload_frame
         future_start_sim_time = latest_sim_time
         if args.future_duration_ticks is not None:
             future_tick_budget_remaining = args.future_duration_ticks
@@ -1381,6 +1418,35 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         if future_start_sim_time is not None:
             collision_logger.set_min_timestamp(future_start_sim_time)
         manager.enable_autopilot(traffic_manager)
+        if metadata is not None:
+            metadata["switch_payload_frame_observed"] = switch_payload_frame_observed
+            metadata["switch_reason"] = switch_reason
+            if tracking_start_time is not None and switch_wall_time is not None:
+                metadata["lead_time_seconds"] = switch_wall_time - tracking_start_time
+
+    def _maybe_apply_payload_frame_offsets() -> None:
+        nonlocal switch_payload_frame, end_payload_frame, payload_frame_offsets_checked
+        if payload_frame_offsets_checked or first_payload_frame is None:
+            return
+        adjusted = False
+        if switch_payload_frame is not None and switch_payload_frame < first_payload_frame:
+            switch_payload_frame = first_payload_frame + switch_payload_frame
+            adjusted = True
+        if end_payload_frame is not None and end_payload_frame < first_payload_frame:
+            end_payload_frame = first_payload_frame + end_payload_frame
+            adjusted = True
+        payload_frame_offsets_checked = True
+        if adjusted:
+            LOGGER.info(
+                "Adjusted payload frame bounds from sender start %d -> switch=%s end=%s",
+                first_payload_frame,
+                switch_payload_frame,
+                end_payload_frame,
+            )
+            if metadata is not None:
+                metadata["switch_payload_frame_used"] = switch_payload_frame
+                metadata["end_payload_frame"] = end_payload_frame
+        _refresh_switch_payload_frame()
 
     try:
         with synchronous_mode(world, args.fixed_delta):
@@ -1414,6 +1480,10 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 for raw_message in decode_messages(payload):
                                     payload_frame = extract_payload_frame(raw_message)
                                     manager.update_payload_frame(payload_frame)
+                                    if payload_frame is not None:
+                                        if first_payload_frame is None:
+                                            first_payload_frame = payload_frame
+                                        last_payload_frame = payload_frame
                                     try:
                                         state = normalise_message(
                                             raw_message, payload_frame=payload_frame
@@ -1434,6 +1504,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                             has_received_first_data = True
                             tracking_start_time = time.monotonic()
 
+                        _maybe_apply_payload_frame_offsets()
+
                         # 最新 payload_frame を取得した上で判定する
                         current_payload_frame = manager.current_payload_frame
 
@@ -1450,7 +1522,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 "after %.1f seconds of tracking",
                                 TRACKING_PHASE_DURATION,
                             )
-                            enter_future_mode()
+                            enter_future_mode("time_based", current_payload_frame)
                         elif (
                             switch_payload_frame is not None
                             and not future_mode
@@ -1462,7 +1534,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                                 "at payload frame %d",
                                 current_payload_frame,
                             )
-                            enter_future_mode()
+                            enter_future_mode("payload_frame", current_payload_frame)
 
                     current_payload_frame = manager.current_payload_frame
 
@@ -1505,7 +1577,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                         latest_sim_delta = float(
                             getattr(timestamp, "delta_seconds", latest_sim_delta)
                         )
-                    if first_frame is None:
+                    if first_frame is None and first_payload_frame is not None:
                         first_frame = carla_frame_id
                     if future_mode and switch_frame is None:
                         switch_frame = carla_frame_id
@@ -1570,6 +1642,14 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         metadata["first_frame"] = first_frame
         metadata["switch_frame"] = switch_frame
         metadata["end_frame"] = end_frame
+        metadata["first_payload_frame"] = first_payload_frame
+        metadata["last_payload_frame"] = last_payload_frame
+        metadata["switch_payload_frame_raw"] = args.switch_payload_frame
+        metadata["switch_payload_frame_used"] = switch_payload_frame
+        metadata["switch_payload_frame_observed"] = switch_payload_frame_observed
+        metadata["computed_switch_payload_frame"] = computed_switch_payload_frame
+        metadata["end_payload_frame"] = end_payload_frame
+        metadata["switch_reason"] = switch_reason
         metadata["future_start_time_seconds"] = future_start_sim_time
         metadata["future_duration_ticks"] = args.future_duration_ticks
         metadata["future_duration_seconds"] = (
