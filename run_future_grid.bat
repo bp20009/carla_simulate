@@ -85,12 +85,12 @@ echo SENDER_RANGE=%START_FRAME%..%END_FRAME%  (pre=%PRE_SEC%s post=%POST_SEC%s)
 for /f %%w in ('
   powershell -NoProfile -Command ^
     "$ErrorActionPreference='Stop';" ^
-    "$delta=[double]$env:FIXED_DELTA;" ^
-    "$start=[int]$env:START_FRAME;" ^
-    "$end=[int]$env:END_FRAME;" ^
+    "$delta=%FIXED_DELTA%;" ^
+    "$start=%START_FRAME%;" ^
+    "$end=%END_FRAME%;" ^
     "$sendDuration=($end - $start + 1) * $delta;" ^
-    "$wait=[int][math]::Ceiling($sendDuration + [double]$env:STARTUP_DELAY + 5);" ^
-    "$waitBound=[int][math]::Max($wait,[int]$env:WAIT_BASE);" ^
+    "$wait=[int][math]::Ceiling($sendDuration + %STARTUP_DELAY% + 5);" ^
+    "$waitBound=[int][math]::Max($wait,%WAIT_BASE%);" ^
     "Write-Output $waitBound"
 ') do set "WAIT_SEC=%%w"
 
@@ -118,14 +118,18 @@ for %%M in (autopilot lstm) do (
       set "RECV_LOG=!RUN_LOGS!\receiver.log"
       set "PID_VALID=1"
 
-      for /f %%p in ('
-        powershell -NoProfile -Command ^
-          "$ErrorActionPreference='Stop';" ^
-          "$argsList=@($env:REPLAY_SCRIPT,'--carla-host',$env:CARLA_HOST,'--carla-port',$env:CARLA_PORT,'--listen-host',$env:LISTEN_HOST,'--listen-port',$env:LISTEN_PORT,'--poll-interval',$env:POLL_INTERVAL,'--fixed-delta',$env:FIXED_DELTA,'--max-runtime',$env:MAX_RUNTIME,'--tm-seed',$env:SEED,'--future-mode','%%M','--switch-payload-frame',$env:SWITCH_PF,'--metadata-output',$env:RUN_META,'--collision-log',$env:RUN_COLL,'--actor-log',$env:RUN_ACTOR,'--id-map-file',$env:RUN_IDMAP);" ^
-          "if ('%%M' -eq 'lstm') { $argsList += @('--lstm-model', $env:LSTM_MODEL, '--lstm-device', $env:LSTM_DEVICE, '--lstm-sample-interval', $env:FIXED_DELTA) };" ^
-          "$p=Start-Process -FilePath $env:PY -ArgumentList $argsList -RedirectStandardOutput $env:RECV_LOG -RedirectStandardError $env:RECV_LOG -NoNewWindow -PassThru;" ^
-          "$p.Id"
-      ') do set "REPLAY_PID=%%p"
+      set "PID_FILE=!RUN_LOGS!\replay.pid"
+      del /q "!PID_FILE!" >nul 2>&1
+
+      powershell -NoProfile -Command ^
+        "$ErrorActionPreference='Stop';" ^
+        "$argsList=@('%REPLAY_SCRIPT%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%LISTEN_PORT%','--poll-interval','%POLL_INTERVAL%','--fixed-delta','%FIXED_DELTA%','--max-runtime','%MAX_RUNTIME%','--tm-seed','!SEED!','--future-mode','%%M','--switch-payload-frame','!SWITCH_PF!','--metadata-output','!RUN_META!','--collision-log','!RUN_COLL!','--actor-log','!RUN_ACTOR!','--id-map-file','!RUN_IDMAP!');" ^
+        "if ('%%M' -eq 'lstm') { $argsList += @('--lstm-model','%LSTM_MODEL%','--lstm-device','%LSTM_DEVICE%','--lstm-sample-interval','%FIXED_DELTA%') };" ^
+        "$p=Start-Process -FilePath '%PY%' -ArgumentList $argsList -RedirectStandardOutput '!RECV_LOG!' -RedirectStandardError '!RECV_LOG!' -NoNewWindow -PassThru;" ^
+        "Set-Content -Path '!PID_FILE!' -Value $p.Id -NoNewline;"
+
+      set "REPLAY_PID="
+      if exist "!PID_FILE!" set /p REPLAY_PID=<"!PID_FILE!"
 
       echo(!REPLAY_PID!| findstr /r "^[0-9][0-9]*$" >nul
       if errorlevel 1 (
