@@ -31,6 +31,9 @@ for %%T in (2 5 10) do (
     --poll-interval 0.1 ^
     --sender-interval 0.1 ^
     --tm-seed 20009 ^
+    --center-payload-frame 25411 ^
+    --pre-sec 60 ^
+    --post-sec 30 ^
     --outdir results_ticks%%T
 )
 
