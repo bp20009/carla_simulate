@@ -37,6 +37,8 @@ set "SENDER_PORT=5005"
 
 set /a "MAX_RUNTIME=%TRACKING_SEC%+%FUTURE_SEC%"
 set /a "WAIT_SEC=%MAX_RUNTIME%+30"
+if not defined CALIB_MAX_RUNTIME set "CALIB_MAX_RUNTIME=%MAX_RUNTIME%"
+set /a "CALIB_WAIT_SEC=%CALIB_MAX_RUNTIME%+30"
 
 for /f %%a in ('python "%META_TOOL%" accident_pf_from_collisions "%ACC_REF%"') do set "ACCIDENT_PF=%%a"
 
