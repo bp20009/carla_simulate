@@ -19,6 +19,9 @@ set "META_TOOL=scripts\udp_replay\meta_tools.py"
 set "ACC_REF=%~dp0exp_future\collisions_exp_accident.csv"
 
 set "FIXED_DELTA=0.1"
+set "PRE_SEC=60"
+set "POST_SEC=30"
+set "PF_PER_SEC=10"
 set "POLL_INTERVAL=0.1"
 set "TRACKING_SEC=30"
 set "FUTURE_SEC=10"
@@ -40,8 +43,9 @@ set "SENDER_HOST=127.0.0.1"
 set "SENDER_PORT=5005"
 set "PY=python"
 
-set /a "MAX_RUNTIME=%TRACKING_SEC%+%FUTURE_SEC%"
-set /a "WAIT_SEC=%MAX_RUNTIME%+30"
+set "MAX_RUNTIME=100"
+set /a "WAIT_BASE=%MAX_RUNTIME%+30"
+set /a "WAIT_SEC=%WAIT_BASE%"
 if not defined CALIB_MAX_RUNTIME set "CALIB_MAX_RUNTIME=%MAX_RUNTIME%"
 set /a "CALIB_WAIT_SEC=%CALIB_MAX_RUNTIME%+30"
 
@@ -51,6 +55,25 @@ if "%ACCIDENT_PF%"=="" (
   echo Failed: no accident frame found in %ACC_REF%
   exit /b 1
 )
+
+set /a "START_FRAME=ACCIDENT_PF-(PRE_SEC*PF_PER_SEC)"
+set /a "END_FRAME=ACCIDENT_PF+(POST_SEC*PF_PER_SEC)"
+if %START_FRAME% LSS 0 set "START_FRAME=0"
+
+echo ACCIDENT_PF=%ACCIDENT_PF%
+echo SENDER_RANGE=%START_FRAME%..%END_FRAME%  (pre=%PRE_SEC%s post=%POST_SEC%s)
+
+for /f %%w in ('
+  powershell -NoProfile -Command ^
+    "$ErrorActionPreference='Stop';" ^
+    "$delta=[double]$env:FIXED_DELTA;" ^
+    "$start=[int]$env:START_FRAME;" ^
+    "$end=[int]$env:END_FRAME;" ^
+    "$sendDuration=($end - $start + 1) * $delta;" ^
+    "$wait=[int][math]::Ceiling($sendDuration + [double]$env:STARTUP_DELAY + 5);" ^
+    "$waitBound=[int][math]::Max($wait,[int]$env:WAIT_BASE);" ^
+    "Write-Output $waitBound"
+') do set "WAIT_SEC=%%w"
 
 set "SUMMARY=%OUTDIR%\summary_grid.csv"
 echo method,lead_sec,rep,seed,switch_payload_frame,ran_ok,accident_after_switch,first_accident_payload_frame,status,accident_payload_frame_ref > "%SUMMARY%"
@@ -68,10 +91,6 @@ for %%M in (autopilot lstm) do (
       set "RUN_ACTOR=!RUN_LOGS!\actor.csv"
       set "RUN_IDMAP=!RUN_LOGS!\id_map.csv"
 
-      set "START_FRAME="
-      set "END_FRAME="
-      set "RUN_WAIT_SEC=%WAIT_SEC%"
-
       mkdir "!RUN_LOGS!" >nul 2>&1
 
       set "RAN_OK=1"
@@ -79,27 +98,6 @@ for %%M in (autopilot lstm) do (
 
       set "RECV_LOG=!RUN_LOGS!\receiver.log"
       set "PID_VALID=1"
-
-      for /f "tokens=1,2,3" %%u in ('
-        powershell -NoProfile -Command ^
-          "$ErrorActionPreference='Stop';" ^
-          "$delta=[double]$env:FIXED_DELTA;" ^
-          "$accident=[int]$env:ACCIDENT_PF;" ^
-          "$beforeSec=[double]$env:WINDOW_SEC_BEFORE;" ^
-          "$afterSec=[double]$env:WINDOW_SEC_AFTER;" ^
-          "$beforeFrames=[int][math]::Ceiling($beforeSec / $delta);" ^
-          "$afterFrames=[int][math]::Ceiling($afterSec / $delta);" ^
-          "$start=[math]::Max($accident - $beforeFrames, 0);" ^
-          "$end=[math]::Max($accident + $afterFrames, 0);" ^
-          "$sendDuration=($end - $start + 1) * $delta;" ^
-          "$wait=[int][math]::Ceiling($sendDuration + [double]$env:STARTUP_DELAY + 5);" ^
-          "$waitBound=[int][math]::Max($wait,[int]$env:WAIT_SEC);" ^
-          "Write-Output \"$start $end $waitBound\""
-      ') do (
-        set "START_FRAME=%%u"
-        set "END_FRAME=%%v"
-        set "RUN_WAIT_SEC=%%w"
-      )
 
       for /f %%p in ('
         powershell -NoProfile -Command ^
@@ -110,20 +108,18 @@ for %%M in (autopilot lstm) do (
           "$p.Id"
       ') do set "REPLAY_PID=%%p"
 
-      timeout /t %STARTUP_DELAY% /nobreak >nul
-      python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%" --start-frame "!START_FRAME!" --end-frame "!END_FRAME!"
-      call :wait_for_pid !REPLAY_PID! !RUN_WAIT_SEC!
+      echo(!REPLAY_PID!| findstr /r "^[0-9][0-9]*$" >nul
       if errorlevel 1 (
-        echo Failed: invalid replay PID "!REPLAY_PID!"
+        echo Failed: REPLAY_PID invalid: "!REPLAY_PID!"
         if exist "!RECV_LOG!" type "!RECV_LOG!"
         set "RAN_OK=0"
-        set "STATUS=pid_error"
+        set "STATUS=pid_invalid"
         set "PID_VALID=0"
       )
 
       if "!PID_VALID!"=="1" (
         timeout /t %STARTUP_DELAY% /nobreak >nul
-        python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%" --start-frame "!START_FRAME!" --end-frame "!END_FRAME!"
+        python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%" --start-frame "!START_FRAME!" --end-frame "!END_FRAME!" --log-level INFO
         call :wait_for_pid !REPLAY_PID! %WAIT_SEC%
         if errorlevel 1 (
           set "RAN_OK=0"
@@ -132,11 +128,13 @@ for %%M in (autopilot lstm) do (
         )
       )
 
-      for /f %%f in ('python "%META_TOOL%" first_accident_pf "!RUN_META!"') do set "FIRST_ACC_PF=%%f"
+      set "FIRST_ACC_PF="
+      set "AFTER_SWITCH=0"
+      if exist "!RUN_META!" (
+        for /f %%f in ('python "%META_TOOL%" first_accident_pf "!RUN_META!"') do set "FIRST_ACC_PF=%%f"
+        for /f %%a in ('python "%META_TOOL%" accident_after_switch "!RUN_META!" "!SWITCH_PF!"') do set "AFTER_SWITCH=%%a"
+      )
 
-      for /f %%a in ('python "%META_TOOL%" accident_after_switch "!RUN_META!" "!SWITCH_PF!"') do set "AFTER_SWITCH=%%a"
-
-      if "!FIRST_ACC_PF!"=="" set "FIRST_ACC_PF="
       if "!AFTER_SWITCH!"=="" set "AFTER_SWITCH=0"
 
       echo %%M,%%L,%%R,!SEED!,!SWITCH_PF!,!RAN_OK!,!AFTER_SWITCH!,!FIRST_ACC_PF!,!STATUS!,%ACCIDENT_PF%>> "%SUMMARY%"
