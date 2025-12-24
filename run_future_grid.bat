@@ -81,6 +81,7 @@ for %%M in (autopilot lstm) do (
       )
 
       set "RECV_LOG=!RUN_LOGS!\receiver.log"
+      set "PID_VALID=1"
 
       for /f "tokens=1,2,3" %%u in ('
         powershell -NoProfile -Command ^
@@ -119,9 +120,22 @@ for %%M in (autopilot lstm) do (
       python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%" --start-frame "!START_FRAME!" --end-frame "!END_FRAME!"
       call :wait_for_pid !REPLAY_PID! !RUN_WAIT_SEC!
       if errorlevel 1 (
+        echo Failed: invalid replay PID "!REPLAY_PID!"
+        if exist "!RECV_LOG!" type "!RECV_LOG!"
         set "RAN_OK=0"
-        set "STATUS=timeout"
-        taskkill /PID !REPLAY_PID! /T /F >nul 2>&1
+        set "STATUS=pid_error"
+        set "PID_VALID=0"
+      )
+
+      if "!PID_VALID!"=="1" (
+        timeout /t %STARTUP_DELAY% /nobreak >nul
+        python "%SENDER_SCRIPT%" "%CSV_PATH%" --host "%SENDER_HOST%" --port "%SENDER_PORT%" --interval "%FIXED_DELTA%"
+        call :wait_for_pid !REPLAY_PID! %WAIT_SEC%
+        if errorlevel 1 (
+          set "RAN_OK=0"
+          set "STATUS=timeout"
+          taskkill /PID !REPLAY_PID! /T /F >nul 2>&1
+        )
       )
 
       for /f %%f in ('python "%META_TOOL%" first_accident_pf "!RUN_META!"') do set "FIRST_ACC_PF=%%f"
