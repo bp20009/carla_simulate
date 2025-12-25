@@ -176,3 +176,18 @@ python send_data/send_udp_frames_from_csv.py vehicle_states_reduced.csv --host 1
 `scripts/udp_replay/replay_from_udp.py` は、UDPメッセージで送られるアクター位置情報を受信し、CARLAワールド上で再生します。`python scripts/udp_replay/replay_from_udp.py --help` で利用可能な全オプションを確認してください。
 
 - `--enable-completion`: デフォルトでは無効。設定すると、位置差分から移動方向を計算し、欠落したyaw/ヘディングを補完します。
+
+## 実験・評価用ユーティリティ
+- `scripts/extract_future_accidents.py`: 未来フェーズで発生した事故イベントをまとめる抽出ツール。`results_grid_accident` のような実行ルート以下を走査し、`logs/collisions.csv` と `logs/meta.json` を突き合わせて強度しきい値（`--threshold`）や事故判定フラグ（`--require-is-accident`）でフィルタした結果を1つのCSVへ出力します。
+- `exp_future/experiment_grid.py`: 先読み秒数（lead）や繰り返し回数（rep）をグリッドで走査し、UDPリプレイ・送信スクリプトを指定して一括実行するバッチランナー。`logs/meta.json` から事故有無を集計して `summary_grid.csv` を生成します。
+- `exp_future/run_future_grid.py`: あるペイロードフレームを基準に、オートパイロットとLSTMモードの双方でプレ・ポストの時間窓を変えながら衝突ヒット数を集計する軽量グリッドスイープ。送信CSVを切り詰めた上でリプレイと送信を自動起動し、`summary.csv` に成功回数をまとめます。
+- `exp_future/batch_run_and_analyze_decel.py`: 減速応答の評価をまとめて実行し、指定したウィンドウ長や切替フレーム（switch_eval_ticks）ごとに結果を集計するスクリプト。`--replay-script`・`--sender-script`・`--csv-path` を与えると、各試行のログや衝突情報を `results_*` ディレクトリに配置します。
+- `exp_future/train_traj_lstm.py`: UDPリプレイで利用する軌跡LSTMモデルを学習するためのトレーナー。`traj_lstm.pt` を更新し、`replay_from_udp_future_exp.py` などから `--lstm-model` として参照できます。
+- `exp_future/denger_traffic.py`, `exp_future/time_acceleration_benchmark.py`, `exp_future/plot_collision.py`: 交通量生成・時間加速ベンチマーク・衝突ログ可視化など、未来フェーズ実験の補助スクリプト群です。
+
+## Windowsバッチ補助
+実験を連続実行するための `.bat` ラッパーを同梱しています。CARLAサーバを事前に起動し、パスを調整した上で実行してください。
+
+- `run_future_grid.bat`: `send_data/exp_accident.csv`（または第1引数で指定したCSV）を使ってオートパイロットとLSTMのリードタイム比較を一括実行します。出力先は第2引数またはデフォルトの `results_grid_accident` で、各実行のログと `summary_grid.csv` を生成します。
+- `run_decel_batch.bat`: `exp_future/batch_run_and_analyze_decel.py` と `scripts/udp_replay/replay_from_udp_carla_pred.py` を組み合わせ、複数の切替タイミング（`SWITCH_EVAL_TICKS` など）で減速実験を繰り返すバッチ。`send_data/exp_accident.csv` を入力とし、`results_ticks*` ディレクトリにログを保存します。
+- `run_extract_future_accidents.bat`: グリッド実行後の結果ルート（第1引数、省略時 `results_grid_accident`）を走査し、未来フェーズで強度しきい値を超える衝突イベントを `future_accidents_ge1000.csv`（第2引数で上書き可）へ集約します。第3引数でしきい値変更、第4引数を `noacc` にすると `--require-is-accident` を無効化できます。
