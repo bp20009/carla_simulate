@@ -19,6 +19,31 @@
   - `pillow`（任意。アニメーションをGIF出力する場合に必要）
 - MatplotlibでMP4を出力する場合は、`PATH`上にある`ffmpeg`バイナリ（任意だが推奨）
 
+## セットアップとクイックスタート
+1. Python仮想環境を用意して依存関係をインストールします。
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # Windowsの場合は .venv\\Scripts\\activate
+   pip install -r requirements.txt
+   ```
+
+2. CARLAサーバを起動し、接続先を確認します（デフォルト: `127.0.0.1:2000`）。
+3. オートパイロットシミュレーションを走らせ、ログと軌跡を出力します。
+
+   ```bash
+   python scripts/autopilot_simulation.py \
+     --host 127.0.0.1 \
+     --port 2000 \
+     --vehicles 25 \
+     --duration 120 \
+     --output-dir runs/example \
+     --plot-trajectories
+   ```
+
+4. 実行後に `runs/example` 配下へ `trajectories.csv`、`trajectories.json`、`trajectories.png` が生成されます。プロットを再利用したい場合は、保存先を別ディレクトリにするか既存ファイルを削除してください。
+5. 既存のCSVを可視化するだけなら、CARLAサーバなしで `scripts/plot_vehicle_trajectories.py` または `scripts/animate_vehicle_trajectories.py` を実行できます。
+
 ## 使い方
 接続先やシナリオのパラメータを指定してオートパイロットシミュレーションスクリプトを実行します。
 
