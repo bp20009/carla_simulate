@@ -1226,11 +1226,12 @@ class EntityManager:
         self._active_frame_sequence = None
         self._active_payload_frame = None
 
-    def update_payload_frame(self, payload_frame: Optional[int]) -> None:
+    def update_payload_frame(self, payload_frame: Optional[int], *, mark_active: bool = True) -> None:
         if payload_frame is None:
             return
         self._current_payload_frame = payload_frame
-        self._active_payload_frame = payload_frame
+        if mark_active:
+            self._active_payload_frame = payload_frame
 
     @property
     def current_payload_frame(self) -> Optional[int]:
@@ -1914,18 +1915,26 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                     # future_mode のときは Traffic Manager / autopilot が制御するので
                     # ここでは何もしない（world.tick() だけ進める）
 
-                    active_payload_frame_for_tick = manager.current_payload_frame
+                    tick_payload_frame = manager.current_payload_frame
+                    if future_mode and tick_payload_frame is None:
+                        tick_payload_frame = (
+                            first_payload_frame if first_payload_frame is not None else 0
+                        )
+                        manager.update_payload_frame(tick_payload_frame, mark_active=True)
+                    if future_mode and tick_payload_frame is not None:
+                        for rec in manager.entities.values():
+                            rec.last_payload_frame = tick_payload_frame
+
+                    if tick_payload_frame is not None:
+                        manager.update_payload_frame(tick_payload_frame, mark_active=True)
+
+                    active_payload_frame_for_tick = tick_payload_frame
                     carla_frame_id = world.tick()
 
                     # future_mode 中は UDP から payload_frame が増えないので，疑似的に進める
-                    if future_mode:
-                        pf = manager.current_payload_frame
-                        if pf is None:
-                            pf = first_payload_frame if first_payload_frame is not None else 0
-                        pf_next = int(pf) + 1
-                        manager.update_payload_frame(pf_next)
-                        for rec in manager.entities.values():
-                            rec.last_payload_frame = pf_next
+                    if future_mode and tick_payload_frame is not None:
+                        pf_next = int(tick_payload_frame) + 1
+                        manager.update_payload_frame(pf_next, mark_active=False)
 
                     snapshot = world.get_snapshot()
                     timestamp = getattr(snapshot, "timestamp", None)
@@ -1967,7 +1976,7 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
 
                     control_broadcaster.publish(manager.control_state_snapshot())
                     manager.log_actor_states(
-                        actor_logger, manager.current_payload_frame, carla_frame_id
+                        actor_logger, tick_payload_frame, carla_frame_id
                     )
                     if budget_exhausted:
                         if args.future_duration_ticks is not None:
