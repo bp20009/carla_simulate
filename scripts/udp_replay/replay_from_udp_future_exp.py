@@ -1710,9 +1710,10 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         return 1
 
     control_broadcaster = ControlStateBroadcaster(args.control_state_file)
+    active_payload_frame_for_tick: Optional[int] = None
     collision_logger = CollisionLogger(
         world,
-        payload_frame_getter=lambda: manager.current_payload_frame,
+        payload_frame_getter=lambda: active_payload_frame_for_tick,
         log_path=args.collision_log,
     )
 
@@ -1913,18 +1914,19 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                     # future_mode のときは Traffic Manager / autopilot が制御するので
                     # ここでは何もしない（world.tick() だけ進める）
 
+                    active_payload_frame_for_tick = manager.current_payload_frame
+                    carla_frame_id = world.tick()
+
                     # future_mode 中は UDP から payload_frame が増えないので，疑似的に進める
                     if future_mode:
                         pf = manager.current_payload_frame
                         if pf is None:
-                            pf = first_payload_frame
-                        if pf is not None:
-                            pf_next = int(pf) + 1
-                            manager.update_payload_frame(pf_next)
-                            for rec in manager.entities.values():
-                                rec.last_payload_frame = pf_next
+                            pf = first_payload_frame if first_payload_frame is not None else 0
+                        pf_next = int(pf) + 1
+                        manager.update_payload_frame(pf_next)
+                        for rec in manager.entities.values():
+                            rec.last_payload_frame = pf_next
 
-                    carla_frame_id = world.tick()
                     snapshot = world.get_snapshot()
                     timestamp = getattr(snapshot, "timestamp", None)
                     if timestamp is not None:
