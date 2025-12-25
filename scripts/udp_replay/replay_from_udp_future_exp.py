@@ -520,6 +520,48 @@ def _load_lstm_model(
     return lstm_model, history_steps, horizon_steps, torch
 
 
+def _speed_kmh_from_actor(actor: carla.Actor) -> float:
+    velocity = actor.get_velocity()
+    return 3.6 * math.sqrt(
+        velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z
+    )
+
+
+def _get_speed_limit_kmh(
+    world: carla.World, actor: carla.Actor, default_kmh: float = 30.0
+) -> float:
+    try:
+        location = actor.get_transform().location
+        waypoint = world.get_map().get_waypoint(
+            location, project_to_road=True, lane_type=carla.LaneType.Driving
+        )
+        if waypoint is not None:
+            speed_limit = float(waypoint.get_speed_limit())
+            if speed_limit > 0.0:
+                return speed_limit
+    except Exception:
+        pass
+    return float(default_kmh)
+
+
+def _tm_set_vehicle_speed_diff(
+    tm: carla.TrafficManager, vehicle: carla.Actor, diff_pct: float
+) -> None:
+    diff_pct = float(diff_pct)
+
+    if hasattr(tm, "vehicle_percentage_speed_difference"):
+        tm.vehicle_percentage_speed_difference(vehicle, diff_pct)
+        return
+    if hasattr(tm, "set_percentage_speed_difference"):
+        tm.set_percentage_speed_difference(vehicle, diff_pct)
+        return
+    if hasattr(tm, "set_vehicle_percentage_speed_difference"):
+        tm.set_vehicle_percentage_speed_difference(vehicle, diff_pct)
+        return
+
+    raise RuntimeError("TrafficManager speed-difference API not found in this CARLA build.")
+
+
 def _iter_message_objects(obj: object) -> Iterator[Mapping[str, object]]:
     if isinstance(obj, Mapping):
         actors = obj.get("actors")
@@ -1027,6 +1069,12 @@ class EntityManager:
 
         tm_port = traffic_manager.get_port()
         self._tm_port = tm_port
+
+        min_kmh = 5.0
+        max_kmh = 60.0
+        default_speed_limit_kmh = 30.0
+        diff_min = -30.0
+        diff_max = 80.0
         for object_id, record in self._entities.items():
             actor = record.actor
             if not actor.is_alive:
@@ -1039,6 +1087,37 @@ class EntityManager:
                     LOGGER.info("Enabled autopilot for '%s' (%s)", object_id, record.object_type)
                 except RuntimeError:
                     LOGGER.warning("Failed to enable autopilot for '%s'", object_id)
+                    continue
+
+                try:
+                    v_switch_kmh = _speed_kmh_from_actor(actor)
+                    target_kmh = max(min_kmh, min(v_switch_kmh, max_kmh))
+
+                    speed_limit_kmh = _get_speed_limit_kmh(
+                        self._world, actor, default_kmh=default_speed_limit_kmh
+                    )
+                    if speed_limit_kmh <= 0.0:
+                        speed_limit_kmh = default_speed_limit_kmh
+
+                    diff = 100.0 * (1.0 - (target_kmh / speed_limit_kmh))
+                    diff = max(diff_min, min(diff, diff_max))
+
+                    _tm_set_vehicle_speed_diff(traffic_manager, actor, diff)
+
+                    LOGGER.info(
+                        (
+                            "TM speed set: %s actor_id=%d v_switch=%.1f km/h "
+                            "target=%.1f km/h limit=%.1f km/h diff=%.1f%%"
+                        ),
+                        object_id,
+                        actor.id,
+                        v_switch_kmh,
+                        target_kmh,
+                        speed_limit_kmh,
+                        diff,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("TM speed adjust failed for '%s': %s", object_id, exc)
 
                 # 以後は自前 PID での制御をやめる
                 record.throttle_pid = None
