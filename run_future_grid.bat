@@ -38,7 +38,7 @@ set "STARTUP_DELAY=1"
 REM ==== CARLA server restart settings ====
 set "CARLA_ROOT=D:\Carla-0.10.0-Win64-Shipping"
 set "CARLA_EXE=%CARLA_ROOT%\CarlaUnreal.exe"
-set "CARLA_OPTS=-RenderOffScreen -nosound -ResX=800 -ResY=600"
+set "CARLA_BOOT_WAIT=10"
 set "CARLA_BOOT_TIMEOUT=120"
 
 set "CARLA_HOST=127.0.0.1"
@@ -170,11 +170,10 @@ echo Wrote: %SUMMARY%
 exit /b 0
 
 :restart_carla
-echo Restarting CARLA...
 call :stop_carla
-timeout /t 5 /nobreak >nul
-start "" /high "%CARLA_EXE%" %CARLA_OPTS%
-timeout /t 3 /nobreak >nul
+echo Starting CARLA: "%CARLA_EXE%"
+start "" /high "%CARLA_EXE%"
+timeout /t %CARLA_BOOT_WAIT% /nobreak >nul
 exit /b 0
 
 :stop_carla
