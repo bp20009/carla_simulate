@@ -194,15 +194,16 @@ set "T=%~3"
 if "%T%"=="" set "T=120"
 
 echo Waiting for CARLA to be ready... (timeout=%T%s host=%H% port=%P%)
-powershell -NoProfile -Command ^
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
-  "$h='%H%'; $p=%P%; $deadline=(Get-Date).AddSeconds(%T%);" ^
+  "$h='%H%'; $p=[int]%P%; $deadline=(Get-Date).AddSeconds([int]%T%);" ^
   "while((Get-Date) -lt $deadline) {" ^
-  "  & python -c `"import carla; c=carla.Client(r'$h',$p); c.set_timeout(2.0); w=c.get_world(); s=w.get_snapshot();`" 1>$null 2>$null;" ^
-  "  if ($LASTEXITCODE -eq 0) { Write-Host 'CARLA READY'; exit 0 }" ^
+  "  $py = ('import carla; c=carla.Client(r''{0}'',{1}); c.set_timeout(5.0); w=c.get_world(); w.get_snapshot()' -f $h,$p);" ^
+  "  & python -c $py > $null 2>&1;" ^
+  "  if ($LASTEXITCODE -eq 0) { Write-Host ''CARLA READY''; exit 0 }" ^
   "  Start-Sleep -Seconds 2" ^
   "}" ^
-  "Write-Host 'CARLA NOT READY (timeout)'; exit 1"
+  "Write-Host ''CARLA NOT READY (timeout)''; exit 1"
 if errorlevel 1 (
   endlocal & exit /b 1
 )
