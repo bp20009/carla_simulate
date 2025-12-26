@@ -33,7 +33,14 @@ set "LEAD_MIN=1"
 set "LEAD_MAX=10"
 set "REPS=10"
 set "BASE_SEED=20009"
-set "STARTUP_DELAY=1"
+set "STARTUP_DELAY=2"
+
+REM ==== CARLA server restart settings ====
+set "CARLA_ROOT=D:\Carla-0.10.0-Win64-Shipping"
+set "CARLA_EXE=%CARLA_ROOT%\CarlaUnreal.exe"
+set "CARLA_BOOT_WAIT=60"
+set "CARLA_BOOT_TIMEOUT=300"
+set "CARLA_WARMUP_SEC=90"
 
 set "CARLA_HOST=127.0.0.1"
 set "CARLA_PORT=2000"
@@ -73,10 +80,25 @@ for /f %%w in ('
 set "SUMMARY=%OUTDIR%\summary_grid.csv"
 echo method,lead_sec,rep,seed,switch_payload_frame,ran_ok,accident_after_switch,first_accident_payload_frame,status,accident_payload_frame_ref > "%SUMMARY%"
 
-for %%M in (autopilot lstm) do (
-  for /L %%L in (%LEAD_MIN%,1,%LEAD_MAX%) do (
-      for /f %%s in ('python "%META_TOOL%" switch_pf "%ACCIDENT_PF%" "%%L" "%FIXED_DELTA%"') do set "SWITCH_PF=%%s"
-      set /a "SWITCH_PF_EVAL=!SWITCH_PF!+BUFFER_PF_AFTER"
+for /L %%L in (%LEAD_MIN%,1,%LEAD_MAX%) do (
+
+  echo =========================================================
+  echo Restarting CARLA server for lead=%%L
+  echo =========================================================
+  call :restart_carla
+  call :wait_carla_ready %CARLA_HOST% %CARLA_PORT% %CARLA_BOOT_TIMEOUT%
+  if errorlevel 1 (
+    echo CARLA did not become ready. Abort lead=%%L
+    exit /b 1
+  )
+
+  echo Warmup wait %CARLA_WARMUP_SEC%s ...
+  timeout /t %CARLA_WARMUP_SEC% /nobreak >nul
+
+  for %%M in (autopilot lstm) do (
+
+    for /f %%s in ('python "%META_TOOL%" switch_pf "%ACCIDENT_PF%" "%%L" "%FIXED_DELTA%"') do set "SWITCH_PF=%%s"
+    set /a "SWITCH_PF_EVAL=!SWITCH_PF!+BUFFER_PF_AFTER"
 
     for /L %%R in (1,1,%REPS%) do (
       set /a "SEED=%BASE_SEED%+%%R"
@@ -142,10 +164,49 @@ for %%M in (autopilot lstm) do (
       echo %%M,%%L,%%R,!SEED!,!SWITCH_PF!,!RAN_OK!,!AFTER_SWITCH!,!FIRST_ACC_PF!,!STATUS!,%ACCIDENT_PF%>> "%SUMMARY%"
     )
   )
+
+  REM lead 終了ごとに明示的に落としておく（次 lead で restart するが念のため）
+  call :stop_carla
 )
 
 echo Wrote: %SUMMARY%
 exit /b 0
+
+:restart_carla
+call :stop_carla
+echo Starting CARLA: "%CARLA_EXE%"
+start "" /high "%CARLA_EXE%"
+timeout /t %CARLA_BOOT_WAIT% /nobreak >nul
+exit /b 0
+
+:stop_carla
+REM 既存 CARLA を確実に落とす（複数起動していてもまとめて落とす）
+taskkill /IM CarlaUnreal.exe /T /F >nul 2>&1
+timeout /t 5 /nobreak >nul
+exit /b 0
+
+:wait_carla_ready
+REM usage: call :wait_carla_ready <HOST> <PORT> <TIMEOUT_SEC>
+setlocal
+set "H=%~1"
+set "P=%~2"
+set "T=%~3"
+if "%T%"=="" set "T=120"
+
+echo Waiting for CARLA to be ready... (timeout=%T%s host=%H% port=%P%)
+powershell -NoProfile -Command ^
+  "$ErrorActionPreference='Stop';" ^
+  "$h='%H%'; $p=%P%; $deadline=(Get-Date).AddSeconds(%T%);" ^
+  "while((Get-Date) -lt $deadline) {" ^
+  "  & python -c ""import carla; c=carla.Client(r'$h',$p); c.set_timeout(2.0); w=c.get_world(); s=w.get_snapshot();"" 1>$null 2>$null;" ^
+  "  if ($LASTEXITCODE -eq 0) { Write-Host 'CARLA READY'; exit 0 }" ^
+  "  Start-Sleep -Seconds 2" ^
+  "}" ^
+  "Write-Host 'CARLA NOT READY (timeout)'; exit 1"
+if errorlevel 1 (
+  endlocal & exit /b 1
+)
+endlocal & exit /b 0
 
 :wait_for_pid
 setlocal
