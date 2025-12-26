@@ -42,6 +42,12 @@ set "CARLA_BOOT_WAIT=60"
 set "CARLA_BOOT_TIMEOUT=300"
 set "CARLA_WARMUP_SEC=90"
 
+REM ==== CARLA server restart settings ====
+set "CARLA_ROOT=D:\Carla-0.10.0-Win64-Shipping"
+set "CARLA_EXE=%CARLA_ROOT%\CarlaUnreal.exe"
+set "CARLA_BOOT_WAIT=10"
+set "CARLA_BOOT_TIMEOUT=120"
+
 set "CARLA_HOST=127.0.0.1"
 set "CARLA_PORT=2000"
 set "LISTEN_HOST=0.0.0.0"
