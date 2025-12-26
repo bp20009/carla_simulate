@@ -42,12 +42,6 @@ set "CARLA_BOOT_WAIT=60"
 set "CARLA_BOOT_TIMEOUT=300"
 set "CARLA_WARMUP_SEC=90"
 
-REM ==== CARLA server restart settings ====
-set "CARLA_ROOT=D:\Carla-0.10.0-Win64-Shipping"
-set "CARLA_EXE=%CARLA_ROOT%\CarlaUnreal.exe"
-set "CARLA_BOOT_WAIT=10"
-set "CARLA_BOOT_TIMEOUT=120"
-
 set "CARLA_HOST=127.0.0.1"
 set "CARLA_PORT=2000"
 set "LISTEN_HOST=0.0.0.0"
@@ -204,7 +198,7 @@ powershell -NoProfile -Command ^
   "$ErrorActionPreference='Stop';" ^
   "$h='%H%'; $p=%P%; $deadline=(Get-Date).AddSeconds(%T%);" ^
   "while((Get-Date) -lt $deadline) {" ^
-  "  & python -c ""import carla; c=carla.Client(r'$h',$p); c.set_timeout(2.0); w=c.get_world(); s=w.get_snapshot();"" 1>$null 2>$null;" ^
+  "  & python -c `"import carla; c=carla.Client(r'$h',$p); c.set_timeout(2.0); w=c.get_world(); s=w.get_snapshot();`" 1>$null 2>$null;" ^
   "  if ($LASTEXITCODE -eq 0) { Write-Host 'CARLA READY'; exit 0 }" ^
   "  Start-Sleep -Seconds 2" ^
   "}" ^
