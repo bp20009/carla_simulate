@@ -33,7 +33,14 @@ set "LEAD_MIN=1"
 set "LEAD_MAX=10"
 set "REPS=10"
 set "BASE_SEED=20009"
-set "STARTUP_DELAY=1"
+set "STARTUP_DELAY=2"
+
+REM ==== CARLA server restart settings ====
+set "CARLA_ROOT=D:\Carla-0.10.0-Win64-Shipping"
+set "CARLA_EXE=%CARLA_ROOT%\CarlaUnreal.exe"
+set "CARLA_BOOT_WAIT=60"
+set "CARLA_BOOT_TIMEOUT=300"
+set "CARLA_WARMUP_SEC=90"
 
 REM ==== CARLA server restart settings ====
 set "CARLA_ROOT=D:\Carla-0.10.0-Win64-Shipping"
@@ -85,14 +92,16 @@ for /L %%L in (%LEAD_MIN%,1,%LEAD_MAX%) do (
   echo Restarting CARLA server for lead=%%L
   echo =========================================================
   call :restart_carla
+  call :wait_carla_ready %CARLA_HOST% %CARLA_PORT% %CARLA_BOOT_TIMEOUT%
+  if errorlevel 1 (
+    echo CARLA did not become ready. Abort lead=%%L
+    exit /b 1
+  )
+
+  echo Warmup wait %CARLA_WARMUP_SEC%s ...
+  timeout /t %CARLA_WARMUP_SEC% /nobreak >nul
 
   for %%M in (autopilot lstm) do (
-
-    call :wait_carla_ready %CARLA_HOST% %CARLA_PORT% %CARLA_BOOT_TIMEOUT%
-    if errorlevel 1 (
-      echo CARLA did not become ready. Abort lead=%%L method=%%M
-      exit /b 1
-    )
 
     for /f %%s in ('python "%META_TOOL%" switch_pf "%ACCIDENT_PF%" "%%L" "%FIXED_DELTA%"') do set "SWITCH_PF=%%s"
     set /a "SWITCH_PF_EVAL=!SWITCH_PF!+BUFFER_PF_AFTER"
@@ -179,7 +188,7 @@ exit /b 0
 :stop_carla
 REM 既存 CARLA を確実に落とす（複数起動していてもまとめて落とす）
 taskkill /IM CarlaUnreal.exe /T /F >nul 2>&1
-timeout /t 3 /nobreak >nul
+timeout /t 5 /nobreak >nul
 exit /b 0
 
 :wait_carla_ready
@@ -192,14 +201,12 @@ if "%T%"=="" set "T=120"
 
 echo Waiting for CARLA to be ready... (timeout=%T%s host=%H% port=%P%)
 powershell -NoProfile -Command ^
+  "$ErrorActionPreference='Stop';" ^
   "$h='%H%'; $p=%P%; $deadline=(Get-Date).AddSeconds(%T%);" ^
   "while((Get-Date) -lt $deadline) {" ^
-  "  try {" ^
-  "    python -c \"import carla; c=carla.Client(r'$h',$p); c.set_timeout(2.0); w=c.get_world(); s=w.get_snapshot(); print('READY', s.frame);\" | Out-Null;" ^
-  "    Write-Host 'CARLA READY'; exit 0;" ^
-  "  } catch {" ^
-  "    Start-Sleep -Seconds 2;" ^
-  "  }" ^
+  "  & python -c ""import carla; c=carla.Client(r'$h',$p); c.set_timeout(2.0); w=c.get_world(); s=w.get_snapshot();"" 1>$null 2>$null;" ^
+  "  if ($LASTEXITCODE -eq 0) { Write-Host 'CARLA READY'; exit 0 }" ^
+  "  Start-Sleep -Seconds 2" ^
   "}" ^
   "Write-Host 'CARLA NOT READY (timeout)'; exit 1"
 if errorlevel 1 (
