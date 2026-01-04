@@ -321,8 +321,13 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.paper:
-        mpl.rcParams["font.family"] = "Times New Roman"
-
+        mpl.rcParams["font.family"] = [
+            "BIZ UDP Gothic",
+            "BIZ UDPゴシック",
+            "IPAexGothic",
+            "MS Gothic",
+            "sans-serif",
+        ]
     csv_paths = list(args.csv)
 
     if args.csv_dir:
