@@ -18,7 +18,6 @@ set "SENDER=%ROOT%send_data\send_udp_frames_from_csv.py"
 set "RECEIVER=%ROOT%scripts\udp_replay\replay_from_udp.py"
 set "STREAMER=%ROOT%scripts\vehicle_state_stream.py"
 
-REM python launcher
 set "PYTHON_EXE=python"
 where "%PYTHON_EXE%" >nul 2>&1
 if errorlevel 1 (
@@ -26,7 +25,7 @@ if errorlevel 1 (
   goto :cleanup
 )
 
-REM Receiver fixed delta (do not sweep)
+REM Receiver params
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
@@ -44,13 +43,14 @@ set "TS_LIST=0.10 1.00"
 set "COOLDOWN_SEC=5"
 
 REM ==========================================================
-REM OUTDIR (robust timestamp)
+REM OUTDIR
 REM ==========================================================
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss_fff"') do set "DT_TAG=%%i"
 set "OUTDIR=%ROOT%sweep_results_%DT_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_LOG=%OUTDIR%\receiver.log"
+set "RECEIVER_START_ERR=%OUTDIR%\start_receiver.err"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
@@ -64,16 +64,16 @@ if not exist "%CSV_PATH%" (
 )
 
 REM ==========================================================
-REM Free UDP port if occupied (Win11 24H2 safe, no wmic)
+REM Free UDP port if occupied (no wmic)
 REM ==========================================================
 echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$p=%UDP_PORT%; $eps=Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue; " ^
   "if($eps){ $pids=$eps | Select-Object -Expand OwningProcess -Unique; " ^
-  "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" >nul
+  "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" >nul 2>nul
 
 REM ==========================================================
-REM Kill previous receiver by PID file if exists (best-effort)
+REM Kill previous receiver by PID file (best-effort)
 REM ==========================================================
 if exist "%RECEIVER_PID_FILE%" (
   set "OLD_RPID="
@@ -86,26 +86,42 @@ if exist "%RECEIVER_PID_FILE%" (
 )
 
 REM ==========================================================
-REM Start RECEIVER once (PID from Start-Process)
+REM Start RECEIVER once (PID returned as digits only)
 REM ==========================================================
 echo [INFO] Starting receiver...
-set "RECEIVER_PID="
 
-for /f "tokens=2 delims==" %%P in ('
+del /q "%RECEIVER_START_ERR%" >nul 2>&1
+
+set "RECEIVER_PID="
+for /f %%P in ('
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue';" ^
     "$py='%PYTHON_EXE%';" ^
     "$args=@('%RECEIVER%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%UDP_PORT%','--fixed-delta','%FIXED_DELTA%','--stale-timeout','%STALE_TIMEOUT%','--measure-update-times','--timing-output','%RECEIVER_TIMING_CSV%','--eval-output','%RECEIVER_EVAL_CSV%');" ^
-    "$p=Start-Process -PassThru -NoNewWindow -FilePath $py -ArgumentList $args -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%';" ^
-    "Start-Sleep -Milliseconds 300;" ^
-    "if($p.HasExited){ Write-Output ('PID='); exit 0 } else { Write-Output ('PID=' + $p.Id) }"
+    "try{" ^
+    "  $p=Start-Process -PassThru -NoNewWindow -FilePath $py -ArgumentList $args -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%';" ^
+    "  Start-Sleep -Milliseconds 300;" ^
+    "  if($p.HasExited){ exit 2 }" ^
+    "  Write-Output $p.Id" ^
+    "}catch{ $_ | Out-String | Write-Error; exit 3 }"
 ') do set "RECEIVER_PID=%%P"
 
-REM sanitize PID (digits only)
-for /f "delims=0123456789" %%X in ("%RECEIVER_PID%") do set "RECEIVER_PID="
+if errorlevel 1 (
+  echo [ERROR] PowerShell failed to start receiver.
+  echo [ERROR] See: %RECEIVER_START_ERR%
+)
+
+REM もし PowerShell 側で例外が出ているなら stderr を保存して見せる
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "if($Error.Count -gt 0){ exit 1 } else { exit 0 }" >nul 2>nul
+
+REM 上の for /f の stderr は取り込めないので，別途 start_receiver.err にも落とす版が必要なら下の1行に置換して使う:
+REM (環境によってはこの行の方が確実)
+REM for /f %%P in ('powershell ... 2^> "%RECEIVER_START_ERR%"') do ...
 
 if not defined RECEIVER_PID (
-  echo [ERROR] Failed to start receiver. Check log:
+  echo [ERROR] Failed to start receiver (PID empty).
+  echo [ERROR] receiver.log:
   if exist "%RECEIVER_LOG%" type "%RECEIVER_LOG%"
   goto :cleanup
 )
@@ -116,12 +132,11 @@ echo [INFO] receiver PID=%RECEIVER_PID%
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup: send short segment and watch receiver.log for "(>=1 actor updates)"
+REM Warmup: watch receiver.log for "(>=1 actor updates)"
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
 
-  REM record receiver.log byte offset
   set "LOG_OFFSET=0"
   if exist "%RECEIVER_LOG%" (
     for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_LOG%'').Length"') do set "LOG_OFFSET=%%S"
@@ -159,42 +174,43 @@ for /L %%N in (10,10,100) do (
     set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
     set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
     set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
-    set "STREAMER_LOG=!RUNDIR!\streamer_!TAGLOG"
-
+    set "STREAMER_LOG=!RUNDIR!\streamer_!TAG!.log"
+    set "STREAMER_START_ERR=!RUNDIR!\start_streamer.err"
 
     echo ============================================================
     echo [RUN] !TAG!
     echo [DIR] !RUNDIR!
 
-    REM --- start STREAMER (PID from Start-Process) ---
+    del /q "!STREAMER_START_ERR!" >nul 2>&1
+
     set "STREAMER_PID="
-    for /f "tokens=2 delims==" %%P in ('
+    for /f %%P in ('
       powershell -NoProfile -ExecutionPolicy Bypass -Command ^
         "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue';" ^
         "$py='%PYTHON_EXE%';" ^
         "$args=@('%STREAMER%','--host','%CARLA_HOST%','--port','%CARLA_PORT%','--mode','wait','--role-prefix','udp_replay:','--include-velocity','--frame-elapsed','--wall-clock','--include-object-id','--include-monotonic','--include-tick-wall-dt','--output','!STREAM_CSV!','--timing-output','!STREAM_TIMING_CSV!','--timing-flush-every','10');" ^
-        "$p=Start-Process -PassThru -NoNewWindow -FilePath $py -ArgumentList $args -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!';" ^
-        "Start-Sleep -Milliseconds 200;" ^
-        "if($p.HasExited){ Write-Output ('PID='); exit 0 } else { Write-Output ('PID=' + $p.Id) }"
+        "try{" ^
+        "  $p=Start-Process -PassThru -NoNewWindow -FilePath $py -ArgumentList $args -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG%';" ^
+        "  Start-Sleep -Milliseconds 200;" ^
+        "  if($p.HasExited){ exit 2 }" ^
+        "  Write-Output $p.Id" ^
+        "}catch{ $_ | Out-String | Write-Error; exit 3 }"
     ') do set "STREAMER_PID=%%P"
 
-    for /f "delims=0123456789" %%X in ("!STREAMER_PID!") do set "STREAMER_PID="
     if not defined STREAMER_PID (
-      echo [ERROR] Failed to start streamer. Log:
+      echo [ERROR] Failed to start streamer (PID empty).
       if exist "!STREAMER_LOG!" type "!STREAMER_LOG!"
       goto :cleanup
     )
 
     timeout /t 1 /nobreak >nul
 
-    REM --- sender (blocking) ---
     set "FRAME_STRIDE=1"
     if "%%T"=="1.00" set "FRAME_STRIDE=10"
 
     echo [INFO] Sending... N=%%N Ts=%%T stride=!FRAME_STRIDE!
     "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %%T --frame-stride !FRAME_STRIDE! --max-actors %%N > "!SENDER_LOG!" 2>&1
 
-    REM --- stop streamer ---
     taskkill /PID !STREAMER_PID! /T /F >nul 2>&1
 
     timeout /t %COOLDOWN_SEC% /nobreak >nul
@@ -202,9 +218,6 @@ for /L %%N in (10,10,100) do (
   )
 )
 
-REM ==========================================================
-REM Stop RECEIVER
-REM ==========================================================
 echo [INFO] Stopping receiver...
 taskkill /PID %RECEIVER_PID% /T /F >nul 2>&1
 
