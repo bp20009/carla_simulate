@@ -27,6 +27,9 @@ set "WARMUP_START_FRAME=0"
 set "WARMUP_END_FRAME=1800"
 set "WARMUP_INTERVAL=0.1"
 set "WARMUP_WAIT_SEC=10"
+set "WARMUP_CHECK_TIMEOUT_SEC=180"
+set "WARMUP_CHECK_INTERVAL_SEC=5"
+set "WARMUP_MAX_ATTEMPTS=3"
 
 REM Cooldown to allow stale actor cleanup (seconds)
 set "STALE_TIMEOUT=2.0"
@@ -78,13 +81,29 @@ REM Give receiver time to boot
 REM ==========================================================
 REM Warmup: send a short segment to trigger initialization
 REM ==========================================================
-echo [INFO] Warmup frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
-python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
+REM Warmup attempts until receiver logs a spawn
+for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
+  echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
+  echo [INFO] Warmup frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
+  python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
 
-REM Optional wait for heavy initialization
-if %WARMUP_WAIT_SEC% GTR 0 (
-  timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
+  REM Optional wait for heavy initialization
+  if %WARMUP_WAIT_SEC% GTR 0 (
+    timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
+  )
+
+  call :wait_for_spawn "%RECEIVER_LOG%" %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
+  if !errorlevel! EQU 0 (
+    echo [INFO] Warmup succeeded (spawn detected).
+    goto :warmup_done
+  )
+  echo [WARN] No spawn detected after warmup attempt %%A. Retrying...
 )
+
+echo [ERROR] Warmup failed to detect spawn after %WARMUP_MAX_ATTEMPTS% attempts.
+goto :cleanup
+
+:warmup_done
 
 REM ==========================================================
 REM Sweep runs (restart only streamer + sender)
@@ -155,3 +174,22 @@ for /f %%P in ('type "%RECEIVER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&
 
 echo [ALL DONE] %OUTDIR%
 endlocal
+exit /b 0
+
+:cleanup
+for /f %%P in ('type "%RECEIVER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&1
+endlocal
+exit /b 1
+
+:wait_for_spawn
+set "LOG_FILE=%~1"
+set "TIMEOUT_SEC=%~2"
+set "INTERVAL_SEC=%~3"
+set /a "ELAPSED=0"
+:wait_loop
+findstr /C:"Spawned " "%LOG_FILE%" >nul 2>&1
+if !errorlevel! EQU 0 exit /b 0
+if !ELAPSED! GEQ %TIMEOUT_SEC% exit /b 1
+timeout /t %INTERVAL_SEC% /nobreak >nul
+set /a "ELAPSED+=%INTERVAL_SEC%"
+goto :wait_loop
