@@ -30,20 +30,24 @@ if not exist "%CSV_PATH%" (
   goto :cleanup
 )
 
+REM ==========================================================
 REM Receiver params
+REM ==========================================================
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
-REM Warmup
-set "WARMUP_START_FRAME=0"
-set "WARMUP_END_FRAME=1800"
+REM ==========================================================
+REM Warmup settings
+REM   sender is ALWAYS "from start, send all", but warmup stops early
+REM ==========================================================
 set "WARMUP_INTERVAL=0.1"
-set "WARMUP_WAIT_SEC=10"
-set "WARMUP_CHECK_TIMEOUT_SEC=180"
-set "WARMUP_CHECK_INTERVAL_SEC=5"
 set "WARMUP_MAX_ATTEMPTS=3"
+set "WARMUP_CHECK_TIMEOUT_SEC=180"
+set "WARMUP_CHECK_INTERVAL_SEC=2"
 
-REM Sweep
+REM ==========================================================
+REM Sweep settings
+REM ==========================================================
 set "TS_LIST=0.10 1.00"
 set "COOLDOWN_SEC=5"
 
@@ -55,15 +59,15 @@ set "OUTDIR=%ROOT%sweep_results_%DT_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_LOG=%OUTDIR%\receiver.log"
-set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
+set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
 
 echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
 
 REM ==========================================================
-REM Pre-clean (kill stale processes + free UDP port)
+REM Pre-clean (kill stale receiver/streamer + free UDP port)
 REM ==========================================================
 echo [INFO] Cleaning stale python processes (receiver/streamer)...
 call :kill_python_by_cmd "replay_from_udp.py"
@@ -71,12 +75,14 @@ call :kill_python_by_cmd "vehicle_state_stream.py"
 
 echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p=%UDP_PORT%; $eps=Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue; " ^
+  "$p=%UDP_PORT%; " ^
+  "$eps=Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue; " ^
   "if($eps){ $pids=$eps | Select-Object -Expand OwningProcess -Unique; " ^
-  "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" >nul 2>nul
+  "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" ^
+  >nul 2>nul
 
 REM ==========================================================
-REM Start receiver via PowerShell (no start /b), capture PID
+REM Start RECEIVER (background), capture PID
 REM ==========================================================
 echo [INFO] Starting receiver...
 del /q "%RECEIVER_LOG%" >nul 2>&1
@@ -100,7 +106,7 @@ for /f %%P in ('
     "$p=Start-Process -PassThru -NoNewWindow -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%';" ^
     "Start-Sleep -Milliseconds 300;" ^
     "if($p.HasExited){ exit 2 };" ^
-    "$p.Id"
+    "Write-Output $p.Id"
 ') do set "RECEIVER_PID=%%P"
 
 if not defined RECEIVER_PID (
@@ -112,10 +118,12 @@ if not defined RECEIVER_PID (
 echo %RECEIVER_PID% > "%RECEIVER_PID_FILE%"
 echo [INFO] receiver PID=%RECEIVER_PID%
 
-timeout /t 2 /nobreak >nul
+timeout /t 1 /nobreak >nul
 
 REM ==========================================================
-REM Warmup: send short segment and confirm "(>=1 actor updates)" in receiver.log
+REM Warmup
+REM   sender: ALWAYS from start, send all
+REM   but we stop sender early when receiver reports "(>=1 actor updates)"
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
@@ -125,20 +133,44 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
     for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_LOG%'').Length"') do set "LOG_OFFSET=%%S"
   )
 
-  "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
-    --host "%UDP_HOST%" --port "%UDP_PORT%" ^
-    --interval %WARMUP_INTERVAL% ^
-    --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% ^
-    > "%OUTDIR%\warmup_sender.log" 2>&1
+  set "WARMUP_SENDER_LOG=%OUTDIR%\warmup_sender_%%A.log"
+  del /q "!WARMUP_SENDER_LOG!" >nul 2>&1
+  set "WARMUP_SENDER_PID="
 
-  if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
+  REM start sender in background (from start, send all)
+  for /f %%P in ('
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$ErrorActionPreference='Stop';" ^
+      "$args=@(" ^
+        "'%SENDER%'," ^
+        "'%CSV_PATH%'," ^
+        "'--host','%UDP_HOST%'," ^
+        "'--port','%UDP_PORT%'," ^
+        "'--interval','%WARMUP_INTERVAL%'" ^
+      ");" ^
+      "$p=Start-Process -PassThru -NoNewWindow -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!WARMUP_SENDER_LOG!' -RedirectStandardError '!WARMUP_SENDER_LOG!';" ^
+      "Start-Sleep -Milliseconds 200;" ^
+      "Write-Output $p.Id"
+  ') do set "WARMUP_SENDER_PID=%%P"
 
+  if not defined WARMUP_SENDER_PID (
+    echo [ERROR] Warmup sender failed to start. log:
+    if exist "!WARMUP_SENDER_LOG!" type "!WARMUP_SENDER_LOG!"
+    goto :cleanup
+  )
+
+  REM wait receiver log update
   call :wait_actor_updates_in_log "%RECEIVER_LOG%" !LOG_OFFSET! %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
   if !errorlevel! EQU 0 (
-    echo [INFO] Warmup succeeded.
+    echo [INFO] Warmup succeeded. Killing warmup sender PID=!WARMUP_SENDER_PID!
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "try{ Stop-Process -Id !WARMUP_SENDER_PID! -Force -ErrorAction SilentlyContinue }catch{}" >nul 2>nul
     goto :warmup_done
   )
-  echo [WARN] Warmup not confirmed. retry...
+
+  echo [WARN] Warmup not confirmed. Killing warmup sender and retry...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "try{ Stop-Process -Id !WARMUP_SENDER_PID! -Force -ErrorAction SilentlyContinue }catch{}" >nul 2>nul
 )
 
 echo [ERROR] Warmup failed.
@@ -147,7 +179,10 @@ goto :cleanup
 :warmup_done
 
 REM ==========================================================
-REM Sweep runs (restart streamer + sender; receiver stays)
+REM Sweep runs
+REM   receiver stays alive
+REM   streamer restarts each run
+REM   sender ALWAYS from start, send all (no frame range). we only vary interval/stride/max-actors
 REM ==========================================================
 for /L %%N in (10,10,100) do (
   for %%T in (%TS_LIST%) do (
@@ -189,11 +224,11 @@ for /L %%N in (10,10,100) do (
         "$p=Start-Process -PassThru -NoNewWindow -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!';" ^
         "Start-Sleep -Milliseconds 200;" ^
         "if($p.HasExited){ exit 2 };" ^
-        "$p.Id"
+        "Write-Output $p.Id"
     ') do set "STREAMER_PID=%%P"
 
     if not defined STREAMER_PID (
-      echo [ERROR] Failed to start streamer (PID empty).
+      echo [ERROR] Failed to start streamer.
       if exist "!STREAMER_LOG!" type "!STREAMER_LOG!"
       goto :cleanup
     )
@@ -209,9 +244,16 @@ for /L %%N in (10,10,100) do (
       --interval %%T --frame-stride !FRAME_STRIDE! --max-actors %%N ^
       > "!SENDER_LOG!" 2>&1
 
-    taskkill /PID !STREAMER_PID! /T /F >nul 2>&1
+    REM if sender sent 0 frames, stop early with logs
+    findstr /i /c:"Sent 0 frames" "!SENDER_LOG!" >nul && (
+      echo [ERROR] Sender sent 0 frames. Check CSV format/columns and sender filters.
+      echo [ERROR] See: !SENDER_LOG!
+      goto :cleanup
+    )
 
+    taskkill /PID !STREAMER_PID! /T /F >nul 2>&1
     timeout /t %COOLDOWN_SEC% /nobreak >nul
+
     echo [DONE] !TAG!
   )
 )
@@ -243,8 +285,9 @@ setlocal EnableExtensions
 set "SUB=%~1"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$sub='%SUB%';" ^
-  "$procs=Get-CimInstance Win32_Process -Filter ""Name='python.exe'"" | Where-Object { $_.CommandLine -like ('*' + $sub + '*') };" ^
-  "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
+  "$procs=Get-CimInstance Win32_Process -Filter ""Name='python.exe'"" | Where-Object { $_.CommandLine -and ($_.CommandLine -like ('*' + $sub + '*')) };" ^
+  "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" ^
+  >nul 2>nul
 endlocal & exit /b 0
 
 :wait_actor_updates_in_log
@@ -256,7 +299,7 @@ set "TMO=%~3"
 set "INT=%~4"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$path='%LOG%'; $off=[int64]%OFF%; $timeout=%TMO%; $interval=%INT%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
+  "$path='%LOG%'; $off=[int64]%OFF%; $timeout=[int]%TMO%; $interval=[int]%INT%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
   "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
   "  if(Test-Path $path){" ^
   "    $len=(Get-Item $path).Length;" ^
