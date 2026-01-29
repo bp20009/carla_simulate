@@ -72,23 +72,22 @@ set "TS_LIST=0.10 1.00"
 REM ==========================================================
 REM Start RECEIVER once (keep alive)
 REM ==========================================================
-REM --- Kill previous receiver if still running ---
-call :pid_kill_from_file "%RECEIVER_PID_FILE%"
+REM --- Kill previous receiver if PID file exists ---
+call :kill_by_pidfile "%RECEIVER_PID_FILE%"
 timeout /t 1 /nobreak >nul
 echo [INFO] Starting receiver...
-call :ps_spawn RECEIVER_PID "%PYTHON_EXE%" "%RECEIVER_LOG_OUT%" "%RECEIVER_LOG_ERR%" "%RECEIVER%" ^
-  --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" ^
-  --listen-host "%LISTEN_HOST%" --listen-port "%UDP_PORT%" ^
-  --fixed-delta "%FIXED_DELTA%" --stale-timeout "%STALE_TIMEOUT%" ^
-  --measure-update-times ^
-  --timing-output "%RECEIVER_TIMING_CSV%" ^
-  --eval-output "%RECEIVER_EVAL_CSV%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$args=@('%RECEIVER%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%UDP_PORT%','--fixed-delta','%FIXED_DELTA%','--stale-timeout','%STALE_TIMEOUT%','--measure-update-times','--timing-output','%RECEIVER_TIMING_CSV%','--eval-output','%RECEIVER_EVAL_CSV%');" ^
+  "$p=Start-Process -PassThru -WindowStyle Hidden -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_LOG_OUT%' -RedirectStandardError '%RECEIVER_LOG_ERR%';" ^
+  "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'" ^
+  >nul
+set "RECEIVER_PID="
+set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
 if not defined RECEIVER_PID (
-  echo [ERROR] Failed to start receiver (PID empty).
+  echo [ERROR] Failed to start receiver. Check logs:
   if exist "%RECEIVER_LOG_ERR%" type "%RECEIVER_LOG_ERR%"
   goto :cleanup
 )
-echo %RECEIVER_PID% > "%RECEIVER_PID_FILE%"
 echo [INFO] receiver PID=%RECEIVER_PID%
 
 REM Give receiver time to boot
@@ -141,22 +140,22 @@ for /L %%N in (10,10,100) do (
     set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
     set "STREAMER_LOG_OUT=!RUNDIR!\streamer_stdout.log"
     set "STREAMER_LOG_ERR=!RUNDIR!\streamer_stderr.log"
+    set "STREAMER_PID_FILE=!RUNDIR!\streamer_pid.txt"
 
     echo ============================================================
     echo [RUN] !TAG!
     echo [DIR] !RUNDIR!
 
     REM 1) Start STREAMER bg
-    call :ps_spawn STREAMER_PID "%PYTHON_EXE%" "!STREAMER_LOG_OUT!" "!STREAMER_LOG_ERR!" "%STREAMER%" ^
-      --host "%CARLA_HOST%" --port "%CARLA_PORT%" ^
-      --mode wait --role-prefix udp_replay: ^
-      --include-velocity --frame-elapsed --wall-clock ^
-      --include-object-id --include-monotonic --include-tick-wall-dt ^
-      --output "!STREAM_CSV!" ^
-      --timing-output "!STREAM_TIMING_CSV!" ^
-      --timing-flush-every 10
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$args=@('%STREAMER%','--host','%CARLA_HOST%','--port','%CARLA_PORT%','--mode','wait','--role-prefix','udp_replay:','--include-velocity','--frame-elapsed','--wall-clock','--include-object-id','--include-monotonic','--include-tick-wall-dt','--output','!STREAM_CSV!','--timing-output','!STREAM_TIMING_CSV!','--timing-flush-every','10');" ^
+      "$p=Start-Process -PassThru -WindowStyle Hidden -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_LOG_OUT!' -RedirectStandardError '!STREAMER_LOG_ERR!';" ^
+      "$p.Id | Out-File -Encoding ascii '!STREAMER_PID_FILE!'" ^
+      >nul
+    set "STREAMER_PID="
+    set /p STREAMER_PID=<"!STREAMER_PID_FILE!"
     if not defined STREAMER_PID (
-      echo [ERROR] Failed to start streamer (PID empty).
+      echo [ERROR] Failed to start streamer. Check logs:
       if exist "!STREAMER_LOG_ERR!" type "!STREAMER_LOG_ERR!"
       goto :cleanup
     )
@@ -181,7 +180,7 @@ for /L %%N in (10,10,100) do (
 REM ==========================================================
 REM Stop RECEIVER
 REM ==========================================================
-call :pid_kill_from_file "%RECEIVER_PID_FILE%"
+call :kill_by_pidfile "%RECEIVER_PID_FILE%"
 
 echo [ALL DONE] %OUTDIR%
 popd
@@ -190,7 +189,7 @@ exit /b 0
 
 :cleanup
 echo [CLEANUP]
-call :pid_kill_from_file "%RECEIVER_PID_FILE%"
+call :kill_by_pidfile "%RECEIVER_PID_FILE%"
 popd
 endlocal
 exit /b 1
@@ -200,35 +199,14 @@ REM ==========================================================
 REM Subroutines
 REM ==========================================================
 
-:ps_spawn
-REM usage:
-REM   call :ps_spawn OUTPID PYEXE LOG_OUT LOG_ERR SCRIPT [args...]
-setlocal EnableExtensions DisableDelayedExpansion
-set "OUTVAR=%~1"
-set "PYEXE=%~2"
-set "LOGOUT=%~3"
-set "LOGERR=%~4"
-set "SCRIPT=%~5"
-shift & shift & shift & shift & shift
-
+:kill_by_pidfile
+setlocal
+set "F=%~1"
+if not exist "%F%" ( endlocal & exit /b 0 )
 set "PID="
-
-for /f %%P in ('
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "& { param($py,$logout,$logerr,$script) $alist=@($args); $p=Start-Process -PassThru -WindowStyle Hidden -FilePath $py -ArgumentList (@($script)+$alist) -RedirectStandardOutput $logout -RedirectStandardError $logerr; $p.Id }" ^
-    "%PYEXE%" "%LOGOUT%" "%LOGERR%" "%SCRIPT%" %*
-') do set "PID=%%P"
-
-endlocal & set "%OUTVAR%=%PID%" & exit /b 0
-
-:pid_kill_from_file
-REM usage: call :pid_kill_from_file PIDFILE
-setlocal EnableExtensions DisableDelayedExpansion
-set "PIDFILE=%~1"
-if not exist "%PIDFILE%" ( endlocal & exit /b 0 )
-set /p PID=<"%PIDFILE%"
-if not defined PID ( endlocal & exit /b 0 )
-taskkill /PID %PID% /T /F >nul 2>&1
+set /p PID=<"%F%"
+if defined PID taskkill /PID %PID% /T /F >nul 2>&1
+del /q "%F%" >nul 2>&1
 endlocal & exit /b 0
 
 :count_lines
