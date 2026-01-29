@@ -93,7 +93,15 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
     timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
   )
 
-  call :wait_for_spawn "%RECEIVER_LOG%" %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$log='%RECEIVER_LOG%';" ^
+    + "$timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%;" ^
+    + "$sw=[Diagnostics.Stopwatch]::StartNew();" ^
+    + "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
+    + "if(Select-String -Path $log -Pattern 'Spawned ' -Quiet){ exit 0 };" ^
+    + "Start-Sleep -Seconds $interval" ^
+    + "}; exit 1" ^
+    >nul
   if !errorlevel! EQU 0 (
     echo [INFO] Warmup succeeded (spawn detected).
     goto :warmup_done
@@ -181,16 +189,3 @@ exit /b 0
 for /f %%P in ('type "%RECEIVER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&1
 endlocal
 exit /b 1
-
-:wait_for_spawn
-set "LOG_FILE=%~1"
-set "TIMEOUT_SEC=%~2"
-set "INTERVAL_SEC=%~3"
-set /a "ELAPSED=0"
-:wait_loop
-findstr /C:"Spawned " "%LOG_FILE%" >nul 2>&1
-if !errorlevel! EQU 0 exit /b 0
-if !ELAPSED! GEQ %TIMEOUT_SEC% exit /b 1
-timeout /t %INTERVAL_SEC% /nobreak >nul
-set /a "ELAPSED+=%INTERVAL_SEC%"
-goto :wait_loop
