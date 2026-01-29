@@ -112,26 +112,13 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
 
   if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
 
-  REM poll until timeout: look for newly appended lines that begin with ,,,,,
-  set /a ELAPSED=0
-  set "WARMUP_OK=0"
-
-  :warmup_poll
-  if !ELAPSED! GEQ %WARMUP_CHECK_TIMEOUT_SEC% goto :warmup_poll_done
-
-  if exist "%RECEIVER_TIMING_CSV%" (
-    call :check_appended_actor_lines "%RECEIVER_TIMING_CSV%" !TIMING_OFFSET_LINES! WARMUP_OK
-    if "!WARMUP_OK!"=="1" (
-      echo [INFO] Warmup succeeded (actor update line detected in timing CSV).
-      goto :warmup_done
-    )
+  REM wait until timing CSV has appended actor update line
+  call :wait_for_actor_update "%RECEIVER_TIMING_CSV%" !TIMING_OFFSET_LINES! %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
+  if !errorlevel! EQU 0 (
+    echo [INFO] Warmup succeeded (actor update line detected in timing CSV).
+    goto :warmup_done
   )
 
-  timeout /t %WARMUP_CHECK_INTERVAL_SEC% /nobreak >nul
-  set /a ELAPSED+=%WARMUP_CHECK_INTERVAL_SEC%
-  goto :warmup_poll
-
-  :warmup_poll_done
   echo [WARN] Warmup not confirmed (no actor update detected). Retrying...
 )
 
@@ -254,3 +241,28 @@ for /f "usebackq skip=%SKIP% delims=" %%L in ("%FILE%") do (
 )
 :app_done
 exit /b 0
+
+:wait_for_actor_update
+REM %1 file, %2 offsetLines, %3 timeoutSec, %4 intervalSec
+setlocal EnableDelayedExpansion
+set "FILE=%~1"
+set "OFFSET=%~2"
+set "TIMEOUT=%~3"
+set "INTERVAL=%~4"
+
+set /a "ELAPSED=0"
+:wait_loop
+if !ELAPSED! GEQ !TIMEOUT! (
+  endlocal & exit /b 1
+)
+
+if exist "!FILE!" (
+  call :check_appended_actor_lines "!FILE!" !OFFSET! FOUND
+  if "!FOUND!"=="1" (
+    endlocal & exit /b 0
+  )
+)
+
+timeout /t !INTERVAL! /nobreak >nul
+set /a "ELAPSED+=INTERVAL"
+goto :wait_loop
