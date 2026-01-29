@@ -73,10 +73,9 @@ REM Start RECEIVER once (keep alive)
 REM ==========================================================
 REM --- Kill previous receiver if still running ---
 call :find_pid_by_script "replay_from_udp.py" OLD_RECEIVER_PID
-if defined OLD_RECEIVER_PID (
-  echo [WARN] Found existing receiver PID=!OLD_RECEIVER_PID! . Killing it...
-  taskkill /PID !OLD_RECEIVER_PID! /T /F >nul 2>&1
-  timeout /t 1 /nobreak >nul
+if exist "%RECEIVER_PID_FILE%" (
+  set /p RP=<"%RECEIVER_PID_FILE%"
+  taskkill /PID %RP% /T /F >nul 2>&1
 )
 echo [INFO] Starting receiver...
 call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" "%RECEIVER%" "--carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output %RECEIVER_TIMING_CSV% --eval-output %RECEIVER_EVAL_CSV%"
@@ -215,8 +214,7 @@ set "TMP=%OUTDIR%\__bg_%RANDOM%_%RANDOM%.cmd"
 )
 
 REM run temp cmd in background
-start "" /b "%ComSpec%" /c call "%TMP%"
-
+start "" /b "%ComSpec%" /d /q /c ""%TMP%""
 endlocal & exit /b 0
 
 :find_pid_by_script
