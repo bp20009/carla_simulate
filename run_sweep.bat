@@ -76,7 +76,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   >nul
 
 REM Give receiver time to boot
- timeout /t 2 /nobreak >nul
+timeout /t 2 /nobreak >nul
 
 REM ==========================================================
 REM Warmup: send a short segment to trigger initialization
@@ -84,6 +84,7 @@ REM ==========================================================
 REM Warmup attempts until receiver logs a spawn
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
+  type nul > "%RECEIVER_LOG%"
   echo [INFO] Warmup frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
   python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
 
