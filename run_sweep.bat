@@ -55,7 +55,8 @@ set "TM_TAG=%TM_TAG:.=%"
 set "OUTDIR=%ROOT%sweep_results_%DT_TAG%_%TM_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
-set "RECEIVER_LOG=%OUTDIR%\receiver.log"
+set "RECEIVER_LOG_OUT=%OUTDIR%\receiver_stdout.log"
+set "RECEIVER_LOG_ERR=%OUTDIR%\receiver_stderr.log"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
@@ -72,19 +73,19 @@ REM ==========================================================
 REM Start RECEIVER once (keep alive)
 REM ==========================================================
 REM --- Kill previous receiver if still running ---
-call :find_pid_by_script "replay_from_udp.py" OLD_RECEIVER_PID
-if exist "%RECEIVER_PID_FILE%" (
-  set /p RP=<"%RECEIVER_PID_FILE%"
-  taskkill /PID %RP% /T /F >nul 2>&1
-)
+call :pid_kill_from_file "%RECEIVER_PID_FILE%"
+timeout /t 1 /nobreak >nul
 echo [INFO] Starting receiver...
-call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" "%RECEIVER%" "--carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output %RECEIVER_TIMING_CSV% --eval-output %RECEIVER_EVAL_CSV%"
-
-REM PIDを特定して保存（コマンドラインに replay_from_udp.py が含まれる python を拾う）
-call :find_pid_by_script "replay_from_udp.py" RECEIVER_PID
+call :ps_spawn RECEIVER_PID "%PYTHON_EXE%" "%RECEIVER_LOG_OUT%" "%RECEIVER_LOG_ERR%" "%RECEIVER%" ^
+  --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" ^
+  --listen-host "%LISTEN_HOST%" --listen-port "%UDP_PORT%" ^
+  --fixed-delta "%FIXED_DELTA%" --stale-timeout "%STALE_TIMEOUT%" ^
+  --measure-update-times ^
+  --timing-output "%RECEIVER_TIMING_CSV%" ^
+  --eval-output "%RECEIVER_EVAL_CSV%"
 if not defined RECEIVER_PID (
-  echo [ERROR] receiver PID not found. Check log:
-  if exist "%RECEIVER_LOG%" type "%RECEIVER_LOG%"
+  echo [ERROR] Failed to start receiver (PID empty).
+  if exist "%RECEIVER_LOG_ERR%" type "%RECEIVER_LOG_ERR%"
   goto :cleanup
 )
 echo %RECEIVER_PID% > "%RECEIVER_PID_FILE%"
@@ -138,19 +139,25 @@ for /L %%N in (10,10,100) do (
     set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
     set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
     set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
-    set "STREAMER_LOG=!RUNDIR!\streamer_!TAG!.log"
+    set "STREAMER_LOG_OUT=!RUNDIR!\streamer_stdout.log"
+    set "STREAMER_LOG_ERR=!RUNDIR!\streamer_stderr.log"
 
     echo ============================================================
     echo [RUN] !TAG!
     echo [DIR] !RUNDIR!
 
     REM 1) Start STREAMER bg
-    call :start_bg_python "%PYTHON_EXE%" "!STREAMER_LOG!" "%STREAMER%" "--host %CARLA_HOST% --port %CARLA_PORT% --mode wait --role-prefix udp_replay: --include-velocity --frame-elapsed --wall-clock --include-object-id --include-monotonic --include-tick-wall-dt --output !STREAM_CSV! --timing-output !STREAM_TIMING_CSV! --timing-flush-every 10"
-
-    call :find_pid_by_script "vehicle_state_stream.py" STREAMER_PID
+    call :ps_spawn STREAMER_PID "%PYTHON_EXE%" "!STREAMER_LOG_OUT!" "!STREAMER_LOG_ERR!" "%STREAMER%" ^
+      --host "%CARLA_HOST%" --port "%CARLA_PORT%" ^
+      --mode wait --role-prefix udp_replay: ^
+      --include-velocity --frame-elapsed --wall-clock ^
+      --include-object-id --include-monotonic --include-tick-wall-dt ^
+      --output "!STREAM_CSV!" ^
+      --timing-output "!STREAM_TIMING_CSV!" ^
+      --timing-flush-every 10
     if not defined STREAMER_PID (
-      echo [ERROR] streamer PID not found. Check log:
-      if exist "!STREAMER_LOG!" type "!STREAMER_LOG!"
+      echo [ERROR] Failed to start streamer (PID empty).
+      if exist "!STREAMER_LOG_ERR!" type "!STREAMER_LOG_ERR!"
       goto :cleanup
     )
 
@@ -174,9 +181,7 @@ for /L %%N in (10,10,100) do (
 REM ==========================================================
 REM Stop RECEIVER
 REM ==========================================================
-if exist "%RECEIVER_PID_FILE%" (
-  for /f %%P in ("%RECEIVER_PID_FILE%") do taskkill /PID %%P /T /F >nul 2>&1
-)
+call :pid_kill_from_file "%RECEIVER_PID_FILE%"
 
 echo [ALL DONE] %OUTDIR%
 popd
@@ -185,9 +190,7 @@ exit /b 0
 
 :cleanup
 echo [CLEANUP]
-if exist "%RECEIVER_PID_FILE%" (
-  for /f %%P in ("%RECEIVER_PID_FILE%") do taskkill /PID %%P /T /F >nul 2>&1
-)
+call :pid_kill_from_file "%RECEIVER_PID_FILE%"
 popd
 endlocal
 exit /b 1
@@ -197,39 +200,36 @@ REM ==========================================================
 REM Subroutines
 REM ==========================================================
 
-:start_bg_python
-REM usage: call :start_bg_python <python_exe> <log_path> <script_path> <arg_string>
+:ps_spawn
+REM usage:
+REM   call :ps_spawn OUTPID PYEXE LOG_OUT LOG_ERR SCRIPT [args...]
 setlocal EnableExtensions DisableDelayedExpansion
-set "PYEXE=%~1"
-set "LOG=%~2"
-set "SCRIPT=%~3"
-set "ARGSTR=%~4"
+set "OUTVAR=%~1"
+set "PYEXE=%~2"
+set "LOGOUT=%~3"
+set "LOGERR=%~4"
+set "SCRIPT=%~5"
+shift & shift & shift & shift & shift
 
-REM unique temp cmd in OUTDIR
-set "TMP=%OUTDIR%\__bg_%RANDOM%_%RANDOM%.cmd"
+set "PID="
 
-> "%TMP%" (
-  echo @echo off
-  echo "%PYEXE%" "%SCRIPT%" %ARGSTR% ^>^>"%LOG%" 2^>^&1
-)
+for /f %%P in ('
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "& { param($py,$logout,$logerr,$script) $alist=@($args); $p=Start-Process -PassThru -WindowStyle Hidden -FilePath $py -ArgumentList (@($script)+$alist) -RedirectStandardOutput $logout -RedirectStandardError $logerr; $p.Id }" ^
+    "%PYEXE%" "%LOGOUT%" "%LOGERR%" "%SCRIPT%" %*
+') do set "PID=%%P"
 
-REM run temp cmd in background
-start "" /b "%ComSpec%" /d /q /c ""%TMP%""
+endlocal & set "%OUTVAR%=%PID%" & exit /b 0
+
+:pid_kill_from_file
+REM usage: call :pid_kill_from_file PIDFILE
+setlocal EnableExtensions DisableDelayedExpansion
+set "PIDFILE=%~1"
+if not exist "%PIDFILE%" ( endlocal & exit /b 0 )
+set /p PID=<"%PIDFILE%"
+if not defined PID ( endlocal & exit /b 0 )
+taskkill /PID %PID% /T /F >nul 2>&1
 endlocal & exit /b 0
-
-:find_pid_by_script
-REM %1 = script substring, %2 = out var
-set "%~2="
-for %%N in (python.exe pythonw.exe) do (
-  for /f "tokens=2 delims== " %%P in ('
-    wmic process where "Name='%%N' and CommandLine like '%%%%%~1%%%%'" get ProcessId /value 2^>nul ^| findstr /i "ProcessId="
-  ') do (
-    set "%~2=%%P"
-    goto :pid_done
-  )
-)
-:pid_done
-exit /b 0
 
 :count_lines
 REM %1 file, %2 out var
