@@ -37,10 +37,17 @@ set "STALE_TIMEOUT=2.0"
 set "COOLDOWN_SEC=5"
 
 REM ==========================================================
-REM OUTDIR (bat-only, no PowerShell)
+REM OUTDIR (bat-only, unique timestamp)
 REM ==========================================================
-call :get_dt_tag DT_TAG
-set "OUTDIR=%ROOT%sweep_results_%DT_TAG%"
+set "DT_TAG=%DATE%"
+set "DT_TAG=%DT_TAG:/=%"
+set "DT_TAG=%DT_TAG:-=%"
+set "DT_TAG=%DT_TAG:.=%"
+set "DT_TAG=%DT_TAG: =%"
+set "TM_TAG=%TIME: =0%"
+set "TM_TAG=%TM_TAG::=%"
+set "TM_TAG=%TM_TAG:.=%"
+set "OUTDIR=%ROOT%sweep_results_%DT_TAG%_%TM_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_LOG=%OUTDIR%\receiver.log"
@@ -59,6 +66,13 @@ set "TS_LIST=0.10 1.00"
 REM ==========================================================
 REM Start RECEIVER once (keep alive)
 REM ==========================================================
+REM --- Kill previous receiver if still running ---
+call :find_pid_by_script "replay_from_udp.py" OLD_RECEIVER_PID
+if defined OLD_RECEIVER_PID (
+  echo [WARN] Found existing receiver PID=!OLD_RECEIVER_PID! . Killing it...
+  taskkill /PID !OLD_RECEIVER_PID! /T /F >nul 2>&1
+  timeout /t 1 /nobreak >nul
+)
 echo [INFO] Starting receiver...
 call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" ^
   "%RECEIVER%" ^
@@ -207,27 +221,6 @@ REM ==========================================================
 REM Subroutines
 REM ==========================================================
 
-:get_dt_tag
-REM WMIC LocalDateTime: YYYYMMDDhhmmss.ssssss+TZ
-set "%~1="
-for /f "skip=1 delims=" %%i in ('wmic os get LocalDateTime 2^>nul ^| findstr /r "[0-9]"') do (
-  set "LDT=%%i"
-  goto :ldt_done
-)
-:ldt_done
-if not defined LDT (
-  set "%~1=unknown_dt"
-  exit /b 0
-)
-set "YYYY=!LDT:~0,4!"
-set "MM=!LDT:~4,2!"
-set "DD=!LDT:~6,2!"
-set "hh=!LDT:~8,2!"
-set "mm=!LDT:~10,2!"
-set "ss=!LDT:~12,2!"
-set "%~1=!YYYY!!MM!!DD!_!hh!!mm!!ss!"
-exit /b 0
-
 :start_bg_python
 REM usage: call :start_bg_python <python_exe> <log_path> <script_path> [args...]
 set "PYEXE=%~1"
@@ -241,11 +234,13 @@ exit /b 0
 :find_pid_by_script
 REM %1 = script substring, %2 = out var
 set "%~2="
-for /f "tokens=2 delims== " %%P in ('
-  wmic process where "Name='python.exe' and CommandLine like '%%%~1%%'" get ProcessId /value 2^>nul ^| findstr /i "ProcessId="
-') do (
-  set "%~2=%%P"
-  goto :pid_done
+for %%N in (python.exe pythonw.exe) do (
+  for /f "tokens=2 delims== " %%P in ('
+    wmic process where "Name='%%N' and CommandLine like '%%%~1%%'" get ProcessId /value 2^>nul ^| findstr /i "ProcessId="
+  ') do (
+    set "%~2=%%P"
+    goto :pid_done
+  )
 )
 :pid_done
 exit /b 0
