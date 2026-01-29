@@ -12,20 +12,18 @@ set "UDP_HOST=127.0.0.1"
 set "UDP_PORT=5005"
 set "LISTEN_HOST=0.0.0.0"
 
-REM Input CSV (sender reads this)
-REM   (e.g. output from scripts/convert_vehicle_state_csv.py)
-set "CSV_PATH=send_data\exp_300.csv"
-
-REM Script paths
 set "ROOT=%~dp0"
+set "CSV_PATH=%ROOT%send_data\exp_300.csv"
 set "SENDER=%ROOT%send_data\send_udp_frames_from_csv.py"
 set "RECEIVER=%ROOT%scripts\udp_replay\replay_from_udp.py"
 set "STREAMER=%ROOT%scripts\vehicle_state_stream.py"
 
+set "PYTHON_EXE=python"
+
 REM Receiver fixed delta (do not sweep)
 set "FIXED_DELTA=0.05"
 
-REM Warmup frames and delay (receiver stays alive)
+REM Warmup
 set "WARMUP_START_FRAME=0"
 set "WARMUP_END_FRAME=1800"
 set "WARMUP_INTERVAL=0.1"
@@ -34,134 +32,92 @@ set "WARMUP_CHECK_TIMEOUT_SEC=180"
 set "WARMUP_CHECK_INTERVAL_SEC=5"
 set "WARMUP_MAX_ATTEMPTS=3"
 
-REM Cooldown to allow stale actor cleanup (seconds)
+REM Stale/Cooldown
 set "STALE_TIMEOUT=2.0"
-set "COOLDOWN_SEC=3"
+set "COOLDOWN_SEC=5"
 
-REM Output root dir
-for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "DT_TAG=%%i"
-set "OUTDIR=sweep_results_%DT_TAG%"
+REM ==========================================================
+REM OUTDIR (bat-only, no PowerShell)
+REM ==========================================================
+call :get_dt_tag DT_TAG
+set "OUTDIR=%ROOT%sweep_results_%DT_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_LOG=%OUTDIR%\receiver.log"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
-set "PS_WARMUP_CHECK=%OUTDIR%\warmup_check.ps1"
 
 echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
 
 REM ==========================================================
 REM Sweep lists
-REM   NS: 10..100 step 10
-REM   TS_LIST: 0.10 1.00
 REM ==========================================================
 set "TS_LIST=0.10 1.00"
 
 REM ==========================================================
-REM Start RECEIVER once (keep alive for entire sweep) - robust
+REM Start RECEIVER once (keep alive)
 REM ==========================================================
-set "PS_START_RECEIVER=%OUTDIR%\start_receiver.ps1"
-> "%PS_START_RECEIVER%" (
-  echo $ErrorActionPreference = 'Stop'
-  echo $wd = '%CD%'
-  echo $python = 'python'
-  echo $argsList = @(
-  echo   '%RECEIVER%',
-  echo   '--carla-host','%CARLA_HOST%',
-  echo   '--carla-port','%CARLA_PORT%',
-  echo   '--listen-host','%LISTEN_HOST%',
-  echo   '--listen-port','%UDP_PORT%',
-  echo   '--fixed-delta','%FIXED_DELTA%',
-  echo   '--stale-timeout','%STALE_TIMEOUT%',
-  echo   '--measure-update-times',
-  echo   '--timing-output','%RECEIVER_TIMING_CSV%',
-  echo   '--eval-output','%RECEIVER_EVAL_CSV%'
-  echo ^)
-  echo $p = Start-Process -PassThru -NoNewWindow -WorkingDirectory $wd -FilePath $python -ArgumentList $argsList -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'
-  echo Start-Sleep -Seconds 1
-  echo if($p.HasExited){
-  echo   Add-Content -Path '%RECEIVER_LOG%' -Value ("[BAT] receiver exited immediately. ExitCode=" + $p.ExitCode)
-  echo   exit 2
-  echo }
-  echo Set-Content -Encoding ascii -Path '%RECEIVER_PID_FILE%' -Value $p.Id
-)
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_START_RECEIVER%" >nul
-if errorlevel 1 (
-  echo [ERROR] Failed to start receiver. Check %RECEIVER_LOG%
-  type "%RECEIVER_LOG%"
+echo [INFO] Starting receiver...
+call :start_bg_python "%PYTHON_EXE%" ^
+  "%RECEIVER% --carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output ""%RECEIVER_TIMING_CSV%"" --eval-output ""%RECEIVER_EVAL_CSV%""" ^
+  "%RECEIVER_LOG%"
+
+REM PIDを特定して保存（コマンドラインに replay_from_udp.py が含まれる python を拾う）
+call :find_pid_by_script "replay_from_udp.py" RECEIVER_PID
+if not defined RECEIVER_PID (
+  echo [ERROR] receiver PID not found. Check log:
+  if exist "%RECEIVER_LOG%" type "%RECEIVER_LOG%"
   goto :cleanup
 )
-
-> "%PS_WARMUP_CHECK%" (
-  echo param(
-  echo   [Parameter(Mandatory=$true)][string]$Path,
-  echo   [Parameter(Mandatory=$true)][Int64]$Offset,
-  echo   [int]$TimeoutSec = 180,
-  echo   [int]$IntervalSec = 5
-  echo ^)
-  echo $ErrorActionPreference = 'Stop'
-  echo $sw = [Diagnostics.Stopwatch]::StartNew()
-  echo while($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-  echo   if(Test-Path $Path) {
-  echo     $len = (Get-Item $Path).Length
-  echo     if($len -gt $Offset) {
-  echo       $fs = [System.IO.File]::Open($Path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
-  echo       try {
-  echo         $fs.Seek($Offset,[System.IO.SeekOrigin]::Begin) ^| Out-Null
-  echo         $buf = New-Object byte[] ($len-$Offset)
-  echo         [void]$fs.Read($buf,0,$buf.Length)
-  echo         $text = [System.Text.Encoding]::UTF8.GetString($buf)
-  echo       } finally { $fs.Close() }
-  echo       $Offset = $len
-  echo       foreach($line in ($text -split "`r?`n")) {
-  echo         if(-not $line) { continue }
-  echo         $cols = $line.Split(',')
-  echo         if($cols.Length -ge 7 -and $cols[5] -ne '') { exit 0 }
-  echo       }
-  echo     }
-  echo   }
-  echo   Start-Sleep -Seconds $IntervalSec
-  echo }
-  echo exit 1
-)
+echo %RECEIVER_PID% > "%RECEIVER_PID_FILE%"
+echo [INFO] receiver PID=%RECEIVER_PID%
 
 REM Give receiver time to boot
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup: send a short segment to trigger initialization
+REM Warmup (monitor timing CSV appended actor lines)
 REM ==========================================================
-REM Warmup attempts until receiver logs a spawn
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
-  set "TIMING_OFFSET=0"
+
+  REM record current line count as offset
+  set "TIMING_OFFSET_LINES=0"
   if exist "%RECEIVER_TIMING_CSV%" (
-    for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_TIMING_CSV%'').Length"') do set "TIMING_OFFSET=%%S"
-  )
-  echo [INFO] Warmup frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
-  python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
-
-  REM Optional wait for heavy initialization
-  if %WARMUP_WAIT_SEC% GTR 0 (
-    timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
+    call :count_lines "%RECEIVER_TIMING_CSV%" TIMING_OFFSET_LINES
   )
 
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_WARMUP_CHECK%" ^
-    -Path "%RECEIVER_TIMING_CSV%" ^
-    -Offset %TIMING_OFFSET% ^
-    -TimeoutSec %WARMUP_CHECK_TIMEOUT_SEC% ^
-    -IntervalSec %WARMUP_CHECK_INTERVAL_SEC% ^
-    >nul
-  if !errorlevel! EQU 0 (
-    echo [INFO] Warmup succeeded (actor update detected).
-    goto :warmup_done
+  echo [INFO] Warmup send frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
+  "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
+
+  if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
+
+  REM poll until timeout: look for newly appended lines that begin with ,,,,,
+  set /a ELAPSED=0
+  set "WARMUP_OK=0"
+
+  :warmup_poll
+  if !ELAPSED! GEQ %WARMUP_CHECK_TIMEOUT_SEC% goto :warmup_poll_done
+
+  if exist "%RECEIVER_TIMING_CSV%" (
+    call :check_appended_actor_lines "%RECEIVER_TIMING_CSV%" !TIMING_OFFSET_LINES! WARMUP_OK
+    if "!WARMUP_OK!"=="1" (
+      echo [INFO] Warmup succeeded (actor update line detected in timing CSV).
+      goto :warmup_done
+    )
   )
-  echo [WARN] Warmup not confirmed (no actor updates detected). Retrying...
+
+  timeout /t %WARMUP_CHECK_INTERVAL_SEC% /nobreak >nul
+  set /a ELAPSED+=%WARMUP_CHECK_INTERVAL_SEC%
+  goto :warmup_poll
+
+  :warmup_poll_done
+  echo [WARN] Warmup not confirmed (no actor update detected). Retrying...
 )
 
-echo [ERROR] Warmup failed to detect spawn after %WARMUP_MAX_ATTEMPTS% attempts.
+echo [ERROR] Warmup failed after %WARMUP_MAX_ATTEMPTS% attempts.
 goto :cleanup
 
 :warmup_done
@@ -176,64 +132,40 @@ for /L %%N in (10,10,100) do (
     set "RUNDIR=%OUTDIR%\!TAG!"
     mkdir "!RUNDIR!" 2>nul
 
+    set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
+    set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
+    set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
+    set "STREAMER_LOG=!RUNDIR!\streamer_!TAG!.log"
+
     echo ============================================================
     echo [RUN] !TAG!
     echo [DIR] !RUNDIR!
 
-    set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
-    set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
+    REM 1) Start STREAMER bg
+    call :start_bg_python "%PYTHON_EXE%" ^
+      "%STREAMER% --host %CARLA_HOST% --port %CARLA_PORT% --mode wait --role-prefix udp_replay: --include-velocity --frame-elapsed --wall-clock --include-object-id --include-monotonic --include-tick-wall-dt --output ""!STREAM_CSV!"" --timing-output ""!STREAM_TIMING_CSV!"" --timing-flush-every 10" ^
+      "!STREAMER_LOG!"
 
-    set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
-    set "STREAMER_LOG=!RUNDIR!\streamer_!TAG!.log"
-    set "STREAMER_PID_FILE=!RUNDIR!\streamer_pid.txt"
-
-    REM ------------------------------------------------------------
-    REM 1) Start STREAMER for this run (background)
-    REM ------------------------------------------------------------
-    set "PS_START_STREAMER=!RUNDIR!\start_streamer.ps1"
-    > "!PS_START_STREAMER!" (
-      echo $ErrorActionPreference = 'Stop'
-      echo $argsList = @(
-      echo   '%STREAMER%',
-      echo   '--host','%CARLA_HOST%',
-      echo   '--port','%CARLA_PORT%',
-      echo   '--mode','wait',
-      echo   '--role-prefix','udp_replay:',
-      echo   '--include-velocity',
-      echo   '--frame-elapsed',
-      echo   '--wall-clock',
-      echo   '--include-object-id',
-      echo   '--include-monotonic',
-      echo   '--include-tick-wall-dt',
-      echo   '--output','!STREAM_CSV!',
-      echo   '--timing-output','!STREAM_TIMING_CSV!',
-      echo   '--timing-flush-every','10'
-      echo ^)
-      echo $p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList $argsList -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!'
-      echo Set-Content -Encoding ascii -Path '!STREAMER_PID_FILE!' -Value $p.Id
+    call :find_pid_by_script "vehicle_state_stream.py" STREAMER_PID
+    if not defined STREAMER_PID (
+      echo [ERROR] streamer PID not found. Check log:
+      if exist "!STREAMER_LOG!" type "!STREAMER_LOG!"
+      goto :cleanup
     )
-    powershell -NoProfile -ExecutionPolicy Bypass -File "!PS_START_STREAMER!" >nul
 
-    REM Give streamer time to start
     timeout /t 1 /nobreak >nul
 
-    REM ------------------------------------------------------------
     REM 2) Run SENDER (blocking)
-    REM ------------------------------------------------------------
     set "FRAME_STRIDE=1"
     if "%%T"=="1.00" set "FRAME_STRIDE=10"
 
     echo [INFO] Sending... N=%%N Ts=%%T stride=!FRAME_STRIDE!
-    python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %%T --frame-stride !FRAME_STRIDE! --max-actors %%N > "!SENDER_LOG!" 2>&1
+    "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %%T --frame-stride !FRAME_STRIDE! --max-actors %%N > "!SENDER_LOG!" 2>&1
 
-    REM ------------------------------------------------------------
-    REM 3) Stop STREAMER for this run
-    REM ------------------------------------------------------------
-    for /f %%P in ('type "%STREAMER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&1
+    REM 3) Stop STREAMER
+    taskkill /PID !STREAMER_PID! /T /F >nul 2>&1
 
-    REM Cooldown so stale actors are cleared before next run
     timeout /t %COOLDOWN_SEC% /nobreak >nul
-
     echo [DONE] !TAG!
   )
 )
@@ -241,7 +173,9 @@ for /L %%N in (10,10,100) do (
 REM ==========================================================
 REM Stop RECEIVER
 REM ==========================================================
-for /f %%P in ('type "%RECEIVER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&1
+if exist "%RECEIVER_PID_FILE%" (
+  for /f %%P in ("%RECEIVER_PID_FILE%") do taskkill /PID %%P /T /F >nul 2>&1
+)
 
 echo [ALL DONE] %OUTDIR%
 popd
@@ -249,7 +183,75 @@ endlocal
 exit /b 0
 
 :cleanup
-for /f %%P in ('type "%RECEIVER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&1
+echo [CLEANUP]
+if exist "%RECEIVER_PID_FILE%" (
+  for /f %%P in ("%RECEIVER_PID_FILE%") do taskkill /PID %%P /T /F >nul 2>&1
+)
 popd
 endlocal
 exit /b 1
+
+
+REM ==========================================================
+REM Subroutines
+REM ==========================================================
+
+:get_dt_tag
+REM WMIC LocalDateTime: YYYYMMDDhhmmss.ssssss+TZ
+set "%~1="
+for /f "skip=1 delims=" %%i in ('wmic os get LocalDateTime 2^>nul ^| findstr /r "[0-9]"') do (
+  set "LDT=%%i"
+  goto :ldt_done
+)
+:ldt_done
+if not defined LDT (
+  set "%~1=unknown_dt"
+  exit /b 0
+)
+set "YYYY=!LDT:~0,4!"
+set "MM=!LDT:~4,2!"
+set "DD=!LDT:~6,2!"
+set "hh=!LDT:~8,2!"
+set "mm=!LDT:~10,2!"
+set "ss=!LDT:~12,2!"
+set "%~1=!YYYY!!MM!!DD!_!hh!!mm!!ss!"
+exit /b 0
+
+:start_bg_python
+REM %1 = python exe, %2 = args string (script + args), %3 = log path
+set "PYEXE=%~1"
+set "ARGS=%~2"
+set "LOG=%~3"
+REM start uses a new cmd so redirection is reliable
+start "" /b cmd /c ""%PYEXE%" %ARGS% 1>> "%LOG%" 2>&1"
+exit /b 0
+
+:find_pid_by_script
+REM %1 = script substring, %2 = out var
+set "%~2="
+for /f "tokens=2 delims== " %%P in ('
+  wmic process where "Name='python.exe' and CommandLine like '%%%~1%%'" get ProcessId /value 2^>nul ^| findstr /i "ProcessId="
+') do (
+  set "%~2=%%P"
+  goto :pid_done
+)
+:pid_done
+exit /b 0
+
+:count_lines
+REM %1 file, %2 out var
+set "%~2=0"
+for /f %%A in ('find /v /c "" ^< "%~1"') do set "%~2=%%A"
+exit /b 0
+
+:check_appended_actor_lines
+REM %1 file, %2 skipLines, %3 out(0/1)
+set "%~3=0"
+set "FILE=%~1"
+set "SKIP=%~2"
+REM 新規行の中に ,,,,, で始まる行があれば成功（actor更新行）
+for /f "usebackq skip=%SKIP% delims=" %%L in ("%FILE%") do (
+  echo %%L | findstr /b /c:",,,,," >nul && (set "%~3=1" & goto :app_done)
+)
+:app_done
+exit /b 0
