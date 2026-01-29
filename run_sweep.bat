@@ -92,52 +92,62 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" >nul 2>nul
 
 REM ==========================================================
-REM Start receiver (stdout/stderr separate. loggingはstderr側に出がち)
+REM Start receiver (write PID to file, avoid for /f hanging)
 REM ==========================================================
 echo [INFO] Starting receiver...
+
+set "RECEIVER_STDOUT=%OUTDIR%\receiver_stdout.log"
+set "RECEIVER_STDERR=%OUTDIR%\receiver_stderr.log"
+set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
+
 type nul > "%RECEIVER_STDOUT%"
 type nul > "%RECEIVER_STDERR%"
-set "RECEIVER_PID="
+del /q "%RECEIVER_PID_FILE%" >nul 2>&1
 
-for /f "usebackq delims=" %%P in (`
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ErrorActionPreference='Stop';" ^
-    "try{" ^
-    "  $args=@(" ^
-    "    '%RECEIVER%'," ^
-    "    '--carla-host','%CARLA_HOST%'," ^
-    "    '--carla-port','%CARLA_PORT%'," ^
-    "    '--listen-host','%LISTEN_HOST%'," ^
-    "    '--listen-port','%UDP_PORT%'," ^
-    "    '--fixed-delta','%FIXED_DELTA%'," ^
-    "    '--stale-timeout','%STALE_TIMEOUT%'," ^
-    "    '--measure-update-times'," ^
-    "    '--timing-output','%RECEIVER_TIMING_CSV%'," ^
-    "    '--eval-output','%RECEIVER_EVAL_CSV%'" ^
-    "  );" ^
-    "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
-    "  Start-Sleep -Milliseconds 300;" ^
-    "  if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode; exit 0 }" ^
-    "  $p.Id" ^
-    "} catch { 'START_FAILED: ' + $_.Exception.Message }"
-`) do set "RECEIVER_PID=%%P"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='Stop';" ^
+  "$args=@(" ^
+  "  '%RECEIVER%'," ^
+  "  '--carla-host','%CARLA_HOST%'," ^
+  "  '--carla-port','%CARLA_PORT%'," ^
+  "  '--listen-host','%LISTEN_HOST%'," ^
+  "  '--listen-port','%UDP_PORT%'," ^
+  "  '--fixed-delta','%FIXED_DELTA%'," ^
+  "  '--stale-timeout','%STALE_TIMEOUT%'," ^
+  "  '--measure-update-times'," ^
+  "  '--timing-output','%RECEIVER_TIMING_CSV%'," ^
+  "  '--eval-output','%RECEIVER_EVAL_CSV%'" ^
+  ");" ^
+  "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
+  "Start-Sleep -Milliseconds 300;" ^
+  "if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode | Out-File -Encoding utf8 '%RECEIVER_STDERR%' -Append; exit 2 }" ^
+  "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'; exit 0" ^
+  1>>"%RECEIVER_STDOUT%" 2>>"%RECEIVER_STDERR%"
 
-echo [INFO] receiver start result: %RECEIVER_PID%
-
-echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
-  echo [ERROR] Failed to start receiver. Reason:
-  echo %RECEIVER_PID%
-  echo [ERROR] receiver_stderr.log:
+  echo [ERROR] Failed to start receiver. Check logs:
   if exist "%RECEIVER_STDERR%" type "%RECEIVER_STDERR%"
-  echo [ERROR] receiver_stdout.log:
   if exist "%RECEIVER_STDOUT%" type "%RECEIVER_STDOUT%"
   goto :cleanup
 )
 
-echo %RECEIVER_PID% > "%RECEIVER_PID_FILE%"
-echo [INFO] receiver PID=%RECEIVER_PID%
+if not exist "%RECEIVER_PID_FILE%" (
+  echo [ERROR] receiver_pid.txt not created. Check logs:
+  if exist "%RECEIVER_STDERR%" type "%RECEIVER_STDERR%"
+  if exist "%RECEIVER_STDOUT%" type "%RECEIVER_STDOUT%"
+  goto :cleanup
+)
 
+set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
+echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
+if errorlevel 1 (
+  echo [ERROR] Invalid receiver PID: %RECEIVER_PID%
+  if exist "%RECEIVER_STDERR%" type "%RECEIVER_STDERR%"
+  if exist "%RECEIVER_STDOUT%" type "%RECEIVER_STDOUT%"
+  goto :cleanup
+)
+
+echo [INFO] receiver PID=%RECEIVER_PID%
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
