@@ -19,6 +19,11 @@ set "RECEIVER=%ROOT%scripts\udp_replay\replay_from_udp.py"
 set "STREAMER=%ROOT%scripts\vehicle_state_stream.py"
 
 set "PYTHON_EXE=python"
+where "%PYTHON_EXE%" >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] python not found in PATH. Set PYTHON_EXE=py or full path.
+  exit /b 1
+)
 
 REM Receiver fixed delta (do not sweep)
 set "FIXED_DELTA=0.05"
@@ -74,14 +79,8 @@ if defined OLD_RECEIVER_PID (
   timeout /t 1 /nobreak >nul
 )
 echo [INFO] Starting receiver...
-call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" ^
-  "%RECEIVER%" ^
-  --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" ^
-  --listen-host "%LISTEN_HOST%" --listen-port "%UDP_PORT%" ^
-  --fixed-delta "%FIXED_DELTA%" --stale-timeout "%STALE_TIMEOUT%" ^
-  --measure-update-times ^
-  --timing-output "%RECEIVER_TIMING_CSV%" ^
-  --eval-output "%RECEIVER_EVAL_CSV%"
+set "RECV_ARGS=--carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output %RECEIVER_TIMING_CSV% --eval-output %RECEIVER_EVAL_CSV%"
+call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" "%RECEIVER%" "%RECV_ARGS%"
 
 REM PIDを特定して保存（コマンドラインに replay_from_udp.py が含まれる python を拾う）
 call :find_pid_by_script "replay_from_udp.py" RECEIVER_PID
@@ -161,15 +160,8 @@ for /L %%N in (10,10,100) do (
     echo [DIR] !RUNDIR!
 
     REM 1) Start STREAMER bg
-    call :start_bg_python "%PYTHON_EXE%" "!STREAMER_LOG!" ^
-      "%STREAMER%" ^
-      --host "%CARLA_HOST%" --port "%CARLA_PORT%" ^
-      --mode wait --role-prefix udp_replay: ^
-      --include-velocity --frame-elapsed --wall-clock ^
-      --include-object-id --include-monotonic --include-tick-wall-dt ^
-      --output "!STREAM_CSV!" ^
-      --timing-output "!STREAM_TIMING_CSV!" ^
-      --timing-flush-every 10
+    set "STR_ARGS=--host %CARLA_HOST% --port %CARLA_PORT% --mode wait --role-prefix udp_replay: --include-velocity --frame-elapsed --wall-clock --include-object-id --include-monotonic --include-tick-wall-dt --output !STREAM_CSV! --timing-output !STREAM_TIMING_CSV! --timing-flush-every 10"
+    call :start_bg_python "%PYTHON_EXE%" "!STREAMER_LOG!" "%STREAMER%" "!STR_ARGS!"
 
     call :find_pid_by_script "vehicle_state_stream.py" STREAMER_PID
     if not defined STREAMER_PID (
@@ -222,13 +214,13 @@ REM Subroutines
 REM ==========================================================
 
 :start_bg_python
-REM usage: call :start_bg_python <python_exe> <log_path> <script_path> [args...]
+REM usage: call :start_bg_python <python_exe> <log_path> <script_path> <arg_string>
 set "PYEXE=%~1"
 set "LOG=%~2"
-shift
-shift
+set "SCRIPT=%~3"
+set "ARGSTR=%~4"
 REM start uses a new cmd so redirection is reliable
-start "" /b "%ComSpec%" /s /c ""%PYEXE%" %* >>"%LOG%" 2>&1"
+start "" /b "%ComSpec%" /s /c ""%PYEXE%" "%SCRIPT%" %ARGSTR% >>"%LOG%" 2>&1"
 exit /b 0
 
 :find_pid_by_script
