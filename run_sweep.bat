@@ -62,17 +62,7 @@ REM ==========================================================
 REM Start RECEIVER once (keep alive for entire sweep)
 REM ==========================================================
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList @(" ^
-  + "'%RECEIVER%'," ^
-  + "'--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%'," ^
-  + "'--listen-host','0.0.0.0','--listen-port','%UDP_PORT%'," ^
-  + "'--fixed-delta','%FIXED_DELTA%'," ^
-  + "'--stale-timeout','%STALE_TIMEOUT%'," ^
-  + "'--measure-update-times'," ^
-  + "'--timing-output','%RECEIVER_TIMING_CSV%'," ^
-  + "'--eval-output','%RECEIVER_EVAL_CSV%'" ^
-  + ") -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%';" ^
-  + "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'" ^
+  "$p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList @('%RECEIVER%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','0.0.0.0','--listen-port','%UDP_PORT%','--fixed-delta','%FIXED_DELTA%','--stale-timeout','%STALE_TIMEOUT%','--measure-update-times','--timing-output','%RECEIVER_TIMING_CSV%','--eval-output','%RECEIVER_EVAL_CSV%') -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'; $p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'" ^
   >nul
 
 REM Give receiver time to boot
@@ -94,13 +84,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   )
 
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$log='%RECEIVER_LOG%';" ^
-    + "$timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%;" ^
-    + "$sw=[Diagnostics.Stopwatch]::StartNew();" ^
-    + "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
-    + "if(Select-String -Path $log -Pattern 'Spawned ' -Quiet){ exit 0 };" ^
-    + "Start-Sleep -Seconds $interval" ^
-    + "}; exit 1" ^
+    "$log='%RECEIVER_LOG%'; $timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%; $sw=[Diagnostics.Stopwatch]::StartNew(); while($sw.Elapsed.TotalSeconds -lt $timeout){ if(Select-String -Path $log -Pattern 'Spawned ' -Quiet){ exit 0 }; Start-Sleep -Seconds $interval }; exit 1" ^
     >nul
   if !errorlevel! EQU 0 (
     echo [INFO] Warmup succeeded (spawn detected).
@@ -138,18 +122,7 @@ for /L %%N in (10,10,100) do (
     REM 1) Start STREAMER for this run (background)
     REM ------------------------------------------------------------
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-      "$p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList @(" ^
-      + "'%STREAMER%'," ^
-      + "'--host','%CARLA_HOST%','--port','%CARLA_PORT%'," ^
-      + "'--mode','wait'," ^
-      + "'--role-prefix','udp_replay:'," ^
-      + "'--include-velocity','--frame-elapsed','--wall-clock','--include-object-id'," ^
-      + "'--include-monotonic','--include-tick-wall-dt'," ^
-      + "'--output','!STREAM_CSV!'," ^
-      + "'--timing-output','!STREAM_TIMING_CSV!'," ^
-      + "'--timing-flush-every','10'" ^
-      + ") -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!';" ^
-      + "$p.Id | Out-File -Encoding ascii '%STREAMER_PID_FILE%'" ^
+      "$p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList @('%STREAMER%','--host','%CARLA_HOST%','--port','%CARLA_PORT%','--mode','wait','--role-prefix','udp_replay:','--include-velocity','--frame-elapsed','--wall-clock','--include-object-id','--include-monotonic','--include-tick-wall-dt','--output','!STREAM_CSV!','--timing-output','!STREAM_TIMING_CSV!','--timing-flush-every','10') -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!'; $p.Id | Out-File -Encoding ascii '%STREAMER_PID_FILE%'" ^
       >nul
 
     REM Give streamer time to start
