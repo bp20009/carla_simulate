@@ -24,7 +24,8 @@ set "FIXED_DELTA=0.05"
 
 REM Warmup frames and delay (receiver stays alive)
 set "WARMUP_START_FRAME=0"
-set "WARMUP_END_FRAME=30"
+set "WARMUP_END_FRAME=1800"
+set "WARMUP_INTERVAL=0.1"
 set "WARMUP_WAIT_SEC=10"
 
 REM Cooldown to allow stale actor cleanup (seconds)
@@ -77,8 +78,8 @@ REM Give receiver time to boot
 REM ==========================================================
 REM Warmup: send a short segment to trigger initialization
 REM ==========================================================
-echo [INFO] Warmup frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME%
-python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
+echo [INFO] Warmup frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
+python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
 
 REM Optional wait for heavy initialization
 if %WARMUP_WAIT_SEC% GTR 0 (
