@@ -89,9 +89,9 @@ REM ==========================================================
 REM Sweep runs (restart only streamer + sender)
 REM ==========================================================
 for /L %%N in (10,10,100) do (
-  for %%TS in (%TS_LIST%) do (
+  for %%T in (%TS_LIST%) do (
 
-    set "TAG=N%%N_Ts%%TS"
+    set "TAG=N%%N_Ts%%T"
     set "RUNDIR=%OUTDIR%\!TAG!"
     mkdir "!RUNDIR!" 2>nul
 
@@ -130,10 +130,10 @@ for /L %%N in (10,10,100) do (
     REM 2) Run SENDER (blocking)
     REM ------------------------------------------------------------
     set "FRAME_STRIDE=1"
-    if "%%TS"=="1.00" set "FRAME_STRIDE=10"
+    if "%%T"=="1.00" set "FRAME_STRIDE=10"
 
-    echo [INFO] Sending... N=%%N Ts=%%TS stride=!FRAME_STRIDE!
-    python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %%TS --frame-stride !FRAME_STRIDE! --max-actors %%N > "!SENDER_LOG!" 2>&1
+    echo [INFO] Sending... N=%%N Ts=%%T stride=!FRAME_STRIDE!
+    python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %%T --frame-stride !FRAME_STRIDE! --max-actors %%N > "!SENDER_LOG!" 2>&1
 
     REM ------------------------------------------------------------
     REM 3) Stop STREAMER for this run
