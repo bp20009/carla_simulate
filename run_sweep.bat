@@ -60,9 +60,14 @@ REM ==========================================================
 REM Start RECEIVER once (keep alive)
 REM ==========================================================
 echo [INFO] Starting receiver...
-call :start_bg_python "%PYTHON_EXE%" ^
-  "%RECEIVER% --carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output ""%RECEIVER_TIMING_CSV%"" --eval-output ""%RECEIVER_EVAL_CSV%""" ^
-  "%RECEIVER_LOG%"
+call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" ^
+  "%RECEIVER%" ^
+  --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" ^
+  --listen-host "%LISTEN_HOST%" --listen-port "%UDP_PORT%" ^
+  --fixed-delta "%FIXED_DELTA%" --stale-timeout "%STALE_TIMEOUT%" ^
+  --measure-update-times ^
+  --timing-output "%RECEIVER_TIMING_CSV%" ^
+  --eval-output "%RECEIVER_EVAL_CSV%"
 
 REM PIDを特定して保存（コマンドラインに replay_from_udp.py が含まれる python を拾う）
 call :find_pid_by_script "replay_from_udp.py" RECEIVER_PID
@@ -142,9 +147,15 @@ for /L %%N in (10,10,100) do (
     echo [DIR] !RUNDIR!
 
     REM 1) Start STREAMER bg
-    call :start_bg_python "%PYTHON_EXE%" ^
-      "%STREAMER% --host %CARLA_HOST% --port %CARLA_PORT% --mode wait --role-prefix udp_replay: --include-velocity --frame-elapsed --wall-clock --include-object-id --include-monotonic --include-tick-wall-dt --output ""!STREAM_CSV!"" --timing-output ""!STREAM_TIMING_CSV!"" --timing-flush-every 10" ^
-      "!STREAMER_LOG!"
+    call :start_bg_python "%PYTHON_EXE%" "!STREAMER_LOG!" ^
+      "%STREAMER%" ^
+      --host "%CARLA_HOST%" --port "%CARLA_PORT%" ^
+      --mode wait --role-prefix udp_replay: ^
+      --include-velocity --frame-elapsed --wall-clock ^
+      --include-object-id --include-monotonic --include-tick-wall-dt ^
+      --output "!STREAM_CSV!" ^
+      --timing-output "!STREAM_TIMING_CSV!" ^
+      --timing-flush-every 10
 
     call :find_pid_by_script "vehicle_state_stream.py" STREAMER_PID
     if not defined STREAMER_PID (
@@ -218,12 +229,13 @@ set "%~1=!YYYY!!MM!!DD!_!hh!!mm!!ss!"
 exit /b 0
 
 :start_bg_python
-REM %1 = python exe, %2 = args string (script + args), %3 = log path
+REM usage: call :start_bg_python <python_exe> <log_path> <script_path> [args...]
 set "PYEXE=%~1"
-set "ARGS=%~2"
-set "LOG=%~3"
+set "LOG=%~2"
+shift
+shift
 REM start uses a new cmd so redirection is reliable
-start "" /b cmd /c ""%PYEXE%" %ARGS% 1>> "%LOG%" 2>&1"
+start "" /b cmd /c ""%PYEXE%" %* 1>>"%LOG%" 2>&1"
 exit /b 0
 
 :find_pid_by_script
