@@ -9,6 +9,7 @@ set "CARLA_PORT=2000"
 
 set "UDP_HOST=127.0.0.1"
 set "UDP_PORT=5005"
+set "LISTEN_HOST=0.0.0.0"
 
 REM Input CSV (sender reads this)
 REM   (e.g. output from scripts/convert_vehicle_state_csv.py)
@@ -59,9 +60,7 @@ set "TS_LIST=0.10 1.00"
 REM ==========================================================
 REM Start RECEIVER once (keep alive for entire sweep)
 REM ==========================================================
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList @('%RECEIVER%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','0.0.0.0','--listen-port','%UDP_PORT%','--fixed-delta','%FIXED_DELTA%','--stale-timeout','%STALE_TIMEOUT%','--measure-update-times','--timing-output','%RECEIVER_TIMING_CSV%','--eval-output','%RECEIVER_EVAL_CSV%') -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'; $p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'" ^
-  >nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Start-Process -PassThru -NoNewWindow -FilePath python -ArgumentList @('%RECEIVER%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%UDP_PORT%','--fixed-delta','%FIXED_DELTA%','--stale-timeout','%STALE_TIMEOUT%','--measure-update-times','--timing-output','%RECEIVER_TIMING_CSV%','--eval-output','%RECEIVER_EVAL_CSV%') -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'; $p.Id | Set-Content -Encoding ascii '%RECEIVER_PID_FILE%'" >nul
 
 REM Give receiver time to boot
 timeout /t 2 /nobreak >nul
@@ -84,9 +83,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
     timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
   )
 
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$path='%RECEIVER_TIMING_CSV%'; $offset=[int64]%TIMING_OFFSET%; $timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%; $sw=[Diagnostics.Stopwatch]::StartNew(); while($sw.Elapsed.TotalSeconds -lt $timeout){ if(Test-Path $path){ $len=(Get-Item $path).Length; if($len -gt $offset){ $fs=[System.IO.File]::Open($path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite); try{ $fs.Seek($offset,[System.IO.SeekOrigin]::Begin) | Out-Null; $buf=New-Object byte[] ($len-$offset); [void]$fs.Read($buf,0,$buf.Length); $text=[System.Text.Encoding]::UTF8.GetString($buf); } finally { $fs.Close() } $offset=$len; foreach($line in ($text -split \"`r?`n\")){ if(-not $line){ continue } $cols=$line.Split(','); if($cols.Length -ge 7 -and $cols[5] -ne ''){ exit 0 } } } } Start-Sleep -Seconds $interval }; exit 1" ^
-    >nul
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$path='%RECEIVER_TIMING_CSV%'; $offset=[int64]%TIMING_OFFSET%; $timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%; $sw=[Diagnostics.Stopwatch]::StartNew(); while($sw.Elapsed.TotalSeconds -lt $timeout){ if(Test-Path $path){ $len=(Get-Item $path).Length; if($len -gt $offset){ $fs=[System.IO.File]::Open($path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite); try{ $fs.Seek($offset,[System.IO.SeekOrigin]::Begin) | Out-Null; $buf=New-Object byte[] ($len-$offset); [void]$fs.Read($buf,0,$buf.Length); $text=[System.Text.Encoding]::UTF8.GetString($buf); } finally { $fs.Close() } $offset=$len; foreach($line in ($text -split \"`r?`n\")){ if(-not $line){ continue } $cols=$line.Split(','); if($cols.Length -ge 7 -and $cols[5] -ne ''){ exit 0 } } } } Start-Sleep -Seconds $interval }; exit 1" >nul
   if !errorlevel! EQU 0 (
     echo [INFO] Warmup succeeded (actor update detected).
     goto :warmup_done
@@ -123,9 +120,7 @@ for /L %%N in (10,10,100) do (
     REM ------------------------------------------------------------
     REM 1) Start STREAMER for this run (background)
     REM ------------------------------------------------------------
-    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-      "$p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList @('%STREAMER%','--host','%CARLA_HOST%','--port','%CARLA_PORT%','--mode','wait','--role-prefix','udp_replay:','--include-velocity','--frame-elapsed','--wall-clock','--include-object-id','--include-monotonic','--include-tick-wall-dt','--output','!STREAM_CSV!','--timing-output','!STREAM_TIMING_CSV!','--timing-flush-every','10') -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!'; $p.Id | Out-File -Encoding ascii '%STREAMER_PID_FILE%'" ^
-      >nul
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Start-Process -PassThru -NoNewWindow -FilePath python -ArgumentList @('%STREAMER%','--host','%CARLA_HOST%','--port','%CARLA_PORT%','--mode','wait','--role-prefix','udp_replay:','--include-velocity','--frame-elapsed','--wall-clock','--include-object-id','--include-monotonic','--include-tick-wall-dt','--output','!STREAM_CSV!','--timing-output','!STREAM_TIMING_CSV!','--timing-flush-every','10') -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!'; $p.Id | Set-Content -Encoding ascii '!STREAMER_PID_FILE!'" >nul
 
     REM Give streamer time to start
     timeout /t 1 /nobreak >nul
