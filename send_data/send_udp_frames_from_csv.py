@@ -144,9 +144,10 @@ def build_frame_payload(
     actor_rows = rows[:max_actors] if max_actors is not None else rows
     actors = []
     for row in actor_rows:
+        actor_id = row.get("id") or row.get("object_id")
         actors.append(
             {
-                "id": row.get("id"),
+                "id": actor_id,
                 "type": row.get("type"),
                 "x": _coerce_float(row.get("x")),
                 "y": _coerce_float(row.get("y")),
