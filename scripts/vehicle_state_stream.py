@@ -74,6 +74,11 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
         help="Only log actors whose role_name starts with this prefix",
     )
     parser.add_argument(
+        "--include-object-id",
+        action="store_true",
+        help="Include object_id alias column (same as external_id) in the CSV output",
+    )
+    parser.add_argument(
         "--include-monotonic",
         action="store_true",
         help="Include time.monotonic() in the CSV output",
@@ -132,6 +137,7 @@ def stream_vehicle_states(
     mode: str,
     control_state_file: str | None,
     role_prefix: str,
+    include_object_id: bool,
     include_monotonic: bool,
     include_tick_wall_dt: bool,
     timing_output: TextIO | None,
@@ -158,17 +164,23 @@ def stream_vehicle_states(
     header = header_prefix + [
         "frame",
         "external_id",
-        "role_name",
-        "id",
-        "carla_actor_id",
-        "type",
-        "location_x",
-        "location_y",
-        "location_z",
-        "rotation_roll",
-        "rotation_pitch",
-        "rotation_yaw",
     ]
+    if include_object_id:
+        header.append("object_id")
+    header.extend(
+        [
+            "role_name",
+            "id",
+            "carla_actor_id",
+            "type",
+            "location_x",
+            "location_y",
+            "location_z",
+            "rotation_roll",
+            "rotation_pitch",
+            "rotation_yaw",
+        ]
+    )
     if include_velocity:
         header.extend(["velocity_x", "velocity_y", "velocity_z"])
     header.extend(["autopilot_enabled", "control_mode"])
@@ -292,17 +304,23 @@ def stream_vehicle_states(
             row = row_prefix + [
                 world_snapshot.frame,
                 external_id,
-                role_name,
-                actor_to_custom_id[actor_id],
-                actor_id,
-                actor.type_id,
-                transform.location.x,
-                transform.location.y,
-                transform.location.z,
-                transform.rotation.roll,
-                transform.rotation.pitch,
-                transform.rotation.yaw,
             ]
+            if include_object_id:
+                row.append(external_id)
+            row.extend(
+                [
+                    role_name,
+                    actor_to_custom_id[actor_id],
+                    actor_id,
+                    actor.type_id,
+                    transform.location.x,
+                    transform.location.y,
+                    transform.location.z,
+                    transform.rotation.roll,
+                    transform.rotation.pitch,
+                    transform.rotation.yaw,
+                ]
+            )
             if include_velocity:
                 row.extend(
                     [
@@ -379,6 +397,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.mode,
             args.control_state_file,
             args.role_prefix,
+            args.include_object_id,
             args.include_monotonic,
             args.include_tick_wall_dt,
             timing_output,

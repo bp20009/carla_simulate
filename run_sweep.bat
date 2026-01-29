@@ -12,7 +12,7 @@ set "UDP_PORT=5005"
 
 REM Input CSV (sender reads this)
 REM   (e.g. output from scripts/convert_vehicle_state_csv.py)
-set "CSV_PATH=send_data\vehicle_states_reduced.csv"
+set "CSV_PATH=send_data\exp_300.csv"
 
 REM Script paths
 set "SENDER=send_data\send_udp_frames_from_csv.py"
@@ -50,9 +50,9 @@ echo [INFO] CSV=%CSV_PATH%
 REM ==========================================================
 REM Sweep lists
 REM   NS: 10..100 step 10
-REM   TS_LIST: 0.05 0.10 0.20
+REM   TS_LIST: 0.10 1.00
 REM ==========================================================
-set "TS_LIST=0.05 0.10 0.20"
+set "TS_LIST=0.10 1.00"
 
 REM ==========================================================
 REM Start RECEIVER once (keep alive for entire sweep)
@@ -114,7 +114,7 @@ for /L %%N in (10,10,100) do (
       + "'--host','%CARLA_HOST%','--port','%CARLA_PORT%'," ^
       + "'--mode','wait'," ^
       + "'--role-prefix','udp_replay:'," ^
-      + "'--include-velocity','--frame-elapsed','--wall-clock'," ^
+      + "'--include-velocity','--frame-elapsed','--wall-clock','--include-object-id'," ^
       + "'--include-monotonic','--include-tick-wall-dt'," ^
       + "'--output','!STREAM_CSV!'," ^
       + "'--timing-output','!STREAM_TIMING_CSV!'," ^
@@ -129,8 +129,11 @@ for /L %%N in (10,10,100) do (
     REM ------------------------------------------------------------
     REM 2) Run SENDER (blocking)
     REM ------------------------------------------------------------
-    echo [INFO] Sending... N=%%N Ts=%%TS
-    python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %%TS --max-actors %%N > "!SENDER_LOG!" 2>&1
+    set "FRAME_STRIDE=1"
+    if "%%TS"=="1.00" set "FRAME_STRIDE=10"
+
+    echo [INFO] Sending... N=%%N Ts=%%TS stride=!FRAME_STRIDE!
+    python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %%TS --frame-stride !FRAME_STRIDE! --max-actors %%N > "!SENDER_LOG!" 2>&1
 
     REM ------------------------------------------------------------
     REM 3) Stop STREAMER for this run
