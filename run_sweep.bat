@@ -79,8 +79,7 @@ if defined OLD_RECEIVER_PID (
   timeout /t 1 /nobreak >nul
 )
 echo [INFO] Starting receiver...
-set "RECV_ARGS=--carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output %RECEIVER_TIMING_CSV% --eval-output %RECEIVER_EVAL_CSV%"
-call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" "%RECEIVER%" "%RECV_ARGS%"
+call :start_bg_python "%PYTHON_EXE%" "%RECEIVER_LOG%" "%RECEIVER%" "--carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output %RECEIVER_TIMING_CSV% --eval-output %RECEIVER_EVAL_CSV%"
 
 REM PIDを特定して保存（コマンドラインに replay_from_udp.py が含まれる python を拾う）
 call :find_pid_by_script "replay_from_udp.py" RECEIVER_PID
@@ -147,8 +146,7 @@ for /L %%N in (10,10,100) do (
     echo [DIR] !RUNDIR!
 
     REM 1) Start STREAMER bg
-    set "STR_ARGS=--host %CARLA_HOST% --port %CARLA_PORT% --mode wait --role-prefix udp_replay: --include-velocity --frame-elapsed --wall-clock --include-object-id --include-monotonic --include-tick-wall-dt --output !STREAM_CSV! --timing-output !STREAM_TIMING_CSV! --timing-flush-every 10"
-    call :start_bg_python "%PYTHON_EXE%" "!STREAMER_LOG!" "%STREAMER%" "!STR_ARGS!"
+    call :start_bg_python "%PYTHON_EXE%" "!STREAMER_LOG!" "%STREAMER%" "--host %CARLA_HOST% --port %CARLA_PORT% --mode wait --role-prefix udp_replay: --include-velocity --frame-elapsed --wall-clock --include-object-id --include-monotonic --include-tick-wall-dt --output !STREAM_CSV! --timing-output !STREAM_TIMING_CSV! --timing-flush-every 10"
 
     call :find_pid_by_script "vehicle_state_stream.py" STREAMER_PID
     if not defined STREAMER_PID (
@@ -202,13 +200,24 @@ REM ==========================================================
 
 :start_bg_python
 REM usage: call :start_bg_python <python_exe> <log_path> <script_path> <arg_string>
+setlocal EnableExtensions DisableDelayedExpansion
 set "PYEXE=%~1"
 set "LOG=%~2"
 set "SCRIPT=%~3"
 set "ARGSTR=%~4"
-REM start uses a new cmd so redirection is reliable
-start "" /b "%ComSpec%" /s /c ""%PYEXE%" "%SCRIPT%" %ARGSTR% >>"%LOG%" 2>&1"
-exit /b 0
+
+REM unique temp cmd in OUTDIR
+set "TMP=%OUTDIR%\__bg_%RANDOM%_%RANDOM%.cmd"
+
+> "%TMP%" (
+  echo @echo off
+  echo "%PYEXE%" "%SCRIPT%" %ARGSTR% ^>^>"%LOG%" 2^>^&1
+)
+
+REM run temp cmd in background
+start "" /b "%ComSpec%" /c call "%TMP%"
+
+endlocal & exit /b 0
 
 :find_pid_by_script
 REM %1 = script substring, %2 = out var
