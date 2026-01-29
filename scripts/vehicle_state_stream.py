@@ -68,6 +68,21 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
             "CARLA actor ID"
         ),
     )
+    parser.add_argument(
+        "--role-prefix",
+        default="",
+        help="Only log actors whose role_name starts with this prefix",
+    )
+    parser.add_argument(
+        "--include-monotonic",
+        action="store_true",
+        help="Include time.monotonic() in the CSV output",
+    )
+    parser.add_argument(
+        "--include-tick-wall-dt",
+        action="store_true",
+        help="Include wall-clock delta between snapshots in the CSV output",
+    )
     return parser.parse_args(list(argv))
 
 
@@ -105,6 +120,9 @@ def stream_vehicle_states(
     include_velocity: bool,
     mode: str,
     control_state_file: str | None,
+    role_prefix: str,
+    include_monotonic: bool,
+    include_tick_wall_dt: bool,
 ) -> None:
     """Continuously write vehicle and pedestrian transforms with stable IDs to CSV."""
     client = carla.Client(host, port)
@@ -116,12 +134,18 @@ def stream_vehicle_states(
 
     writer = csv.writer(output)
     header_prefix = []
+    if include_tick_wall_dt:
+        header_prefix.append("tick_wall_dt")
+    if include_monotonic:
+        header_prefix.append("monotonic_time")
     if include_frame_elapsed:
         header_prefix.append("frame_elapsed")
     if include_wall_clock:
         header_prefix.append("wall_time")
     header = header_prefix + [
         "frame",
+        "external_id",
+        "role_name",
         "id",
         "carla_actor_id",
         "type",
@@ -140,6 +164,7 @@ def stream_vehicle_states(
 
     throttle_with_interval = interval > 0.0 and mode == "on-tick"
     last_emit_monotonic: float | None = None
+    last_snapshot_monotonic: float | None = None
 
     def load_control_overrides() -> Dict[int, Dict[str, object]]:
         if not control_state_file:
@@ -173,15 +198,23 @@ def stream_vehicle_states(
         return overrides
 
     def handle_snapshot(world_snapshot: carla.WorldSnapshot) -> None:
-        nonlocal last_emit_monotonic
+        nonlocal last_emit_monotonic, last_snapshot_monotonic
+
+        now_monotonic = time.monotonic()
+        tick_wall_dt = None
+        if last_snapshot_monotonic is not None:
+            tick_wall_dt = now_monotonic - last_snapshot_monotonic
+        last_snapshot_monotonic = now_monotonic
 
         control_overrides = load_control_overrides()
 
         if throttle_with_interval:
-            now = time.monotonic()
-            if last_emit_monotonic is not None and now - last_emit_monotonic < interval:
+            if (
+                last_emit_monotonic is not None
+                and now_monotonic - last_emit_monotonic < interval
+            ):
                 return
-            last_emit_monotonic = now
+            last_emit_monotonic = now_monotonic
 
         wall_time = time.time() if include_wall_clock else None
         frame_elapsed = (
@@ -197,6 +230,16 @@ def stream_vehicle_states(
             actor_id = actor.id
             if actor_id not in actor_to_custom_id:
                 actor_to_custom_id[actor_id] = next(id_sequence)
+
+            role_name = actor.attributes.get("role_name", "")
+            if role_prefix and not role_name.startswith(role_prefix):
+                continue
+
+            external_id = ""
+            if role_prefix and role_name.startswith(role_prefix):
+                external_id = role_name[len(role_prefix) :]
+            elif role_name.startswith("udp_replay:"):
+                external_id = role_name.split(":", 1)[1]
 
             transform = actor.get_transform()
             try:
@@ -214,12 +257,18 @@ def stream_vehicle_states(
             else:
                 control_mode = "autopilot" if autopilot_enabled else "direct"
             row_prefix = []
+            if include_tick_wall_dt:
+                row_prefix.append(tick_wall_dt)
+            if include_monotonic:
+                row_prefix.append(now_monotonic)
             if include_frame_elapsed:
                 row_prefix.append(frame_elapsed)
             if include_wall_clock:
                 row_prefix.append(wall_time)
             row = row_prefix + [
                 world_snapshot.frame,
+                external_id,
+                role_name,
                 actor_to_custom_id[actor_id],
                 actor_id,
                 actor.type_id,
@@ -286,6 +335,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.include_velocity,
             args.mode,
             args.control_state_file,
+            args.role_prefix,
+            args.include_monotonic,
+            args.include_tick_wall_dt,
         )
     finally:
         if close_output:
