@@ -7,6 +7,7 @@ import csv
 import json
 import logging
 import math
+import random
 import socket
 import sys
 import time
@@ -81,6 +82,11 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--timing-output",
         default="update_timings.csv",
         help="CSV file that stores frame and actor update timings",
+    )
+    parser.add_argument(
+        "--eval-output",
+        default=None,
+        help="Optional CSV file to store target vs CARLA state for RMSE evaluation",
     )
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -422,10 +428,7 @@ class EntityManager:
         for pattern in filters:
             matches = self._blueprint_library.filter(pattern)
             if matches:
-                blueprint = matches[0]
-                if blueprint.has_attribute("role_name"):
-                    blueprint.set_attribute("role_name", "udp_replay")
-                return blueprint
+                return random.choice(matches)
         LOGGER.warning("No blueprint found for type '%s'", object_type)
         return None
 
@@ -433,6 +436,8 @@ class EntityManager:
         blueprint = self._select_blueprint(state.object_type)
         if blueprint is None:
             return None
+        if blueprint.has_attribute("role_name"):
+            blueprint.set_attribute("role_name", f"udp_replay:{state.object_id}")
 
         transform = carla.Transform(
             carla.Location(x=state.x, y=state.y, z=state.z),
@@ -477,6 +482,9 @@ class EntityManager:
             record.max_speed = 3.0
 
         return record
+
+    def iter_entities(self) -> Iterable[Tuple[str, EntityRecord]]:
+        return self._entities.items()
 
     def apply_state(self, state: IncomingState, timestamp: float) -> bool:
         record = self._entities.get(state.object_id)
@@ -697,10 +705,34 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
     world = client.get_world()
     blueprint_library = world.get_blueprint_library()
     timing_file: Optional[TextIO] = None
+    eval_file: Optional[TextIO] = None
+    eval_writer: Optional[csv.writer] = None
     if args.measure_update_times:
         output_path = Path(args.timing_output).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         timing_file = output_path.open("w", newline="")
+    if args.eval_output:
+        eval_path = Path(args.eval_output).expanduser()
+        eval_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_file = eval_path.open("w", newline="")
+        eval_writer = csv.writer(eval_file)
+        eval_writer.writerow(
+            [
+                "t_monotonic",
+                "carla_frame",
+                "object_id",
+                "object_type",
+                "target_x",
+                "target_y",
+                "target_z",
+                "carla_x",
+                "carla_y",
+                "carla_z",
+                "err_2d",
+                "err_3d",
+            ]
+        )
+        eval_file.flush()
 
     manager = EntityManager(
         world,
@@ -778,6 +810,41 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
                     carla_frame_id = world.tick()
                     frame_completed = True
                     last_step_time = time.monotonic()
+                    if eval_writer is not None and eval_file is not None:
+                        eval_time = last_step_time
+                        for object_id, record in manager.iter_entities():
+                            if not record.actor.is_alive:
+                                continue
+                            target = record.target
+                            if target is None:
+                                continue
+                            try:
+                                transform = record.actor.get_transform()
+                            except RuntimeError:
+                                continue
+                            carla_loc = transform.location
+                            dx = carla_loc.x - target.x
+                            dy = carla_loc.y - target.y
+                            dz = carla_loc.z - target.z
+                            err_2d = math.sqrt(dx * dx + dy * dy)
+                            err_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                            eval_writer.writerow(
+                                [
+                                    f"{eval_time:.6f}",
+                                    carla_frame_id,
+                                    object_id,
+                                    record.object_type,
+                                    target.x,
+                                    target.y,
+                                    target.z,
+                                    carla_loc.x,
+                                    carla_loc.y,
+                                    carla_loc.z,
+                                    f"{err_2d:.6f}",
+                                    f"{err_3d:.6f}",
+                                ]
+                            )
+                        eval_file.flush()
 
                     now = last_step_time
                     if now >= next_cleanup:
@@ -796,6 +863,8 @@ def run(argv: Optional[Iterable[str]] = None) -> int:
         sock.close()
         if timing_file is not None:
             timing_file.close()
+        if eval_file is not None:
+            eval_file.close()
 
     return 0
 

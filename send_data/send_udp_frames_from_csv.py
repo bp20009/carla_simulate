@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         help="Last payload frame id to send (inclusive)",
     )
     parser.add_argument(
+        "--max-actors",
+        type=int,
+        default=None,
+        help="Limit number of actors per frame payload",
+    )
+    parser.add_argument(
         "csv_path",
         type=Path,
         help=(
@@ -160,6 +166,7 @@ def send_frames(
     frame_stride: int,
     start_frame: int | None,
     end_frame: int | None,
+    max_actors: int | None,
 ) -> None:
     host, port = destination
     sent_frames = 0
@@ -200,7 +207,7 @@ def send_frames(
                 )
                 continue
 
-            payload_dict = build_frame_payload(frame_id, frame_rows)
+            payload_dict = build_frame_payload(frame_id, frame_rows, max_actors=max_actors)
             payload_text = json.dumps(payload_dict, ensure_ascii=False)
             LOGGER.debug(
                 "Sending frame %s payload to %s:%d: %s", frame_id, host, port, payload_text
@@ -258,6 +265,7 @@ def main() -> None:
         frame_stride=args.frame_stride,
         start_frame=args.start_frame,
         end_frame=args.end_frame,
+        max_actors=args.max_actors,
     )
 
 
