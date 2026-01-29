@@ -47,6 +47,7 @@ set "RECEIVER_LOG=%OUTDIR%\receiver.log"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
+set "PS_WARMUP_CHECK=%OUTDIR%\warmup_check.ps1"
 
 echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
@@ -93,6 +94,39 @@ if errorlevel 1 (
   goto :cleanup
 )
 
+> "%PS_WARMUP_CHECK%" (
+  echo param(
+  echo   [Parameter(Mandatory=$true)][string]$Path,
+  echo   [Parameter(Mandatory=$true)][Int64]$Offset,
+  echo   [int]$TimeoutSec = 180,
+  echo   [int]$IntervalSec = 5
+  echo ^)
+  echo $ErrorActionPreference = 'Stop'
+  echo $sw = [Diagnostics.Stopwatch]::StartNew()
+  echo while($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+  echo   if(Test-Path $Path) {
+  echo     $len = (Get-Item $Path).Length
+  echo     if($len -gt $Offset) {
+  echo       $fs = [System.IO.File]::Open($Path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
+  echo       try {
+  echo         $fs.Seek($Offset,[System.IO.SeekOrigin]::Begin) ^| Out-Null
+  echo         $buf = New-Object byte[] ($len-$Offset)
+  echo         [void]$fs.Read($buf,0,$buf.Length)
+  echo         $text = [System.Text.Encoding]::UTF8.GetString($buf)
+  echo       } finally { $fs.Close() }
+  echo       $Offset = $len
+  echo       foreach($line in ($text -split "`r?`n")) {
+  echo         if(-not $line) { continue }
+  echo         $cols = $line.Split(',')
+  echo         if($cols.Length -ge 7 -and $cols[5] -ne '') { exit 0 }
+  echo       }
+  echo     }
+  echo   }
+  echo   Start-Sleep -Seconds $IntervalSec
+  echo }
+  echo exit 1
+)
+
 REM Give receiver time to boot
 timeout /t 2 /nobreak >nul
 
@@ -114,7 +148,12 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
     timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
   )
 
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$path='%RECEIVER_TIMING_CSV%'; $offset=[int64]%TIMING_OFFSET%; $timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%; $sw=[Diagnostics.Stopwatch]::StartNew(); while($sw.Elapsed.TotalSeconds -lt $timeout){ if(Test-Path $path){ $len=(Get-Item $path).Length; if($len -gt $offset){ $fs=[System.IO.File]::Open($path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite); try{ $fs.Seek($offset,[System.IO.SeekOrigin]::Begin) | Out-Null; $buf=New-Object byte[] ($len-$offset); [void]$fs.Read($buf,0,$buf.Length); $text=[System.Text.Encoding]::UTF8.GetString($buf); } finally { $fs.Close() } $offset=$len; foreach($line in ($text -split \"`r?`n\")){ if(-not $line){ continue } $cols=$line.Split(','); if($cols.Length -ge 7 -and $cols[5] -ne ''){ exit 0 } } } } Start-Sleep -Seconds $interval }; exit 1" >nul
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_WARMUP_CHECK%" ^
+    -Path "%RECEIVER_TIMING_CSV%" ^
+    -Offset %TIMING_OFFSET% ^
+    -TimeoutSec %WARMUP_CHECK_TIMEOUT_SEC% ^
+    -IntervalSec %WARMUP_CHECK_INTERVAL_SEC% ^
+    >nul
   if !errorlevel! EQU 0 (
     echo [INFO] Warmup succeeded (actor update detected).
     goto :warmup_done
