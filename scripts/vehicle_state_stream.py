@@ -74,6 +74,11 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
         help="Only log actors whose role_name starts with this prefix",
     )
     parser.add_argument(
+        "--include-object-id",
+        action="store_true",
+        help="Include object_id alias column (same as external_id) in the CSV output",
+    )
+    parser.add_argument(
         "--include-monotonic",
         action="store_true",
         help="Include time.monotonic() in the CSV output",
@@ -82,6 +87,17 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
         "--include-tick-wall-dt",
         action="store_true",
         help="Include wall-clock delta between snapshots in the CSV output",
+    )
+    parser.add_argument(
+        "--timing-output",
+        default=None,
+        help="Optional CSV file to write per-frame timing measurements",
+    )
+    parser.add_argument(
+        "--timing-flush-every",
+        default=1,
+        type=int,
+        help="Flush timing output every N frames (default: 1)",
     )
     return parser.parse_args(list(argv))
 
@@ -121,8 +137,11 @@ def stream_vehicle_states(
     mode: str,
     control_state_file: str | None,
     role_prefix: str,
+    include_object_id: bool,
     include_monotonic: bool,
     include_tick_wall_dt: bool,
+    timing_output: TextIO | None,
+    timing_flush_every: int,
 ) -> None:
     """Continuously write vehicle and pedestrian transforms with stable IDs to CSV."""
     client = carla.Client(host, port)
@@ -145,17 +164,23 @@ def stream_vehicle_states(
     header = header_prefix + [
         "frame",
         "external_id",
-        "role_name",
-        "id",
-        "carla_actor_id",
-        "type",
-        "location_x",
-        "location_y",
-        "location_z",
-        "rotation_roll",
-        "rotation_pitch",
-        "rotation_yaw",
     ]
+    if include_object_id:
+        header.append("object_id")
+    header.extend(
+        [
+            "role_name",
+            "id",
+            "carla_actor_id",
+            "type",
+            "location_x",
+            "location_y",
+            "location_z",
+            "rotation_roll",
+            "rotation_pitch",
+            "rotation_yaw",
+        ]
+    )
     if include_velocity:
         header.extend(["velocity_x", "velocity_y", "velocity_z"])
     header.extend(["autopilot_enabled", "control_mode"])
@@ -165,6 +190,15 @@ def stream_vehicle_states(
     throttle_with_interval = interval > 0.0 and mode == "on-tick"
     last_emit_monotonic: float | None = None
     last_snapshot_monotonic: float | None = None
+    timing_writer = None
+    timing_frame_count = 0
+    if timing_output is not None:
+        timing_writer = csv.writer(timing_output)
+        timing_header = ["t_monotonic", "carla_frame", "frame_processing_ms"]
+        if include_tick_wall_dt:
+            timing_header.append("tick_wall_dt_ms")
+        timing_writer.writerow(timing_header)
+        timing_output.flush()
 
     def load_control_overrides() -> Dict[int, Dict[str, object]]:
         if not control_state_file:
@@ -199,12 +233,14 @@ def stream_vehicle_states(
 
     def handle_snapshot(world_snapshot: carla.WorldSnapshot) -> None:
         nonlocal last_emit_monotonic, last_snapshot_monotonic
+        nonlocal timing_frame_count
 
         now_monotonic = time.monotonic()
         tick_wall_dt = None
         if last_snapshot_monotonic is not None:
             tick_wall_dt = now_monotonic - last_snapshot_monotonic
         last_snapshot_monotonic = now_monotonic
+        processing_start_ns = time.perf_counter_ns()
 
         control_overrides = load_control_overrides()
 
@@ -268,17 +304,23 @@ def stream_vehicle_states(
             row = row_prefix + [
                 world_snapshot.frame,
                 external_id,
-                role_name,
-                actor_to_custom_id[actor_id],
-                actor_id,
-                actor.type_id,
-                transform.location.x,
-                transform.location.y,
-                transform.location.z,
-                transform.rotation.roll,
-                transform.rotation.pitch,
-                transform.rotation.yaw,
             ]
+            if include_object_id:
+                row.append(external_id)
+            row.extend(
+                [
+                    role_name,
+                    actor_to_custom_id[actor_id],
+                    actor_id,
+                    actor.type_id,
+                    transform.location.x,
+                    transform.location.y,
+                    transform.location.z,
+                    transform.rotation.roll,
+                    transform.rotation.pitch,
+                    transform.rotation.yaw,
+                ]
+            )
             if include_velocity:
                 row.extend(
                     [
@@ -293,6 +335,21 @@ def stream_vehicle_states(
 
         if wrote_frame:
             output.flush()
+        processing_end_ns = time.perf_counter_ns()
+        if timing_writer is not None:
+            frame_processing_ms = (processing_end_ns - processing_start_ns) / 1_000_000.0
+            timing_row = [
+                now_monotonic,
+                world_snapshot.frame,
+                frame_processing_ms,
+            ]
+            if include_tick_wall_dt:
+                timing_row.append(tick_wall_dt * 1000.0 if tick_wall_dt is not None else None)
+            timing_writer.writerow(timing_row)
+            timing_frame_count += 1
+            if timing_output is not None and timing_flush_every > 0:
+                if timing_frame_count % timing_flush_every == 0:
+                    timing_output.flush()
 
     try:
         if mode == "on-tick":
@@ -322,6 +379,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     else:
         output_stream = open(args.output, "w", newline="")
         close_output = True
+    if args.timing_output:
+        timing_output = open(args.timing_output, "w", newline="")
+    else:
+        timing_output = None
 
     try:
         stream_vehicle_states(
@@ -336,12 +397,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.mode,
             args.control_state_file,
             args.role_prefix,
+            args.include_object_id,
             args.include_monotonic,
             args.include_tick_wall_dt,
+            timing_output,
+            args.timing_flush_every,
         )
     finally:
         if close_output:
             output_stream.close()
+        if timing_output is not None and timing_output is not output_stream:
+            timing_output.close()
     return 0
 
 
