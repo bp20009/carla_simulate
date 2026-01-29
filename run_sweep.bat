@@ -29,7 +29,6 @@ if not exist "%CSV_PATH%" (
   echo [ERROR] CSV not found: %CSV_PATH%
   goto :cleanup
 )
-
 if not exist "%SENDER%" (
   echo [ERROR] sender not found: %SENDER%
   goto :cleanup
@@ -50,7 +49,7 @@ REM Receiver params (fixed)
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
-REM Warmup
+REM Warmup (frame range OK. id管理ではないので残す)
 set "WARMUP_START_FRAME=0"
 set "WARMUP_END_FRAME=1800"
 set "WARMUP_INTERVAL=0.1"
@@ -59,7 +58,7 @@ set "WARMUP_CHECK_TIMEOUT_SEC=180"
 set "WARMUP_CHECK_INTERVAL_SEC=5"
 set "WARMUP_MAX_ATTEMPTS=3"
 
-REM Sweep
+REM Sweep (senderは常に全送信。ここではTsだけ振る)
 set "TS_LIST=0.10 1.00"
 set "COOLDOWN_SEC=5"
 
@@ -70,7 +69,8 @@ for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss
 set "OUTDIR=%ROOT%sweep_results_%DT_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
-set "RECEIVER_LOG=%OUTDIR%\receiver.log"
+set "RECEIVER_STDOUT=%OUTDIR%\receiver_stdout.log"
+set "RECEIVER_STDERR=%OUTDIR%\receiver_stderr.log"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
@@ -92,10 +92,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" >nul 2>nul
 
 REM ==========================================================
-REM Start receiver via PowerShell one-liner, capture PID robustly
+REM Start receiver (stdout/stderr separate. loggingはstderr側に出がち)
 REM ==========================================================
 echo [INFO] Starting receiver...
-type nul > "%RECEIVER_LOG%"
+type nul > "%RECEIVER_STDOUT%"
+type nul > "%RECEIVER_STDERR%"
 set "RECEIVER_PID="
 
 for /f "usebackq delims=" %%P in (`
@@ -114,7 +115,7 @@ for /f "usebackq delims=" %%P in (`
     "    '--timing-output','%RECEIVER_TIMING_CSV%'," ^
     "    '--eval-output','%RECEIVER_EVAL_CSV%'" ^
     "  );" ^
-    "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%';" ^
+    "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
     "  Start-Sleep -Milliseconds 300;" ^
     "  if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode; exit 0 }" ^
     "  $p.Id" ^
@@ -127,8 +128,10 @@ echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
   echo [ERROR] Failed to start receiver. Reason:
   echo %RECEIVER_PID%
-  echo [ERROR] receiver.log:
-  if exist "%RECEIVER_LOG%" type "%RECEIVER_LOG%"
+  echo [ERROR] receiver_stderr.log:
+  if exist "%RECEIVER_STDERR%" type "%RECEIVER_STDERR%"
+  echo [ERROR] receiver_stdout.log:
+  if exist "%RECEIVER_STDOUT%" type "%RECEIVER_STDOUT%"
   goto :cleanup
 )
 
@@ -138,15 +141,16 @@ echo [INFO] receiver PID=%RECEIVER_PID%
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup: send short segment and confirm "(>=1 actor updates)" in receiver.log
+REM Warmup: sender短区間送信 + receiverログに "(>=1 actor updates)" が出るのを待つ
+REM   INFOログはstderrに出ることが多いので両方監視
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
 
-  set "LOG_OFFSET=0"
-  if exist "%RECEIVER_LOG%" (
-    for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_LOG%'').Length"') do set "LOG_OFFSET=%%S"
-  )
+  set "OFF_OUT=0"
+  set "OFF_ERR=0"
+  if exist "%RECEIVER_STDOUT%" for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_STDOUT%'').Length"') do set "OFF_OUT=%%S"
+  if exist "%RECEIVER_STDERR%" for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_STDERR%'').Length"') do set "OFF_ERR=%%S"
 
   set "WARMUP_SENDER_LOG=%OUTDIR%\warmup_sender_%%A.log"
   type nul > "!WARMUP_SENDER_LOG!"
@@ -160,7 +164,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
 
   if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
 
-  call :wait_actor_updates_in_log "%RECEIVER_LOG%" !LOG_OFFSET! %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
+  call :wait_actor_updates_in_two_logs "%RECEIVER_STDOUT%" !OFF_OUT! "%RECEIVER_STDERR%" !OFF_ERR! %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
   if !errorlevel! EQU 0 (
     echo [INFO] Warmup succeeded.
     goto :warmup_done
@@ -174,79 +178,79 @@ goto :cleanup
 :warmup_done
 
 REM ==========================================================
-REM Sweep runs (restart streamer + sender; receiver stays alive)
+REM Sweep runs (receiver stays. streamer + sender per Ts)
+REM   senderは全送信（max-actors等は使わない）
 REM ==========================================================
-for /L %%N in (10,10,100) do (
-  for %%T in (%TS_LIST%) do (
-    set "TAG=N%%N_Ts%%T"
-    set "RUNDIR=%OUTDIR%\!TAG!"
-    mkdir "!RUNDIR!" 2>nul
+for %%T in (%TS_LIST%) do (
+  set "TAG=Ts%%T"
+  set "RUNDIR=%OUTDIR%\!TAG!"
+  mkdir "!RUNDIR!" 2>nul
 
-    set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
-    set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
-    set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
-    set "STREAMER_LOG=!RUNDIR!\streamer_!TAG!.log"
+  set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
+  set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
+  set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
+  set "STREAMER_STDOUT=!RUNDIR!\streamer_stdout_!TAG!.log"
+  set "STREAMER_STDERR=!RUNDIR!\streamer_stderr_!TAG!.log"
 
-    echo ============================================================
-    echo [RUN] !TAG!
-    echo [DIR] !RUNDIR!
+  echo ============================================================
+  echo [RUN] !TAG!
+  echo [DIR] !RUNDIR!
 
-    type nul > "!STREAMER_LOG!"
-    set "STREAMER_PID="
+  type nul > "!STREAMER_STDOUT!"
+  type nul > "!STREAMER_STDERR!"
+  set "STREAMER_PID="
 
-    for /f "usebackq delims=" %%P in (`
-      powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "$ErrorActionPreference='Stop';" ^
-        "try{" ^
-        "  $args=@(" ^
-        "    '%STREAMER%'," ^
-        "    '--host','%CARLA_HOST%'," ^
-        "    '--port','%CARLA_PORT%'," ^
-        "    '--mode','wait'," ^
-        "    '--role-prefix','udp_replay:'," ^
-        "    '--include-velocity'," ^
-        "    '--frame-elapsed'," ^
-        "    '--wall-clock'," ^
-        "    '--include-object-id'," ^
-        "    '--include-monotonic'," ^
-        "    '--include-tick-wall-dt'," ^
-        "    '--output','!STREAM_CSV!'," ^
-        "    '--timing-output','!STREAM_TIMING_CSV!'," ^
-        "    '--timing-flush-every','10'" ^
-        "  );" ^
-        "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!';" ^
-        "  Start-Sleep -Milliseconds 200;" ^
-        "  if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode; exit 0 }" ^
-        "  $p.Id" ^
-        "} catch { 'START_FAILED: ' + $_.Exception.Message }"
-    `) do set "STREAMER_PID=%%P"
+  for /f "usebackq delims=" %%P in (`
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$ErrorActionPreference='Stop';" ^
+      "try{" ^
+      "  $args=@(" ^
+      "    '%STREAMER%'," ^
+      "    '--host','%CARLA_HOST%'," ^
+      "    '--port','%CARLA_PORT%'," ^
+      "    '--mode','wait'," ^
+      "    '--role-prefix','udp_replay:'," ^
+      "    '--include-velocity'," ^
+      "    '--frame-elapsed'," ^
+      "    '--wall-clock'," ^
+      "    '--include-object-id'," ^
+      "    '--include-monotonic'," ^
+      "    '--include-tick-wall-dt'," ^
+      "    '--output','!STREAM_CSV!'," ^
+      "    '--timing-output','!STREAM_TIMING_CSV!'," ^
+      "    '--timing-flush-every','10'" ^
+      "  );" ^
+      "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR!';" ^
+      "  Start-Sleep -Milliseconds 200;" ^
+      "  if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode; exit 0 }" ^
+      "  $p.Id" ^
+      "} catch { 'START_FAILED: ' + $_.Exception.Message }"
+  `) do set "STREAMER_PID=%%P"
 
-    echo [INFO] streamer start result: !STREAMER_PID!
-    echo !STREAMER_PID!| findstr /r "^[0-9][0-9]*$" >nul
-    if errorlevel 1 (
-      echo [ERROR] Failed to start streamer. Reason:
-      echo !STREAMER_PID!
-      echo [ERROR] streamer.log:
-      if exist "!STREAMER_LOG!" type "!STREAMER_LOG!"
-      goto :cleanup
-    )
-
-    timeout /t 1 /nobreak >nul
-
-    set "FRAME_STRIDE=1"
-    if "%%T"=="1.00" set "FRAME_STRIDE=10"
-
-    echo [INFO] Sending... N=%%N Ts=%%T stride=!FRAME_STRIDE!
-    "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
-      --host "%UDP_HOST%" --port "%UDP_PORT%" ^
-      --interval %%T --frame-stride !FRAME_STRIDE! ^
-      > "!SENDER_LOG!" 2>&1
-
-    taskkill /PID !STREAMER_PID! /T /F >nul 2>&1
-
-    timeout /t %COOLDOWN_SEC% /nobreak >nul
-    echo [DONE] !TAG!
+  echo [INFO] streamer start result: !STREAMER_PID!
+  echo !STREAMER_PID!| findstr /r "^[0-9][0-9]*$" >nul
+  if errorlevel 1 (
+    echo [ERROR] Failed to start streamer. Reason:
+    echo !STREAMER_PID!
+    echo [ERROR] streamer_stderr:
+    if exist "!STREAMER_STDERR!" type "!STREAMER_STDERR!"
+    echo [ERROR] streamer_stdout:
+    if exist "!STREAMER_STDOUT!" type "!STREAMER_STDOUT!"
+    goto :cleanup
   )
+
+  timeout /t 1 /nobreak >nul
+
+  echo [INFO] Sending... Ts=%%T
+  "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
+    --host "%UDP_HOST%" --port "%UDP_PORT%" ^
+    --interval %%T ^
+    > "!SENDER_LOG!" 2>&1
+
+  taskkill /PID !STREAMER_PID! /T /F >nul 2>&1
+
+  timeout /t %COOLDOWN_SEC% /nobreak >nul
+  echo [DONE] !TAG!
 )
 
 echo [INFO] Stopping receiver...
@@ -280,26 +284,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
 endlocal & exit /b 0
 
-:wait_actor_updates_in_log
-REM args: %1 log_path, %2 offset_bytes, %3 timeout_sec, %4 interval_sec
+:wait_actor_updates_in_two_logs
+REM args:
+REM   %1 log1_path %2 off1_bytes %3 log2_path %4 off2_bytes %5 timeout_sec %6 interval_sec
 setlocal EnableDelayedExpansion
-set "LOG=%~1"
-set "OFF=%~2"
-set "TMO=%~3"
-set "INT=%~4"
+set "L1=%~1"
+set "O1=%~2"
+set "L2=%~3"
+set "O2=%~4"
+set "TMO=%~5"
+set "INT=%~6"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$path='%LOG%'; $off=[int64]%OFF%; $timeout=%TMO%; $interval=%INT%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
+  "$l1='%L1%'; $o1=[int64]%O1%; $l2='%L2%'; $o2=[int64]%O2%; $timeout=%TMO%; $interval=%INT%;" ^
+  "$re='\(([1-9][0-9]*) actor updates\)';" ^
+  "$sw=[Diagnostics.Stopwatch]::StartNew();" ^
+  "function ReadNew([string]$p,[ref]$off){" ^
+  "  if(-not (Test-Path $p)){ return '' }" ^
+  "  $len=(Get-Item $p).Length; if($len -le $off.Value){ return '' }" ^
+  "  $fs=[System.IO.File]::Open($p,'Open','Read','ReadWrite');" ^
+  "  try{ $fs.Seek($off.Value,[System.IO.SeekOrigin]::Begin)|Out-Null; $buf=New-Object byte[] ($len-$off.Value); [void]$fs.Read($buf,0,$buf.Length); } finally { $fs.Close() }" ^
+  "  $off.Value=$len; return [Text.Encoding]::UTF8.GetString($buf)" ^
+  "}" ^
   "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
-  "  if(Test-Path $path){" ^
-  "    $len=(Get-Item $path).Length;" ^
-  "    if($len -gt $off){" ^
-  "      $fs=[System.IO.File]::Open($path,'Open','Read','ReadWrite');" ^
-  "      try{ $fs.Seek($off,[System.IO.SeekOrigin]::Begin)|Out-Null; $buf=New-Object byte[] ($len-$off); [void]$fs.Read($buf,0,$buf.Length); $txt=[Text.Encoding]::UTF8.GetString($buf) } finally { $fs.Close() }" ^
-  "      if($txt -match '\(([1-9][0-9]*) actor updates\)'){ exit 0 }" ^
-  "      $off=$len" ^
-  "    }" ^
-  "  }" ^
+  "  $t1=ReadNew $l1 ([ref]$o1); if($t1 -match $re){ exit 0 }" ^
+  "  $t2=ReadNew $l2 ([ref]$o2); if($t2 -match $re){ exit 0 }" ^
   "  Start-Sleep -Seconds $interval" ^
   "}" ^
   "exit 1" >nul
