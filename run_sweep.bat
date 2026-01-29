@@ -151,41 +151,50 @@ echo [INFO] receiver PID=%RECEIVER_PID%
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup: sender短区間送信 + receiverログに "(>=1 actor updates)" が出るのを待つ
-REM   INFOログはstderrに出ることが多いので両方監視
+REM Warmup: send and confirm "(>=1 actor updates)" in receiver *stderr*
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
+  echo [INFO] Warmup send interval=%WARMUP_INTERVAL%
 
-  set "OFF_OUT=0"
-  set "OFF_ERR=0"
-  if exist "%RECEIVER_STDOUT%" for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_STDOUT%'').Length"') do set "OFF_OUT=%%S"
-  if exist "%RECEIVER_STDERR%" for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_STDERR%'').Length"') do set "OFF_ERR=%%S"
+  REM 現在の receiver_stderr のバイト長を offset にする
+  set "LOG_OFFSET=0"
+  if exist "%RECEIVER_STDERR%" (
+    for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_STDERR%'').Length"') do set "LOG_OFFSET=%%S"
+  )
 
-  set "WARMUP_SENDER_LOG=%OUTDIR%\warmup_sender_%%A.log"
-  type nul > "!WARMUP_SENDER_LOG!"
-
-  echo [INFO] Warmup send frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
+  REM warmup sender: 全送信（start/end は使わない）
   "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
     --host "%UDP_HOST%" --port "%UDP_PORT%" ^
     --interval %WARMUP_INTERVAL% ^
-    --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% ^
-    > "!WARMUP_SENDER_LOG!" 2>&1
+    > "%OUTDIR%\warmup_sender.log" 2>&1
+
+  REM 送信0ならここで即死（warmupが通らないのはsenderのせい）
+  findstr /i /c:"Sent 0 frames" "%OUTDIR%\warmup_sender.log" >nul 2>&1
+  if !errorlevel! EQU 0 (
+    echo [ERROR] Warmup sender sent 0 frames. Check %OUTDIR%\warmup_sender.log
+    type "%OUTDIR%\warmup_sender.log"
+    goto :cleanup
+  )
 
   if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
 
-  call :wait_actor_updates_in_two_logs "%RECEIVER_STDOUT%" !OFF_OUT! "%RECEIVER_STDERR%" !OFF_ERR! %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
+  call :wait_actor_updates_in_log "%RECEIVER_STDERR%" !LOG_OFFSET! %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
   if !errorlevel! EQU 0 (
     echo [INFO] Warmup succeeded.
     goto :warmup_done
   )
+
   echo [WARN] Warmup not confirmed. retry...
+  echo [INFO] receiver_stderr tail:
+  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 10 }"
 )
 
 echo [ERROR] Warmup failed.
 goto :cleanup
 
 :warmup_done
+
 
 REM ==========================================================
 REM Sweep runs (receiver stays. streamer + sender per Ts)
@@ -294,31 +303,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
 endlocal & exit /b 0
 
-:wait_actor_updates_in_two_logs
-REM args:
-REM   %1 log1_path %2 off1_bytes %3 log2_path %4 off2_bytes %5 timeout_sec %6 interval_sec
+:wait_actor_updates_in_log
+REM args: %1 log_path, %2 offset_bytes, %3 timeout_sec, %4 interval_sec
 setlocal EnableDelayedExpansion
-set "L1=%~1"
-set "O1=%~2"
-set "L2=%~3"
-set "O2=%~4"
-set "TMO=%~5"
-set "INT=%~6"
+set "LOG=%~1"
+set "OFF=%~2"
+set "TMO=%~3"
+set "INT=%~4"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$l1='%L1%'; $o1=[int64]%O1%; $l2='%L2%'; $o2=[int64]%O2%; $timeout=%TMO%; $interval=%INT%;" ^
-  "$re='\(([1-9][0-9]*) actor updates\)';" ^
-  "$sw=[Diagnostics.Stopwatch]::StartNew();" ^
-  "function ReadNew([string]$p,[ref]$off){" ^
-  "  if(-not (Test-Path $p)){ return '' }" ^
-  "  $len=(Get-Item $p).Length; if($len -le $off.Value){ return '' }" ^
-  "  $fs=[System.IO.File]::Open($p,'Open','Read','ReadWrite');" ^
-  "  try{ $fs.Seek($off.Value,[System.IO.SeekOrigin]::Begin)|Out-Null; $buf=New-Object byte[] ($len-$off.Value); [void]$fs.Read($buf,0,$buf.Length); } finally { $fs.Close() }" ^
-  "  $off.Value=$len; return [Text.Encoding]::UTF8.GetString($buf)" ^
-  "}" ^
+  "$path='%LOG%'; $off=[int64]%OFF%; $timeout=%TMO%; $interval=%INT%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
   "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
-  "  $t1=ReadNew $l1 ([ref]$o1); if($t1 -match $re){ exit 0 }" ^
-  "  $t2=ReadNew $l2 ([ref]$o2); if($t2 -match $re){ exit 0 }" ^
+  "  if(Test-Path $path){" ^
+  "    $len=(Get-Item $path).Length;" ^
+  "    if($len -gt $off){" ^
+  "      $fs=[System.IO.File]::Open($path,'Open','Read','ReadWrite');" ^
+  "      try{ $fs.Seek($off,[System.IO.SeekOrigin]::Begin)|Out-Null; $buf=New-Object byte[] ($len-$off); [void]$fs.Read($buf,0,$buf.Length); $txt=[Text.Encoding]::UTF8.GetString($buf) } finally { $fs.Close() }" ^
+  "      if($txt -match '\(([1-9][0-9]*) actor updates\)'){ exit 0 }" ^
+  "      $off=$len" ^
+  "    }" ^
+  "  }" ^
   "  Start-Sleep -Seconds $interval" ^
   "}" ^
   "exit 1" >nul
