@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
+pushd "%~dp0"
 
 REM ==========================================================
 REM User config
@@ -16,9 +17,10 @@ REM   (e.g. output from scripts/convert_vehicle_state_csv.py)
 set "CSV_PATH=send_data\exp_300.csv"
 
 REM Script paths
-set "SENDER=send_data\send_udp_frames_from_csv.py"
-set "RECEIVER=scripts\udp_replay\replay_from_udp.py"
-set "STREAMER=scripts\vehicle_state_stream.py"
+set "ROOT=%~dp0"
+set "SENDER=%ROOT%send_data\send_udp_frames_from_csv.py"
+set "RECEIVER=%ROOT%scripts\udp_replay\replay_from_udp.py"
+set "STREAMER=%ROOT%scripts\vehicle_state_stream.py"
 
 REM Receiver fixed delta (do not sweep)
 set "FIXED_DELTA=0.05"
@@ -62,6 +64,8 @@ REM ==========================================================
 set "PS_START_RECEIVER=%OUTDIR%\start_receiver.ps1"
 > "%PS_START_RECEIVER%" (
   echo $ErrorActionPreference = 'Stop'
+  echo $wd = '%CD%'
+  echo $python = 'python'
   echo $argsList = @(
   echo   '%RECEIVER%',
   echo   '--carla-host','%CARLA_HOST%',
@@ -74,12 +78,18 @@ set "PS_START_RECEIVER=%OUTDIR%\start_receiver.ps1"
   echo   '--timing-output','%RECEIVER_TIMING_CSV%',
   echo   '--eval-output','%RECEIVER_EVAL_CSV%'
   echo ^)
-  echo $p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList $argsList -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'
+  echo $p = Start-Process -PassThru -NoNewWindow -WorkingDirectory $wd -FilePath $python -ArgumentList $argsList -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'
+  echo Start-Sleep -Seconds 1
+  echo if($p.HasExited){
+  echo   Add-Content -Path '%RECEIVER_LOG%' -Value ("[BAT] receiver exited immediately. ExitCode=" + $p.ExitCode)
+  echo   exit 2
+  echo }
   echo Set-Content -Encoding ascii -Path '%RECEIVER_PID_FILE%' -Value $p.Id
 )
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_START_RECEIVER%" >nul
 if errorlevel 1 (
   echo [ERROR] Failed to start receiver. Check %RECEIVER_LOG%
+  type "%RECEIVER_LOG%"
   goto :cleanup
 )
 
@@ -195,10 +205,12 @@ REM ==========================================================
 for /f %%P in ('type "%RECEIVER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&1
 
 echo [ALL DONE] %OUTDIR%
+popd
 endlocal
 exit /b 0
 
 :cleanup
 for /f %%P in ('type "%RECEIVER_PID_FILE%"') do taskkill /PID %%P /T /F >nul 2>&1
+popd
 endlocal
 exit /b 1
