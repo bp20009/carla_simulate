@@ -76,29 +76,39 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" >nul 2>nul
 
 REM ==========================================================
-REM Start receiver (BAT-only async), then get PID by UDP port
+REM Start receiver via PowerShell (no start /b), capture PID
 REM ==========================================================
 echo [INFO] Starting receiver...
 del /q "%RECEIVER_LOG%" >nul 2>&1
-
-start "" /b "%PYTHON_EXE%" "%RECEIVER%" ^
-  --carla-host "%CARLA_HOST%" --carla-port "%CARLA_PORT%" ^
-  --listen-host "%LISTEN_HOST%" --listen-port "%UDP_PORT%" ^
-  --fixed-delta "%FIXED_DELTA%" --stale-timeout "%STALE_TIMEOUT%" ^
-  --measure-update-times ^
-  --timing-output "%RECEIVER_TIMING_CSV%" ^
-  --eval-output "%RECEIVER_EVAL_CSV%" ^
-  1>>"%RECEIVER_LOG%" 2>&1
-
-REM wait and resolve PID from UDP port
 set "RECEIVER_PID="
-call :wait_pid_by_udp_port "%UDP_PORT%" 20 RECEIVER_PID
+
+for /f %%P in ('
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ErrorActionPreference='Stop';" ^
+    "$args=@(" ^
+      "'%RECEIVER%'," ^
+      "'--carla-host','%CARLA_HOST%'," ^
+      "'--carla-port','%CARLA_PORT%'," ^
+      "'--listen-host','%LISTEN_HOST%'," ^
+      "'--listen-port','%UDP_PORT%'," ^
+      "'--fixed-delta','%FIXED_DELTA%'," ^
+      "'--stale-timeout','%STALE_TIMEOUT%'," ^
+      "'--measure-update-times'," ^
+      "'--timing-output','%RECEIVER_TIMING_CSV%'," ^
+      "'--eval-output','%RECEIVER_EVAL_CSV%'" ^
+    ");" ^
+    "$p=Start-Process -PassThru -NoNewWindow -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%';" ^
+    "Start-Sleep -Milliseconds 300;" ^
+    "if($p.HasExited){ exit 2 };" ^
+    "$p.Id"
+') do set "RECEIVER_PID=%%P"
+
 if not defined RECEIVER_PID (
-  echo [ERROR] Failed to start receiver (PID not found by port %UDP_PORT%).
-  echo [ERROR] receiver.log:
+  echo [ERROR] Failed to start receiver. Check log:
   if exist "%RECEIVER_LOG%" type "%RECEIVER_LOG%"
   goto :cleanup
 )
+
 echo %RECEIVER_PID% > "%RECEIVER_PID_FILE%"
 echo [INFO] receiver PID=%RECEIVER_PID%
 
@@ -154,15 +164,32 @@ for /L %%N in (10,10,100) do (
     echo [RUN] !TAG!
     echo [DIR] !RUNDIR!
 
-    REM start streamer (use PowerShell one-liner, no ps1 file)
     del /q "!STREAMER_LOG!" >nul 2>&1
     set "STREAMER_PID="
+
     for /f %%P in ('
       powershell -NoProfile -ExecutionPolicy Bypass -Command ^
         "$ErrorActionPreference='Stop';" ^
-        "$args=@('%STREAMER%','--host','%CARLA_HOST%','--port','%CARLA_PORT%','--mode','wait','--role-prefix','udp_replay:','--include-velocity','--frame-elapsed','--wall-clock','--include-object-id','--include-monotonic','--include-tick-wall-dt','--output','!STREAM_CSV!','--timing-output','!STREAM_TIMING_CSV!','--timing-flush-every','10');" ^
+        "$args=@(" ^
+          "'%STREAMER%'," ^
+          "'--host','%CARLA_HOST%'," ^
+          "'--port','%CARLA_PORT%'," ^
+          "'--mode','wait'," ^
+          "'--role-prefix','udp_replay:'," ^
+          "'--include-velocity'," ^
+          "'--frame-elapsed'," ^
+          "'--wall-clock'," ^
+          "'--include-object-id'," ^
+          "'--include-monotonic'," ^
+          "'--include-tick-wall-dt'," ^
+          "'--output','!STREAM_CSV!'," ^
+          "'--timing-output','!STREAM_TIMING_CSV!'," ^
+          "'--timing-flush-every','10'" ^
+        ");" ^
         "$p=Start-Process -PassThru -NoNewWindow -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!';" ^
-        "Start-Sleep -Milliseconds 200; if($p.HasExited){ exit 2 } ; $p.Id"
+        "Start-Sleep -Milliseconds 200;" ^
+        "if($p.HasExited){ exit 2 };" ^
+        "$p.Id"
     ') do set "STREAMER_PID=%%P"
 
     if not defined STREAMER_PID (
@@ -219,32 +246,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$procs=Get-CimInstance Win32_Process -Filter ""Name='python.exe'"" | Where-Object { $_.CommandLine -like ('*' + $sub + '*') };" ^
   "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
 endlocal & exit /b 0
-
-:wait_pid_by_udp_port
-REM args: %1 port, %2 timeoutSec, %3 outVar
-setlocal EnableDelayedExpansion
-set "PORT=%~1"
-set /a "TMO=%~2"
-set "OUTVAR=%~3"
-set /a "EL=0"
-
-:pid_wait_loop
-set "PID="
-for /f %%P in ('powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p=%PORT%; $e=Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue | Select-Object -First 1;" ^
-  "if($e){ $e.OwningProcess }"') do set "PID=%%P"
-
-if defined PID (
-  endlocal & set "%OUTVAR%=%PID%" & exit /b 0
-)
-
-if !EL! GEQ !TMO! (
-  endlocal & set "%OUTVAR%=" & exit /b 1
-)
-
-timeout /t 1 /nobreak >nul
-set /a "EL+=1"
-goto :pid_wait_loop
 
 :wait_actor_updates_in_log
 REM args: %1 log_path, %2 offset_bytes, %3 timeout_sec, %4 interval_sec
