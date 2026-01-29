@@ -37,9 +37,8 @@ set "STALE_TIMEOUT=2.0"
 set "COOLDOWN_SEC=3"
 
 REM Output root dir
-for /f "tokens=1-3 delims=/- " %%a in ("%date%") do set "DATE_TAG=%%a%%b%%c"
-for /f "tokens=1-3 delims=:." %%a in ("%time%") do set "TIME_TAG=%%a%%b%%c"
-set "OUTDIR=sweep_results_%DATE_TAG%_%TIME_TAG%"
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "DT_TAG=%%i"
+set "OUTDIR=sweep_results_%DT_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_LOG=%OUTDIR%\receiver.log"
@@ -58,9 +57,31 @@ REM ==========================================================
 set "TS_LIST=0.10 1.00"
 
 REM ==========================================================
-REM Start RECEIVER once (keep alive for entire sweep)
+REM Start RECEIVER once (keep alive for entire sweep) - robust
 REM ==========================================================
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Start-Process -PassThru -NoNewWindow -FilePath python -ArgumentList @('%RECEIVER%','--carla-host','%CARLA_HOST%','--carla-port','%CARLA_PORT%','--listen-host','%LISTEN_HOST%','--listen-port','%UDP_PORT%','--fixed-delta','%FIXED_DELTA%','--stale-timeout','%STALE_TIMEOUT%','--measure-update-times','--timing-output','%RECEIVER_TIMING_CSV%','--eval-output','%RECEIVER_EVAL_CSV%') -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'; $p.Id | Set-Content -Encoding ascii '%RECEIVER_PID_FILE%'" >nul
+set "PS_START_RECEIVER=%OUTDIR%\start_receiver.ps1"
+> "%PS_START_RECEIVER%" (
+  echo $ErrorActionPreference = 'Stop'
+  echo $argsList = @(
+  echo   '%RECEIVER%',
+  echo   '--carla-host','%CARLA_HOST%',
+  echo   '--carla-port','%CARLA_PORT%',
+  echo   '--listen-host','%LISTEN_HOST%',
+  echo   '--listen-port','%UDP_PORT%',
+  echo   '--fixed-delta','%FIXED_DELTA%',
+  echo   '--stale-timeout','%STALE_TIMEOUT%',
+  echo   '--measure-update-times',
+  echo   '--timing-output','%RECEIVER_TIMING_CSV%',
+  echo   '--eval-output','%RECEIVER_EVAL_CSV%'
+  echo ^)
+  echo $p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList $argsList -RedirectStandardOutput '%RECEIVER_LOG%' -RedirectStandardError '%RECEIVER_LOG%'
+  echo Set-Content -Encoding ascii -Path '%RECEIVER_PID_FILE%' -Value $p.Id
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_START_RECEIVER%" >nul
+if errorlevel 1 (
+  echo [ERROR] Failed to start receiver. Check %RECEIVER_LOG%
+  goto :cleanup
+)
 
 REM Give receiver time to boot
 timeout /t 2 /nobreak >nul
@@ -120,7 +141,29 @@ for /L %%N in (10,10,100) do (
     REM ------------------------------------------------------------
     REM 1) Start STREAMER for this run (background)
     REM ------------------------------------------------------------
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Start-Process -PassThru -NoNewWindow -FilePath python -ArgumentList @('%STREAMER%','--host','%CARLA_HOST%','--port','%CARLA_PORT%','--mode','wait','--role-prefix','udp_replay:','--include-velocity','--frame-elapsed','--wall-clock','--include-object-id','--include-monotonic','--include-tick-wall-dt','--output','!STREAM_CSV!','--timing-output','!STREAM_TIMING_CSV!','--timing-flush-every','10') -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!'; $p.Id | Set-Content -Encoding ascii '!STREAMER_PID_FILE!'" >nul
+    set "PS_START_STREAMER=!RUNDIR!\start_streamer.ps1"
+    > "!PS_START_STREAMER!" (
+      echo $ErrorActionPreference = 'Stop'
+      echo $argsList = @(
+      echo   '%STREAMER%',
+      echo   '--host','%CARLA_HOST%',
+      echo   '--port','%CARLA_PORT%',
+      echo   '--mode','wait',
+      echo   '--role-prefix','udp_replay:',
+      echo   '--include-velocity',
+      echo   '--frame-elapsed',
+      echo   '--wall-clock',
+      echo   '--include-object-id',
+      echo   '--include-monotonic',
+      echo   '--include-tick-wall-dt',
+      echo   '--output','!STREAM_CSV!',
+      echo   '--timing-output','!STREAM_TIMING_CSV!',
+      echo   '--timing-flush-every','10'
+      echo ^)
+      echo $p = Start-Process -PassThru -NoNewWindow -FilePath 'python' -ArgumentList $argsList -RedirectStandardOutput '!STREAMER_LOG!' -RedirectStandardError '!STREAMER_LOG!'
+      echo Set-Content -Encoding ascii -Path '!STREAMER_PID_FILE!' -Value $p.Id
+    )
+    powershell -NoProfile -ExecutionPolicy Bypass -File "!PS_START_STREAMER!" >nul
 
     REM Give streamer time to start
     timeout /t 1 /nobreak >nul
