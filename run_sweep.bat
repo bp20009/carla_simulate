@@ -116,7 +116,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  '--stale-timeout','%STALE_TIMEOUT%'," ^
   "  '--measure-update-times'," ^
   "  '--timing-output','%RECEIVER_TIMING_CSV%'," ^
-  "  '--eval-output','%RECEIVER_EVAL_CSV%'" ^
+  "  '--eval-output','%RECEIVER_EVAL_CSV%'," ^
   "  '--enable-completion'"^
   ");" ^
   "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
