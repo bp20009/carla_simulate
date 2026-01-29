@@ -46,8 +46,6 @@ set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
 
-set "STREAMER_PID_FILE=%OUTDIR%\streamer_pid.txt"
-
 echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
 
@@ -74,7 +72,10 @@ REM ==========================================================
 REM Warmup attempts until receiver logs a spawn
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
-  type nul > "%RECEIVER_LOG%"
+  set "TIMING_OFFSET=0"
+  if exist "%RECEIVER_TIMING_CSV%" (
+    for /f %%S in ('powershell -NoProfile -Command "(Get-Item ''%RECEIVER_TIMING_CSV%'').Length"') do set "TIMING_OFFSET=%%S"
+  )
   echo [INFO] Warmup frames %WARMUP_START_FRAME%..%WARMUP_END_FRAME% interval=%WARMUP_INTERVAL%
   python "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% --start-frame %WARMUP_START_FRAME% --end-frame %WARMUP_END_FRAME% > "%OUTDIR%\warmup_sender.log" 2>&1
 
@@ -84,13 +85,13 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   )
 
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$log='%RECEIVER_LOG%'; $timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%; $sw=[Diagnostics.Stopwatch]::StartNew(); while($sw.Elapsed.TotalSeconds -lt $timeout){ if(Select-String -Path $log -Pattern 'Spawned ' -Quiet){ exit 0 }; Start-Sleep -Seconds $interval }; exit 1" ^
+    "$path='%RECEIVER_TIMING_CSV%'; $offset=[int64]%TIMING_OFFSET%; $timeout=%WARMUP_CHECK_TIMEOUT_SEC%; $interval=%WARMUP_CHECK_INTERVAL_SEC%; $sw=[Diagnostics.Stopwatch]::StartNew(); while($sw.Elapsed.TotalSeconds -lt $timeout){ if(Test-Path $path){ $len=(Get-Item $path).Length; if($len -gt $offset){ $fs=[System.IO.File]::Open($path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite); try{ $fs.Seek($offset,[System.IO.SeekOrigin]::Begin) | Out-Null; $buf=New-Object byte[] ($len-$offset); [void]$fs.Read($buf,0,$buf.Length); $text=[System.Text.Encoding]::UTF8.GetString($buf); } finally { $fs.Close() } $offset=$len; foreach($line in ($text -split \"`r?`n\")){ if(-not $line){ continue } $cols=$line.Split(','); if($cols.Length -ge 7 -and $cols[5] -ne ''){ exit 0 } } } } Start-Sleep -Seconds $interval }; exit 1" ^
     >nul
   if !errorlevel! EQU 0 (
-    echo [INFO] Warmup succeeded (spawn detected).
+    echo [INFO] Warmup succeeded (actor update detected).
     goto :warmup_done
   )
-  echo [WARN] No spawn detected after warmup attempt %%A. Retrying...
+  echo [WARN] Warmup not confirmed (no actor updates detected). Retrying...
 )
 
 echo [ERROR] Warmup failed to detect spawn after %WARMUP_MAX_ATTEMPTS% attempts.
@@ -117,6 +118,7 @@ for /L %%N in (10,10,100) do (
 
     set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
     set "STREAMER_LOG=!RUNDIR!\streamer_!TAG!.log"
+    set "STREAMER_PID_FILE=!RUNDIR!\streamer_pid.txt"
 
     REM ------------------------------------------------------------
     REM 1) Start STREAMER for this run (background)
