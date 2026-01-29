@@ -228,7 +228,7 @@ set "LOG=%~2"
 shift
 shift
 REM start uses a new cmd so redirection is reliable
-start "" /b cmd /c ""%PYEXE%" %* 1>>"%LOG%" 2>&1"
+start "" /b "%ComSpec%" /s /c ""%PYEXE%" %* >>"%LOG%" 2>&1"
 exit /b 0
 
 :find_pid_by_script
@@ -236,7 +236,7 @@ REM %1 = script substring, %2 = out var
 set "%~2="
 for %%N in (python.exe pythonw.exe) do (
   for /f "tokens=2 delims== " %%P in ('
-    wmic process where "Name='%%N' and CommandLine like '%%%~1%%'" get ProcessId /value 2^>nul ^| findstr /i "ProcessId="
+    wmic process where "Name='%%N' and CommandLine like '%%%%%~1%%%%'" get ProcessId /value 2^>nul ^| findstr /i "ProcessId="
   ') do (
     set "%~2=%%P"
     goto :pid_done
