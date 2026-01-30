@@ -25,21 +25,11 @@ if errorlevel 1 (
   goto :cleanup
 )
 
-if not exist "%CSV_PATH%" (
-  echo [ERROR] CSV not found: %CSV_PATH%
-  goto :cleanup
-)
-if not exist "%SENDER%" (
-  echo [ERROR] sender not found: %SENDER%
-  goto :cleanup
-)
-if not exist "%RECEIVER%" (
-  echo [ERROR] receiver not found: %RECEIVER%
-  goto :cleanup
-)
-if not exist "%STREAMER%" (
-  echo [ERROR] streamer not found: %STREAMER%
-  goto :cleanup
+for %%F in ("%CSV_PATH%" "%SENDER%" "%RECEIVER%" "%STREAMER%") do (
+  if not exist "%%~fF" (
+    echo [ERROR] missing: %%~fF
+    goto :cleanup
+  )
 )
 
 REM ==========================================================
@@ -70,6 +60,7 @@ mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_STDOUT=%OUTDIR%\receiver_stdout.log"
 set "RECEIVER_STDERR=%OUTDIR%\receiver_stderr.log"
+set "RECEIVER_LAUNCH=%OUTDIR%\receiver_launcher.log"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
@@ -92,10 +83,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 
 REM ==========================================================
 REM Start receiver (PIDはStart-Processから確実に取ってファイルへ)
+REM   - python stdout/stderr は receiver_stdout/receiver_stderr にのみ書く
+REM   - ラッパのログは receiver_launcher に書く
 REM ==========================================================
 echo [INFO] Starting receiver...
 type nul > "%RECEIVER_STDOUT%"
 type nul > "%RECEIVER_STDERR%"
+type nul > "%RECEIVER_LAUNCH%"
 del /q "%RECEIVER_PID_FILE%" >nul 2>&1
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
@@ -114,33 +108,48 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  '--eval-output','%RECEIVER_EVAL_CSV%'" ^
   ");" ^
   "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
-  "Start-Sleep -Milliseconds 500;" ^
-  "if($p.HasExited){ throw ('receiver exited early. ExitCode=' + $p.ExitCode) }" ^
   "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%';" ^
-  "exit 0" ^
-  1>>"%RECEIVER_STDOUT%" 2>>"%RECEIVER_STDERR%"
+  "Start-Sleep -Milliseconds 800;" ^
+  "if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode | Out-File -Encoding utf8 '%RECEIVER_LAUNCH%' -Append; exit 2 }" ^
+  "'START_OK: PID=' + $p.Id | Out-File -Encoding utf8 '%RECEIVER_LAUNCH%' -Append; exit 0" ^
+  1>nul 2>nul
 
 if errorlevel 1 (
-  echo [ERROR] Failed to start receiver. receiver_stderr tail:
-  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 50 }"
-  goto :cleanup
-)
-
-if not exist "%RECEIVER_PID_FILE%" (
-  echo [ERROR] receiver PID file not created. receiver_stderr tail:
-  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 50 }"
+  echo [ERROR] Failed to start receiver.
+  echo [INFO] receiver_launcher.log:
+  if exist "%RECEIVER_LAUNCH%" type "%RECEIVER_LAUNCH%"
+  echo [INFO] receiver_stderr.log (tail 80):
+  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content -LiteralPath '%RECEIVER_STDERR%' -Tail 80 }"
+  echo [INFO] receiver_stdout.log (tail 40):
+  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDOUT%'){ Get-Content -LiteralPath '%RECEIVER_STDOUT%' -Tail 40 }"
   goto :cleanup
 )
 
 set "RECEIVER_PID="
+if not exist "%RECEIVER_PID_FILE%" (
+  echo [ERROR] receiver_pid.txt not created.
+  type "%RECEIVER_LAUNCH%"
+  goto :cleanup
+)
 set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
 echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
   echo [ERROR] Invalid receiver PID: %RECEIVER_PID%
-  echo [INFO] receiver_stderr tail:
-  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 50 }"
+  type "%RECEIVER_LAUNCH%"
   goto :cleanup
 )
+
+REM 生存確認（ここで落ちてたら python 側エラーが receiver_stderr に出てる）
+powershell -NoProfile -Command "if(Get-Process -Id %RECEIVER_PID% -ErrorAction SilentlyContinue){ exit 0 } else { exit 1 }" >nul
+if errorlevel 1 (
+  echo [ERROR] receiver process already dead after start. PID=%RECEIVER_PID%
+  echo [INFO] receiver_launcher.log:
+  type "%RECEIVER_LAUNCH%"
+  echo [INFO] receiver_stderr.log (tail 120):
+  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content -LiteralPath '%RECEIVER_STDERR%' -Tail 120 }"
+  goto :cleanup
+)
+
 echo [INFO] receiver PID=%RECEIVER_PID%
 
 REM ==========================================================
@@ -166,8 +175,6 @@ call :wait_for_actor_updates "%RECEIVER_STDERR%" %WARMUP_TIMEOUT_SEC% %WARMUP_PO
 if errorlevel 1 (
   echo [WARN] Warmup did not confirm actor updates within timeout.
   echo [WARN] Proceeding anyway (first measured run might be contaminated).
-  echo [INFO] receiver_stderr tail:
-  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 50 }"
 ) else (
   echo [INFO] Warmup confirmed (nonzero actor updates detected).
 )
@@ -214,14 +221,14 @@ for /L %%N in (%N_START%,%N_STEP%,%N_END%) do (
       "  '--timing-flush-every','10'" ^
       ");" ^
       "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR%';" ^
-      "Start-Sleep -Milliseconds 500;" ^
-      "if($p.HasExited){ throw ('streamer exited early. ExitCode=' + $p.ExitCode) }" ^
+      "Start-Sleep -Milliseconds 800;" ^
+      "if($p.HasExited){ exit 2 }" ^
       "exit 0" ^
-      1>>"!STREAMER_STDOUT!" 2>>"!STREAMER_STDERR!"
+      1>nul 2>nul
 
     if errorlevel 1 (
       echo [ERROR] Failed to start streamer. streamer_stderr tail:
-      powershell -NoProfile -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 50 }"
+      powershell -NoProfile -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content -LiteralPath '!STREAMER_STDERR!' -Tail 80 }"
       goto :cleanup
     )
 
