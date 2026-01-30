@@ -119,6 +119,14 @@ if errorlevel 1 (
   goto :cleanup
 )
 
+if not exist "%RECEIVER_PID_FILE%" (
+  echo [ERROR] receiver_pid.txt not created. launcher tail:
+  call :tail_file "%RECEIVER_LAUNCHER%" 120
+  echo [ERROR] receiver_stderr tail:
+  call :tail_file "%RECEIVER_STDERR%" 120
+  goto :cleanup
+)
+
 set "RECEIVER_PID="
 set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
 echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
@@ -200,6 +208,14 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
       goto :cleanup
     )
 
+    if not exist "!STREAMER_PID_FILE!" (
+      echo [ERROR] streamer_pid not created. launcher tail:
+      call :tail_file "!STREAMER_LAUNCHER!" 120
+      echo [ERROR] streamer_stderr tail:
+      call :tail_file "!STREAMER_STDERR!" 120
+      goto :cleanup
+    )
+
     set "STREAMER_PID="
     set /p STREAMER_PID=<"!STREAMER_PID_FILE!"
     echo !STREAMER_PID!| findstr /r "^[0-9][0-9]*$" >nul
@@ -273,10 +289,6 @@ set "CMDLINE=%~3"
 set "OUT=%~4"
 set "ERR=%~5"
 
-REM NOTE:
-REM - Start-Process(cmd.exe /c) + cmd redirection for logs
-REM - Save PID of cmd wrapper. taskkill /T will stop python child too.
-
 "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
   "$cmd = %CMDLINE% + ' 1>>' + '""%OUT%""' + ' 2>>' + '""%ERR%""';" ^
@@ -286,7 +298,7 @@ REM - Save PID of cmd wrapper. taskkill /T will stop python child too.
   "Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id;" ^
   "Write-Output ('START_OK PID=' + $p.Id);" ^
   "exit 0" ^
-  1>>"%LAUNCHER%" 2>>"%LAUNCHER%"
+  1>>"%LAUNCHER%" 2>>&1
 
 set "RC=%errorlevel%"
 endlocal & exit /b %RC%
