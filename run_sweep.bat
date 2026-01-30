@@ -53,13 +53,11 @@ REM ==========================================================
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
-REM Warmup: map compile can be long -> wait up to 900s for "Received first complete tracking update"
 set "WARMUP_INTERVAL=0.1"
 set "WARMUP_MAX_ATTEMPTS=2"
 set "WARMUP_CHECK_TIMEOUT_SEC=900"
 set "WARMUP_CHECK_INTERVAL_SEC=5"
 
-REM Sweep
 set "TS_LIST=0.10 1.00"
 set "N_MIN=10"
 set "N_MAX=100"
@@ -67,7 +65,7 @@ set "N_STEP=10"
 set "COOLDOWN_SEC=3"
 
 REM ==========================================================
-REM OUTDIR (safe, no ':')
+REM OUTDIR (safe)
 REM ==========================================================
 set "DT_TAG=%DATE%"
 set "DT_TAG=%DT_TAG:/=%"
@@ -92,13 +90,13 @@ echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
 
 REM ==========================================================
-REM Pre-clean: free UDP port (avoid WinError 10048)
+REM Pre-clean: free UDP port
 REM ==========================================================
 echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 call :free_udp_port_netstat %UDP_PORT%
 
 REM ==========================================================
-REM Start receiver (keep alive; avoid map recompile)
+REM Start receiver (keep alive)
 REM ==========================================================
 echo [INFO] Starting receiver...
 type nul > "%RECEIVER_STDOUT%"
@@ -145,7 +143,7 @@ echo [INFO] receiver PID=%RECEIVER_PID%
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup (discard): send once, wait map setup completion marker
+REM Warmup (discard)
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
@@ -170,7 +168,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   call :tail_file "%RECEIVER_STDERR%" 30
 )
 
-echo [WARN] Warmup not confirmed, continue anyway. First run may include map setup overhead.
+echo [WARN] Warmup not confirmed, continue anyway.
 :warmup_done
 
 REM ==========================================================
@@ -188,6 +186,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
 
     set "STREAMER_STDOUT=!RUNDIR!\streamer_stdout_!TAG!.log"
     set "STREAMER_STDERR=!RUNDIR!\streamer_stderr_!TAG!.log"
+    set "STREAMER_LAUNCHER=!RUNDIR!\streamer_launcher_!TAG!.log"
     set "STREAMER_PID_FILE=!RUNDIR!\streamer_pid_!TAG!.txt"
 
     echo ============================================================
@@ -196,34 +195,59 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
 
     type nul > "!STREAMER_STDOUT!"
     type nul > "!STREAMER_STDERR!"
+    type nul > "!STREAMER_LAUNCHER!"
     del /q "!STREAMER_PID_FILE!" >nul 2>&1
 
+    REM --- Start streamer + always write PID, then verify it's alive ---
     "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
       "$ErrorActionPreference='Stop';" ^
-      "$args=@(" ^
-      "  '%STREAMER%'," ^
-      "  '--host','%CARLA_HOST%'," ^
-      "  '--port','%CARLA_PORT%'," ^
-      "  '--mode','wait'," ^
-      "  '--role-prefix','udp_replay:'," ^
-      "  '--include-velocity'," ^
-      "  '--frame-elapsed'," ^
-      "  '--wall-clock'," ^
-      "  '--include-object-id'," ^
-      "  '--include-monotonic'," ^
-      "  '--include-tick-wall-dt'," ^
-      "  '--output','!STREAM_CSV!'," ^
-      "  '--timing-output','!STREAM_TIMING_CSV!'," ^
-      "  '--timing-flush-every','10'" ^
-      ");" ^
-      "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR%';" ^
-      "Start-Sleep -Milliseconds 500;" ^
-      "if($p.HasExited){ exit 2 }" ^
-      "$p.Id | Out-File -Encoding ascii '!STREAMER_PID_FILE!'; exit 0" >nul 2>nul
+      "try {" ^
+      "  $args=@(" ^
+      "    '%STREAMER%'," ^
+      "    '--host','%CARLA_HOST%'," ^
+      "    '--port','%CARLA_PORT%'," ^
+      "    '--mode','wait'," ^
+      "    '--role-prefix','udp_replay:'," ^
+      "    '--include-velocity'," ^
+      "    '--frame-elapsed'," ^
+      "    '--wall-clock'," ^
+      "    '--include-object-id'," ^
+      "    '--include-monotonic'," ^
+      "    '--include-tick-wall-dt'," ^
+      "    '--output','!STREAM_CSV!'," ^
+      "    '--timing-output','!STREAM_TIMING_CSV!'," ^
+      "    '--timing-flush-every','10'" ^
+      "  );" ^
+      "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR%';" ^
+      "  $p.Id | Out-File -Encoding ascii '!STREAMER_PID_FILE!';" ^
+      "  Start-Sleep -Milliseconds 800;" ^
+      "  if($p.HasExited){" ^
+      "    'STREAMER_EXITED_EARLY ExitCode=' + $p.ExitCode | Out-File -Encoding utf8 -Append '!STREAMER_LAUNCHER!';" ^
+      "    exit 3" ^
+      "  }" ^
+      "  'STREAMER_OK PID=' + $p.Id | Out-File -Encoding utf8 -Append '!STREAMER_LAUNCHER!';" ^
+      "  exit 0" ^
+      "} catch {" ^
+      "  ('STREAMER_START_FAILED: ' + $_.Exception.Message) | Out-File -Encoding utf8 -Append '!STREAMER_LAUNCHER!';" ^
+      "  exit 4" ^
+      "}" ^
+      1>>"!STREAMER_LAUNCHER!" 2>>"!STREAMER_LAUNCHER!"
+
+    if errorlevel 1 (
+      echo [ERROR] Streamer start failed. launcher tail:
+      call :tail_file "!STREAMER_LAUNCHER!" 80
+      echo [ERROR] streamer_stderr tail:
+      call :tail_file "!STREAMER_STDERR!" 80
+      echo [ERROR] streamer_stdout tail:
+      call :tail_file "!STREAMER_STDOUT!" 80
+      goto :cleanup
+    )
 
     if not exist "!STREAMER_PID_FILE!" (
-      echo [ERROR] streamer_pid not created. streamer_stderr:
-      type "!STREAMER_STDERR!"
+      echo [ERROR] streamer_pid not created. launcher tail:
+      call :tail_file "!STREAMER_LAUNCHER!" 80
+      echo [ERROR] streamer_stderr tail:
+      call :tail_file "!STREAMER_STDERR!" 80
       goto :cleanup
     )
 
@@ -232,6 +256,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
     echo !STREAMER_PID!| findstr /r "^[0-9][0-9]*$" >nul
     if errorlevel 1 (
       echo [ERROR] Invalid streamer PID: !STREAMER_PID!
+      call :tail_file "!STREAMER_LAUNCHER!" 80
       goto :cleanup
     )
 
@@ -292,26 +317,17 @@ endlocal & exit /b 0
 
 :wait_warmup_ready
 REM %1 log_file, %2 timeout_sec, %3 interval_sec
-REM success condition:
-REM   - contains "Received first complete tracking update"
 setlocal EnableExtensions EnableDelayedExpansion
 set "LOG=%~1"
 set "TMO=%~2"
 set "INT=%~3"
-
 set /a ELAPSED=0
 :wr_loop
-if %ELAPSED% GEQ %TMO% (
-  endlocal & exit /b 1
-)
-
+if %ELAPSED% GEQ %TMO% ( endlocal & exit /b 1 )
 if exist "%LOG%" (
   findstr /i /c:"Received first complete tracking update" "%LOG%" >nul 2>&1
-  if !errorlevel! EQU 0 (
-    endlocal & exit /b 0
-  )
+  if !errorlevel! EQU 0 ( endlocal & exit /b 0 )
 )
-
 timeout /t %INT% /nobreak >nul
 set /a ELAPSED+=%INT%
 goto :wr_loop
