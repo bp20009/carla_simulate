@@ -53,11 +53,13 @@ REM ==========================================================
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
+REM Warmup: map compile waits can be long
 set "WARMUP_INTERVAL=0.1"
 set "WARMUP_MAX_ATTEMPTS=2"
 set "WARMUP_CHECK_TIMEOUT_SEC=900"
 set "WARMUP_CHECK_INTERVAL_SEC=5"
 
+REM Sweep
 set "TS_LIST=0.10 1.00"
 set "N_MIN=10"
 set "N_MAX=100"
@@ -65,7 +67,7 @@ set "N_STEP=10"
 set "COOLDOWN_SEC=3"
 
 REM ==========================================================
-REM OUTDIR (safe)
+REM OUTDIR (safe tag from %DATE%/%TIME%)
 REM ==========================================================
 set "DT_TAG=%DATE%"
 set "DT_TAG=%DT_TAG:/=%"
@@ -119,13 +121,13 @@ del /q "%RECEIVER_PID_FILE%" >nul 2>&1
   "  '--enable-completion'" ^
   ");" ^
   "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
-  "Start-Sleep -Milliseconds 500;" ^
+  "Start-Sleep -Milliseconds 700;" ^
   "if($p.HasExited){ exit 2 }" ^
   "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'; exit 0" >nul 2>nul
 
 if not exist "%RECEIVER_PID_FILE%" (
-  echo [ERROR] receiver_pid.txt not created. receiver_stderr:
-  type "%RECEIVER_STDERR%"
+  echo [ERROR] receiver_pid.txt not created. receiver_stderr tail:
+  call :tail_file "%RECEIVER_STDERR%" 80
   goto :cleanup
 )
 
@@ -134,8 +136,7 @@ set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
 echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
   echo [ERROR] Invalid receiver PID: %RECEIVER_PID%
-  echo [ERROR] receiver_stderr:
-  type "%RECEIVER_STDERR%"
+  call :tail_file "%RECEIVER_STDERR%" 80
   goto :cleanup
 )
 echo [INFO] receiver PID=%RECEIVER_PID%
@@ -143,7 +144,7 @@ echo [INFO] receiver PID=%RECEIVER_PID%
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup (discard)
+REM Warmup (discard): wait until first complete tracking update
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
@@ -165,7 +166,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   )
 
   echo [WARN] Warmup not confirmed yet. receiver_stderr tail:
-  call :tail_file "%RECEIVER_STDERR%" 30
+  call :tail_file "%RECEIVER_STDERR%" 40
 )
 
 echo [WARN] Warmup not confirmed, continue anyway.
@@ -198,7 +199,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
     type nul > "!STREAMER_LAUNCHER!"
     del /q "!STREAMER_PID_FILE!" >nul 2>&1
 
-    REM --- Start streamer + always write PID, then verify it's alive ---
+    REM --- Start streamer: PowerShell does NOT write launcher file directly ---
     "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
       "$ErrorActionPreference='Stop';" ^
       "try {" ^
@@ -220,24 +221,24 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
       "  );" ^
       "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR%';" ^
       "  $p.Id | Out-File -Encoding ascii '!STREAMER_PID_FILE!';" ^
-      "  Start-Sleep -Milliseconds 800;" ^
+      "  Start-Sleep -Milliseconds 900;" ^
       "  if($p.HasExited){" ^
-      "    'STREAMER_EXITED_EARLY ExitCode=' + $p.ExitCode | Out-File -Encoding utf8 -Append '!STREAMER_LAUNCHER!';" ^
+      "    Write-Output ('STREAMER_EXITED_EARLY ExitCode=' + $p.ExitCode);" ^
       "    exit 3" ^
       "  }" ^
-      "  'STREAMER_OK PID=' + $p.Id | Out-File -Encoding utf8 -Append '!STREAMER_LAUNCHER!';" ^
+      "  Write-Output ('STREAMER_OK PID=' + $p.Id);" ^
       "  exit 0" ^
       "} catch {" ^
-      "  ('STREAMER_START_FAILED: ' + $_.Exception.Message) | Out-File -Encoding utf8 -Append '!STREAMER_LAUNCHER!';" ^
+      "  Write-Output ('STREAMER_START_FAILED: ' + $_.Exception.Message);" ^
       "  exit 4" ^
       "}" ^
       1>>"!STREAMER_LAUNCHER!" 2>>"!STREAMER_LAUNCHER!"
 
     if errorlevel 1 (
       echo [ERROR] Streamer start failed. launcher tail:
-      call :tail_file "!STREAMER_LAUNCHER!" 80
+      call :tail_file "!STREAMER_LAUNCHER!" 120
       echo [ERROR] streamer_stderr tail:
-      call :tail_file "!STREAMER_STDERR!" 80
+      call :tail_file "!STREAMER_STDERR!" 120
       echo [ERROR] streamer_stdout tail:
       call :tail_file "!STREAMER_STDOUT!" 80
       goto :cleanup
@@ -245,9 +246,9 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
 
     if not exist "!STREAMER_PID_FILE!" (
       echo [ERROR] streamer_pid not created. launcher tail:
-      call :tail_file "!STREAMER_LAUNCHER!" 80
+      call :tail_file "!STREAMER_LAUNCHER!" 120
       echo [ERROR] streamer_stderr tail:
-      call :tail_file "!STREAMER_STDERR!" 80
+      call :tail_file "!STREAMER_STDERR!" 120
       goto :cleanup
     )
 
@@ -256,7 +257,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
     echo !STREAMER_PID!| findstr /r "^[0-9][0-9]*$" >nul
     if errorlevel 1 (
       echo [ERROR] Invalid streamer PID: !STREAMER_PID!
-      call :tail_file "!STREAMER_LAUNCHER!" 80
+      call :tail_file "!STREAMER_LAUNCHER!" 120
       goto :cleanup
     )
 
