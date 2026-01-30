@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 pushd "%~dp0"
 
 REM ==========================================================
-REM Paths / executables (NO embedded quotes)
+REM Paths / executables
 REM ==========================================================
 set "ROOT=%~dp0"
 set "PYTHON_EXE=python"
@@ -14,15 +14,21 @@ if errorlevel 1 (
   goto :cleanup
 )
 
+REM --- Resolve PowerShell executable to FULL PATH (avoid '"pwsh"' issue) ---
 set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-if not exist "%PS_EXE%" (
-  where pwsh >nul 2>&1
-  if errorlevel 1 (
-    echo [ERROR] PowerShell not found. (powershell.exe / pwsh)
-    goto :cleanup
-  )
-  set "PS_EXE=pwsh"
+if exist "%PS_EXE%" goto :ps_ok
+
+set "PS_EXE="
+for /f "delims=" %%I in ('where pwsh 2^>nul') do (
+  set "PS_EXE=%%I"
+  goto :ps_ok
 )
+
+echo [ERROR] PowerShell not found. (powershell.exe / pwsh)
+goto :cleanup
+
+:ps_ok
+echo [INFO] PS_EXE=%PS_EXE%
 
 REM ==========================================================
 REM User config
@@ -45,10 +51,10 @@ set "SENDER=%SENDER:"=%"
 set "RECEIVER=%RECEIVER:"=%"
 set "STREAMER=%STREAMER:"=%"
 
-if not exist "%CSV_PATH%"   ( echo [ERROR] CSV not found: %CSV_PATH% & goto :cleanup )
-if not exist "%SENDER%"     ( echo [ERROR] sender not found: %SENDER% & goto :cleanup )
-if not exist "%RECEIVER%"   ( echo [ERROR] receiver not found: %RECEIVER% & goto :cleanup )
-if not exist "%STREAMER%"   ( echo [ERROR] streamer not found: %STREAMER% & goto :cleanup )
+if not exist "%CSV_PATH%"    ( echo [ERROR] CSV not found: %CSV_PATH% & goto :cleanup )
+if not exist "%SENDER%"      ( echo [ERROR] sender not found: %SENDER% & goto :cleanup )
+if not exist "%RECEIVER%"    ( echo [ERROR] receiver not found: %RECEIVER% & goto :cleanup )
+if not exist "%STREAMER%"    ( echo [ERROR] streamer not found: %STREAMER% & goto :cleanup )
 
 REM ==========================================================
 REM Policy
@@ -71,23 +77,22 @@ set "N_STEP=10"
 set "COOLDOWN_SEC=3"
 
 REM ==========================================================
-REM OUTDIR timestamp (via temp file, avoids for/f quoting traps)
+REM OUTDIR (safe timestamp)
 REM ==========================================================
-set "DT_FILE=%ROOT%__dt.txt"
-del /q "%DT_FILE%" >nul 2>&1
-call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Date -Format yyyyMMdd_HHmmss_fff | Out-File -Encoding ascii '%DT_FILE%'" >nul 2>nul
 set "DT_TAG="
-if exist "%DT_FILE%" set /p DT_TAG=<"%DT_FILE%"
-del /q "%DT_FILE%" >nul 2>&1
+for /f "usebackq delims=" %%i in (`"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Date -Format yyyyMMdd_HHmmss_fff"`) do set "DT_TAG=%%i"
 
 if not defined DT_TAG (
-  REM fallback (no PS): DATE/TIME sanitized
-  set "DT_TAG=%DATE%_%TIME%"
-  set "DT_TAG=%DT_TAG:/=%"
-  set "DT_TAG=%DT_TAG:-=%"
-  set "DT_TAG=%DT_TAG:.=%"
-  set "DT_TAG=%DT_TAG: =0%"
-  set "DT_TAG=%DT_TAG::=%"
+  REM fallback: keep digits only from DATE+TIME
+  set "RAW=%DATE%_%TIME%"
+  set "DT_TAG="
+  for /l %%k in (0,1,80) do (
+    set "c=!RAW:~%%k,1!"
+    if "!c!"=="" goto :dt_done
+    for %%d in (0 1 2 3 4 5 6 7 8 9) do if "!c!"=="%%d" set "DT_TAG=!DT_TAG!!c!"
+  )
+  :dt_done
+  if not defined DT_TAG set "DT_TAG=%RANDOM%%RANDOM%"
 )
 
 set "OUTDIR=%ROOT%sweep_results_%DT_TAG%"
@@ -101,7 +106,6 @@ set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 
 echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
-echo [INFO] PS_EXE=%PS_EXE%
 
 REM ==========================================================
 REM Pre-clean
@@ -114,7 +118,7 @@ echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 call :free_udp_port %UDP_PORT%
 
 REM ==========================================================
-REM Start receiver (python direct, stdout/stderr separate)
+REM Start receiver
 REM ==========================================================
 echo [INFO] Starting receiver...
 type nul > "%RECEIVER_STDOUT%"
@@ -135,7 +139,7 @@ call :ps_start_python_pid "%RECEIVER_PID_FILE%" "%ROOT%" "%RECEIVER_STDOUT%" "%R
 
 if errorlevel 1 (
   echo [ERROR] Failed to start receiver. receiver_stderr tail:
-  call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 80 }"
+  "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 120 }"
   goto :cleanup
 )
 
@@ -157,7 +161,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup send interval=%WARMUP_INTERVAL% (discard)
 
   set "LOG_OFFSET=0"
-  for /f "usebackq delims=" %%S in (`call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ (Get-Item '%RECEIVER_STDERR%').Length } else { 0 }"`) do set "LOG_OFFSET=%%S"
+  for /f "usebackq delims=" %%S in (`"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ (Get-Item '%RECEIVER_STDERR%').Length } else { 0 }"`) do set "LOG_OFFSET=%%S"
 
   "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% > "%OUTDIR%\warmup_sender.log" 2>&1
 
@@ -177,7 +181,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   )
 
   echo [WARN] Warmup not confirmed yet. receiver_stderr tail:
-  call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 30 }"
+  "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 40 }"
 )
 
 echo [WARN] Warmup not confirmed, but continue anyway.
@@ -227,7 +231,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
 
     if errorlevel 1 (
       echo [ERROR] Failed to start streamer. streamer_stderr tail:
-      call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 80 }"
+      "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 120 }"
       goto :cleanup
     )
 
@@ -247,7 +251,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
     findstr /i /c:"Sent 0 frames" "!SENDER_LOG!" >nul 2>&1
     if !errorlevel! EQU 0 (
       echo [ERROR] sender sent 0 frames. sender log tail:
-      call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Content '!SENDER_LOG!' -Tail 60"
+      "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Content '!SENDER_LOG!' -Tail 80"
       goto :cleanup
     )
 
@@ -282,7 +286,7 @@ REM ==========================================================
 REM %1 substring in CommandLine; kill python and wrappers
 setlocal EnableExtensions
 set "SUB=%~1"
-call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
   "$sub='%SUB%';" ^
   "$procs=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like ('*'+$sub+'*')) };" ^
   "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
@@ -292,13 +296,13 @@ endlocal & exit /b 0
 REM %1 port
 setlocal EnableExtensions
 set "PORT=%~1"
-call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p=[int]%PORT%; for($i=0;$i -lt 5;$i++){" ^
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$p=[int]%PORT%; for($i=0;$i -lt 8;$i++){" ^
   "  $eps=Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue;" ^
   "  if(-not $eps){ exit 0 }" ^
   "  $pids=$eps | Select-Object -ExpandProperty OwningProcess -Unique;" ^
   "  foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} }" ^
-  "  Start-Sleep -Seconds 1" ^
+  "  Start-Sleep -Milliseconds 700" ^
   "} exit 0" >nul 2>nul
 endlocal & exit /b 0
 
@@ -318,24 +322,21 @@ set "PSARGS="
 :psargs_loop
 if "%~1"=="" goto :psargs_done
 set "A=%~1"
-REM escape single quotes for PowerShell single-quoted strings
 set "A=%A:'=''%"
 set "PSARGS=%PSARGS%,'%A%'"
 shift /1
 goto :psargs_loop
 :psargs_done
 
-call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
   "$args=@('%SCRIPT%'%PSARGS%);" ^
   "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%WORKDIR%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%STDOUT%' -RedirectStandardError '%STDERR%';" ^
-  "Start-Sleep -Milliseconds 400;" ^
+  "Start-Sleep -Milliseconds 450;" ^
   "if($p.HasExited){ throw ('exited early. ExitCode=' + $p.ExitCode) }" ^
   "$p.Id | Out-File -Encoding ascii '%PID_FILE%'" >nul 2>nul
 
-if errorlevel 1 (
-  endlocal & exit /b 1
-)
+if errorlevel 1 ( endlocal & exit /b 1 )
 endlocal & exit /b 0
 
 :wait_actor_updates_in_log
@@ -346,21 +347,20 @@ set "OFF=%~2"
 set "TMO=%~3"
 set "INT=%~4"
 
-call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
   "$path='%LOG%'; $off=[int64]%OFF%; $timeout=%TMO%; $interval=%INT%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
   "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
   "  if(Test-Path $path){" ^
   "    $len=(Get-Item $path).Length;" ^
   "    if($len -gt $off){" ^
   "      $fs=[System.IO.File]::Open($path,'Open','Read','ReadWrite');" ^
-  "      try{ $fs.Seek($off,[System.IO.SeekOrigin]::Begin)|Out-Null; $buf=New-Object byte[] ($len-$off); [void]$fs.Read($buf,0,$buf.Length); $txt=[Text.Encoding]::ASCII.GetString($buf) } finally { $fs.Close() }" ^
+  "      try{ $fs.Seek($off,[System.IO.SeekOrigin]::Begin)|Out-Null; $buf=New-Object byte[] ($len-$off); [void]$fs.Read($buf,0,$buf.Length); $txt=[Text.Encoding]::UTF8.GetString($buf) } finally { $fs.Close() }" ^
   "      if($txt -match '\(([1-9][0-9]*) actor updates\)'){ exit 0 }" ^
   "      $off=$len" ^
   "    }" ^
   "  }" ^
   "  Start-Sleep -Seconds $interval" ^
-  "}" ^
-  "exit 1" >nul 2>nul
+  "} exit 1" >nul 2>nul
 
 set "RC=%errorlevel%"
 endlocal & exit /b %RC%
