@@ -42,10 +42,10 @@ set "SENDER=%SENDER:"=%"
 set "RECEIVER=%RECEIVER:"=%"
 set "STREAMER=%STREAMER:"=%"
 
-if not exist "%CSV_PATH%" ( echo [ERROR] CSV not found: %CSV_PATH% & goto :cleanup )
-if not exist "%SENDER%"   ( echo [ERROR] sender not found: %SENDER% & goto :cleanup )
-if not exist "%RECEIVER%" ( echo [ERROR] receiver not found: %RECEIVER% & goto :cleanup )
-if not exist "%STREAMER%" ( echo [ERROR] streamer not found: %STREAMER% & goto :cleanup )
+if not exist "%CSV_PATH%"  ( echo [ERROR] CSV not found: %CSV_PATH% & goto :cleanup )
+if not exist "%SENDER%"    ( echo [ERROR] sender not found: %SENDER% & goto :cleanup )
+if not exist "%RECEIVER%"  ( echo [ERROR] receiver not found: %RECEIVER% & goto :cleanup )
+if not exist "%STREAMER%"  ( echo [ERROR] streamer not found: %STREAMER% & goto :cleanup )
 
 REM ==========================================================
 REM Policy
@@ -84,6 +84,7 @@ mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_STDOUT=%OUTDIR%\receiver_stdout.log"
 set "RECEIVER_STDERR=%OUTDIR%\receiver_stderr.log"
+set "RECEIVER_LAUNCHER=%OUTDIR%\receiver_launcher.log"
 set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
@@ -98,36 +99,23 @@ echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 call :free_udp_port_netstat %UDP_PORT%
 
 REM ==========================================================
-REM Start receiver (keep alive)
+REM Start receiver (cmd.exe wrapper + redirection)
 REM ==========================================================
 echo [INFO] Starting receiver...
+
 type nul > "%RECEIVER_STDOUT%"
 type nul > "%RECEIVER_STDERR%"
+type nul > "%RECEIVER_LAUNCHER%"
 del /q "%RECEIVER_PID_FILE%" >nul 2>&1
 
-"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='Stop';" ^
-  "$args=@(" ^
-  "  '%RECEIVER%'," ^
-  "  '--carla-host','%CARLA_HOST%'," ^
-  "  '--carla-port','%CARLA_PORT%'," ^
-  "  '--listen-host','%LISTEN_HOST%'," ^
-  "  '--listen-port','%UDP_PORT%'," ^
-  "  '--fixed-delta','%FIXED_DELTA%'," ^
-  "  '--stale-timeout','%STALE_TIMEOUT%'," ^
-  "  '--measure-update-times'," ^
-  "  '--timing-output','%RECEIVER_TIMING_CSV%'," ^
-  "  '--eval-output','%RECEIVER_EVAL_CSV%'," ^
-  "  '--enable-completion'" ^
-  ");" ^
-  "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
-  "Start-Sleep -Milliseconds 700;" ^
-  "if($p.HasExited){ exit 2 }" ^
-  "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'; exit 0" >nul 2>nul
+set "RECEIVER_CMD="%PYTHON_EXE%" "%RECEIVER%" --carla-host %CARLA_HOST% --carla-port %CARLA_PORT% --listen-host %LISTEN_HOST% --listen-port %UDP_PORT% --fixed-delta %FIXED_DELTA% --stale-timeout %STALE_TIMEOUT% --measure-update-times --timing-output "%RECEIVER_TIMING_CSV%" --eval-output "%RECEIVER_EVAL_CSV%" --enable-completion"
 
-if not exist "%RECEIVER_PID_FILE%" (
-  echo [ERROR] receiver_pid.txt not created. receiver_stderr tail:
-  call :tail_file "%RECEIVER_STDERR%" 80
+call :start_cmd_wrapper "%RECEIVER_PID_FILE%" "%RECEIVER_LAUNCHER%" "%RECEIVER_CMD%" "%RECEIVER_STDOUT%" "%RECEIVER_STDERR%"
+if errorlevel 1 (
+  echo [ERROR] Failed to start receiver. launcher tail:
+  call :tail_file "%RECEIVER_LAUNCHER%" 120
+  echo [ERROR] receiver_stderr tail:
+  call :tail_file "%RECEIVER_STDERR%" 120
   goto :cleanup
 )
 
@@ -136,7 +124,8 @@ set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
 echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
   echo [ERROR] Invalid receiver PID: %RECEIVER_PID%
-  call :tail_file "%RECEIVER_STDERR%" 80
+  call :tail_file "%RECEIVER_LAUNCHER%" 120
+  call :tail_file "%RECEIVER_STDERR%" 120
   goto :cleanup
 )
 echo [INFO] receiver PID=%RECEIVER_PID%
@@ -166,7 +155,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   )
 
   echo [WARN] Warmup not confirmed yet. receiver_stderr tail:
-  call :tail_file "%RECEIVER_STDERR%" 40
+  call :tail_file "%RECEIVER_STDERR%" 60
 )
 
 echo [WARN] Warmup not confirmed, continue anyway.
@@ -183,6 +172,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
 
     set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
     set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
+
     set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
 
     set "STREAMER_STDOUT=!RUNDIR!\streamer_stdout_!TAG!.log"
@@ -199,53 +189,11 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
     type nul > "!STREAMER_LAUNCHER!"
     del /q "!STREAMER_PID_FILE!" >nul 2>&1
 
-    REM --- Start streamer: PowerShell does NOT write launcher file directly ---
-    "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
-      "$ErrorActionPreference='Stop';" ^
-      "try {" ^
-      "  $args=@(" ^
-      "    '%STREAMER%'," ^
-      "    '--host','%CARLA_HOST%'," ^
-      "    '--port','%CARLA_PORT%'," ^
-      "    '--mode','wait'," ^
-      "    '--role-prefix','udp_replay:'," ^
-      "    '--include-velocity'," ^
-      "    '--frame-elapsed'," ^
-      "    '--wall-clock'," ^
-      "    '--include-object-id'," ^
-      "    '--include-monotonic'," ^
-      "    '--include-tick-wall-dt'," ^
-      "    '--output','!STREAM_CSV!'," ^
-      "    '--timing-output','!STREAM_TIMING_CSV!'," ^
-      "    '--timing-flush-every','10'" ^
-      "  );" ^
-      "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR%';" ^
-      "  $p.Id | Out-File -Encoding ascii '!STREAMER_PID_FILE!';" ^
-      "  Start-Sleep -Milliseconds 900;" ^
-      "  if($p.HasExited){" ^
-      "    Write-Output ('STREAMER_EXITED_EARLY ExitCode=' + $p.ExitCode);" ^
-      "    exit 3" ^
-      "  }" ^
-      "  Write-Output ('STREAMER_OK PID=' + $p.Id);" ^
-      "  exit 0" ^
-      "} catch {" ^
-      "  Write-Output ('STREAMER_START_FAILED: ' + $_.Exception.Message);" ^
-      "  exit 4" ^
-      "}" ^
-      1>>"!STREAMER_LAUNCHER!" 2>>"!STREAMER_LAUNCHER!"
+    set "STREAMER_CMD="%PYTHON_EXE%" "%STREAMER%" --host %CARLA_HOST% --port %CARLA_PORT% --mode wait --role-prefix udp_replay: --include-velocity --frame-elapsed --wall-clock --include-object-id --include-monotonic --include-tick-wall-dt --output "!STREAM_CSV!" --timing-output "!STREAM_TIMING_CSV!" --timing-flush-every 10"
 
+    call :start_cmd_wrapper "!STREAMER_PID_FILE!" "!STREAMER_LAUNCHER!" "!STREAMER_CMD!" "!STREAMER_STDOUT!" "!STREAMER_STDERR!"
     if errorlevel 1 (
-      echo [ERROR] Streamer start failed. launcher tail:
-      call :tail_file "!STREAMER_LAUNCHER!" 120
-      echo [ERROR] streamer_stderr tail:
-      call :tail_file "!STREAMER_STDERR!" 120
-      echo [ERROR] streamer_stdout tail:
-      call :tail_file "!STREAMER_STDOUT!" 80
-      goto :cleanup
-    )
-
-    if not exist "!STREAMER_PID_FILE!" (
-      echo [ERROR] streamer_pid not created. launcher tail:
+      echo [ERROR] Failed to start streamer. launcher tail:
       call :tail_file "!STREAMER_LAUNCHER!" 120
       echo [ERROR] streamer_stderr tail:
       call :tail_file "!STREAMER_STDERR!" 120
@@ -268,8 +216,8 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
 
     findstr /i /c:"Sent 0 frames" "!SENDER_LOG!" >nul 2>&1
     if !errorlevel! EQU 0 (
-      echo [ERROR] sender sent 0 frames. sender log:
-      type "!SENDER_LOG!"
+      echo [ERROR] sender sent 0 frames. sender log tail:
+      call :tail_file "!SENDER_LOG!" 80
       goto :cleanup
     )
 
@@ -315,6 +263,33 @@ for /L %%K in (1,1,10) do (
 )
 :freed_done
 endlocal & exit /b 0
+
+:start_cmd_wrapper
+REM usage: call :start_cmd_wrapper <pid_file> <launcher_log> <cmdline> <stdout_file> <stderr_file>
+setlocal EnableExtensions DisableDelayedExpansion
+set "PID_FILE=%~1"
+set "LAUNCHER=%~2"
+set "CMDLINE=%~3"
+set "OUT=%~4"
+set "ERR=%~5"
+
+REM NOTE:
+REM - Start-Process(cmd.exe /c) + cmd redirection for logs
+REM - Save PID of cmd wrapper. taskkill /T will stop python child too.
+
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='Stop';" ^
+  "$cmd = %CMDLINE% + ' 1>>' + '""%OUT%""' + ' 2>>' + '""%ERR%""';" ^
+  "$p = Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath 'cmd.exe' -ArgumentList @('/c',$cmd);" ^
+  "Start-Sleep -Milliseconds 800;" ^
+  "if($p.HasExited){ Write-Output ('START_FAILED ExitCode=' + $p.ExitCode); exit 2 }" ^
+  "Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id;" ^
+  "Write-Output ('START_OK PID=' + $p.Id);" ^
+  "exit 0" ^
+  1>>"%LAUNCHER%" 2>>"%LAUNCHER%"
+
+set "RC=%errorlevel%"
+endlocal & exit /b %RC%
 
 :wait_warmup_ready
 REM %1 log_file, %2 timeout_sec, %3 interval_sec
