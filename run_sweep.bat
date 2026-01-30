@@ -42,22 +42,10 @@ set "SENDER=%SENDER:"=%"
 set "RECEIVER=%RECEIVER:"=%"
 set "STREAMER=%STREAMER:"=%"
 
-if not exist "%CSV_PATH%" (
-  echo [ERROR] CSV not found: %CSV_PATH%
-  goto :cleanup
-)
-if not exist "%SENDER%" (
-  echo [ERROR] sender not found: %SENDER%
-  goto :cleanup
-)
-if not exist "%RECEIVER%" (
-  echo [ERROR] receiver not found: %RECEIVER%
-  goto :cleanup
-)
-if not exist "%STREAMER%" (
-  echo [ERROR] streamer not found: %STREAMER%
-  goto :cleanup
-)
+if not exist "%CSV_PATH%" ( echo [ERROR] CSV not found: %CSV_PATH% & goto :cleanup )
+if not exist "%SENDER%"   ( echo [ERROR] sender not found: %SENDER% & goto :cleanup )
+if not exist "%RECEIVER%" ( echo [ERROR] receiver not found: %RECEIVER% & goto :cleanup )
+if not exist "%STREAMER%" ( echo [ERROR] streamer not found: %STREAMER% & goto :cleanup )
 
 REM ==========================================================
 REM Policy
@@ -65,7 +53,7 @@ REM ==========================================================
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
-REM Warmup: map compile can be long -> wait up to 900s for nonzero actor updates
+REM Warmup: map compile can be long -> wait up to 900s for "Received first complete tracking update"
 set "WARMUP_INTERVAL=0.1"
 set "WARMUP_MAX_ATTEMPTS=2"
 set "WARMUP_CHECK_TIMEOUT_SEC=900"
@@ -79,7 +67,7 @@ set "N_STEP=10"
 set "COOLDOWN_SEC=3"
 
 REM ==========================================================
-REM OUTDIR (safe, no ':' )
+REM OUTDIR (safe, no ':')
 REM ==========================================================
 set "DT_TAG=%DATE%"
 set "DT_TAG=%DT_TAG:/=%"
@@ -104,16 +92,13 @@ echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
 
 REM ==========================================================
-REM Pre-clean
-REM   - free UDP port (avoid WinError 10048)
-REM   - do NOT rely on wmic (24H2)
+REM Pre-clean: free UDP port (avoid WinError 10048)
 REM ==========================================================
 echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 call :free_udp_port_netstat %UDP_PORT%
 
 REM ==========================================================
-REM Start receiver (PID written to file, stdout/stderr separated)
-REM   IMPORTANT: no extra args injected
+REM Start receiver (keep alive; avoid map recompile)
 REM ==========================================================
 echo [INFO] Starting receiver...
 type nul > "%RECEIVER_STDOUT%"
@@ -141,7 +126,7 @@ del /q "%RECEIVER_PID_FILE%" >nul 2>&1
   "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'; exit 0" >nul 2>nul
 
 if not exist "%RECEIVER_PID_FILE%" (
-  echo [ERROR] receiver_pid.txt not created. receiver_stderr tail:
+  echo [ERROR] receiver_pid.txt not created. receiver_stderr:
   type "%RECEIVER_STDERR%"
   goto :cleanup
 )
@@ -157,17 +142,14 @@ if errorlevel 1 (
 )
 echo [INFO] receiver PID=%RECEIVER_PID%
 
-REM give it a moment
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup (discard run)
-REM   - send once
-REM   - wait until receiver_stderr contains NONZERO "actor updates"
+REM Warmup (discard): send once, wait map setup completion marker
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
-  echo [INFO] Warmup send interval=%WARMUP_INTERVAL% (discard)
+  echo [INFO] Warmup send interval=%WARMUP_INTERVAL% [discard]
 
   "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% > "%OUTDIR%\warmup_sender.log" 2>&1
 
@@ -178,17 +160,17 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
     goto :cleanup
   )
 
-  call :wait_nonzero_actor_updates "%RECEIVER_STDERR%" %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
+  call :wait_warmup_ready "%RECEIVER_STDERR%" %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
   if !errorlevel! EQU 0 (
-    echo [INFO] Warmup confirmed (nonzero actor updates detected).
+    echo [INFO] Warmup confirmed: first complete tracking update detected.
     goto :warmup_done
   )
 
   echo [WARN] Warmup not confirmed yet. receiver_stderr tail:
-  type "%RECEIVER_STDERR%"
+  call :tail_file "%RECEIVER_STDERR%" 30
 )
 
-echo [WARN] Warmup not confirmed, continue anyway (first run may include compile overhead).
+echo [WARN] Warmup not confirmed, continue anyway. First run may include map setup overhead.
 :warmup_done
 
 REM ==========================================================
@@ -294,12 +276,9 @@ REM ==========================================================
 REM %1 port
 setlocal EnableExtensions EnableDelayedExpansion
 set "PORT=%~1"
-
 for /L %%K in (1,1,10) do (
   set "FOUND=0"
   for /f "tokens=1-5" %%a in ('netstat -ano -p udp ^| findstr /r /c:":%PORT% *"') do (
-    REM netstat UDP line: Proto LocalAddr ForeignAddr State PID  (UDP has no State)
-    REM For UDP, tokens often: UDP 0.0.0.0:5005 *:* 1234
     set "FOUND=1"
     set "PID=%%e"
     echo [INFO] UDP :%PORT% owned by PID=!PID!. Killing...
@@ -311,22 +290,23 @@ for /L %%K in (1,1,10) do (
 :freed_done
 endlocal & exit /b 0
 
-:wait_nonzero_actor_updates
+:wait_warmup_ready
 REM %1 log_file, %2 timeout_sec, %3 interval_sec
-setlocal EnableDelayedExpansion
+REM success condition:
+REM   - contains "Received first complete tracking update"
+setlocal EnableExtensions EnableDelayedExpansion
 set "LOG=%~1"
 set "TMO=%~2"
 set "INT=%~3"
 
 set /a ELAPSED=0
-:wait_loop
+:wr_loop
 if %ELAPSED% GEQ %TMO% (
   endlocal & exit /b 1
 )
 
 if exist "%LOG%" (
-  REM find any "... (1 actor updates)" or "(12 actor updates)" etc
-  findstr /r /c:"[1-9][0-9]* actor updates" "%LOG%" >nul 2>&1
+  findstr /i /c:"Received first complete tracking update" "%LOG%" >nul 2>&1
   if !errorlevel! EQU 0 (
     endlocal & exit /b 0
   )
@@ -334,4 +314,13 @@ if exist "%LOG%" (
 
 timeout /t %INT% /nobreak >nul
 set /a ELAPSED+=%INT%
-goto :wait_loop
+goto :wr_loop
+
+:tail_file
+REM %1 file, %2 lines
+setlocal EnableExtensions
+set "F=%~1"
+set "N=%~2"
+if not exist "%F%" ( endlocal & exit /b 0 )
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath '%F%' -Tail %N%" 2>nul
+endlocal & exit /b 0
