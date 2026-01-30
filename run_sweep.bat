@@ -19,15 +19,12 @@ set "RECEIVER=%ROOT%scripts\udp_replay\replay_from_udp.py"
 set "STREAMER=%ROOT%scripts\vehicle_state_stream.py"
 
 set "PYTHON_EXE=python"
-
-REM ==========================================================
-REM Checks
-REM ==========================================================
 where "%PYTHON_EXE%" >nul 2>&1
 if errorlevel 1 (
   echo [ERROR] python not found in PATH. Set PYTHON_EXE=py or full path.
   goto :cleanup
 )
+
 if not exist "%CSV_PATH%" (
   echo [ERROR] CSV not found: %CSV_PATH%
   goto :cleanup
@@ -48,22 +45,24 @@ if not exist "%STREAMER%" (
 REM ==========================================================
 REM Experiment policy
 REM ==========================================================
-REM Receiver params (fixed)
+REM Receiver params
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
-set "ENABLE_COMPLETION=1"
 
-REM Warmup
-REM map compile が 1-2 分走る前提で長めに待つ
+REM Warmup: map compile待ちを考慮して長めに待つ
 set "WARMUP_INTERVAL=0.1"
-set "WARMUP_WAIT_SEC=0"
-set "WARMUP_CHECK_TIMEOUT_SEC=420"
-set "WARMUP_CHECK_INTERVAL_SEC=5"
-set "WARMUP_MAX_ATTEMPTS=2"
+set "WARMUP_WAIT_SEC=2"
+set "WARMUP_TIMEOUT_SEC=600"
+set "WARMUP_POLL_SEC=5"
 
-REM Sweep (Ts only). sender is ALWAYS full-send.
+REM Sweep params
 set "TS_LIST=0.10 1.00"
 set "COOLDOWN_SEC=3"
+
+REM Actor count sweep
+set "N_START=10"
+set "N_STEP=10"
+set "N_END=100"
 
 REM ==========================================================
 REM OUTDIR
@@ -74,7 +73,6 @@ mkdir "%OUTDIR%" 2>nul
 
 set "RECEIVER_STDOUT=%OUTDIR%\receiver_stdout.log"
 set "RECEIVER_STDERR=%OUTDIR%\receiver_stderr.log"
-set "RECEIVER_PID_FILE=%OUTDIR%\receiver_pid.txt"
 set "RECEIVER_TIMING_CSV=%OUTDIR%\update_timings_all.csv"
 set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 
@@ -82,11 +80,11 @@ echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
 
 REM ==========================================================
-REM Pre-clean (kill stale processes + free UDP port)
+REM Pre-clean: stop only our known scripts (no wmic)
 REM ==========================================================
 echo [INFO] Cleaning stale python processes (receiver/streamer)...
-call :kill_python_by_cmd "replay_from_udp.py"
 call :kill_python_by_cmd "vehicle_state_stream.py"
+call :kill_python_by_cmd "replay_from_udp.py"
 
 echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
@@ -95,17 +93,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} } }" >nul 2>nul
 
 REM ==========================================================
-REM Start receiver (PID -> file, avoid for /f hanging)
+REM Start receiver (python -u, stdout/stderr separate)
+REM   NOTE: RedirectStandardOutput と RedirectStandardError は同一パス不可
 REM ==========================================================
 echo [INFO] Starting receiver...
-
 type nul > "%RECEIVER_STDOUT%"
 type nul > "%RECEIVER_STDERR%"
-del /q "%RECEIVER_PID_FILE%" >nul 2>&1
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
   "$args=@(" ^
+  "  '-u'," ^
   "  '%RECEIVER%'," ^
   "  '--carla-host','%CARLA_HOST%'," ^
   "  '--carla-port','%CARLA_PORT%'," ^
@@ -117,177 +115,147 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  '--timing-output','%RECEIVER_TIMING_CSV%'," ^
   "  '--eval-output','%RECEIVER_EVAL_CSV%'" ^
   ");" ^
-  "if(%ENABLE_COMPLETION% -eq 1){ $args += '--enable-completion' }" ^
   "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
-  "Start-Sleep -Milliseconds 400;" ^
-  "if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode | Out-File -Encoding utf8 '%RECEIVER_STDERR%' -Append; exit 2 }" ^
-  "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'; exit 0" ^
-  1>>"%RECEIVER_STDOUT%" 2>>"%RECEIVER_STDERR%"
+  "Start-Sleep -Milliseconds 500;" ^
+  "if($p.HasExited){ throw ('receiver exited early. ExitCode=' + $p.ExitCode) }" ^
+  >nul 2>>"%RECEIVER_STDERR%"
 
 if errorlevel 1 (
-  echo [ERROR] Failed to start receiver. Check logs:
-  call :tail "%RECEIVER_STDERR%" 80
-  call :tail "%RECEIVER_STDOUT%" 40
+  echo [ERROR] Failed to start receiver. Check receiver_stderr:
+  if exist "%RECEIVER_STDERR%" type "%RECEIVER_STDERR%"
   goto :cleanup
 )
 
-if not exist "%RECEIVER_PID_FILE%" (
-  echo [ERROR] receiver_pid.txt not created. Check logs:
-  call :tail "%RECEIVER_STDERR%" 80
-  call :tail "%RECEIVER_STDOUT%" 40
-  goto :cleanup
-)
+REM receiverが起きてるか軽く確認
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$p=Get-CimInstance Win32_Process -Filter ""Name='python.exe'"" | Where-Object { $_.CommandLine -like '*replay_from_udp.py*' } | Select-Object -First 1;" ^
+  "if(-not $p){ exit 2 } else { $p.ProcessId }" > "%OUTDIR%\receiver_pid.txt" 2>nul
 
-set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
+set "RECEIVER_PID="
+set /p RECEIVER_PID=<"%OUTDIR%\receiver_pid.txt"
 echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
-  echo [ERROR] Invalid receiver PID: %RECEIVER_PID%
-  call :tail "%RECEIVER_STDERR%" 80
+  echo [ERROR] receiver PID not detected. Stderr tail:
+  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 30 }"
+  goto :cleanup
+)
+echo [INFO] receiver PID=%RECEIVER_PID%
+
+REM ==========================================================
+REM Warmup (discard run): send once, then wait until receiver sees nonzero actor updates
+REM   map compileで1-2分止まる想定 => timeout長め
+REM ==========================================================
+echo [INFO] Warmup (discard-first) start. interval=%WARMUP_INTERVAL% timeout=%WARMUP_TIMEOUT_SEC%s
+
+REM sender warmup: 全送信
+"%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
+  --host "%UDP_HOST%" --port "%UDP_PORT%" ^
+  --interval %WARMUP_INTERVAL% ^
+  > "%OUTDIR%\warmup_sender.log" 2>&1
+
+findstr /i /c:"Sent 0 frames" "%OUTDIR%\warmup_sender.log" >nul 2>&1
+if !errorlevel! EQU 0 (
+  echo [ERROR] Warmup sender sent 0 frames. Check warmup_sender.log:
+  type "%OUTDIR%\warmup_sender.log"
   goto :cleanup
 )
 
-echo [INFO] receiver PID=%RECEIVER_PID%
-timeout /t 2 /nobreak >nul
+if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
 
-REM ==========================================================
-REM Warmup:
-REM   - sender: full send (start/end 使わない)
-REM   - confirm: receiver stdout/stderr の tail に "(>=1 actor updates)" が出るまで待つ
-REM ==========================================================
-for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
-  echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
-  echo [INFO] Warmup send interval=%WARMUP_INTERVAL%
-
-  "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
-    --host "%UDP_HOST%" --port "%UDP_PORT%" ^
-    --interval %WARMUP_INTERVAL% ^
-    > "%OUTDIR%\warmup_sender.log" 2>&1
-
-  if errorlevel 1 (
-    echo [ERROR] Warmup sender failed. Tail:
-    call :tail "%OUTDIR%\warmup_sender.log" 120
-    goto :cleanup
-  )
-
-  findstr /i /c:"Sent 0 frames" "%OUTDIR%\warmup_sender.log" >nul 2>&1
-  if !errorlevel! EQU 0 (
-    echo [ERROR] Warmup sender sent 0 frames. Tail:
-    call :tail "%OUTDIR%\warmup_sender.log" 120
-    goto :cleanup
-  )
-
-  if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
-
-  call :wait_actor_updates_tail "%RECEIVER_STDOUT%" "%RECEIVER_STDERR%" %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
-  if !errorlevel! EQU 0 (
-    echo [INFO] Warmup confirmed (nonzero actor updates).
-    goto :warmup_done
-  )
-
-  echo [WARN] Warmup not confirmed yet. (map compile may be running) retry...
+call :wait_for_actor_updates "%RECEIVER_STDERR%" %WARMUP_TIMEOUT_SEC% %WARMUP_POLL_SEC%
+if errorlevel 1 (
+  echo [WARN] Warmup did not confirm actor updates within timeout.
+  echo [WARN] Proceeding anyway, but first measured run may be contaminated by map compile.
   echo [INFO] receiver_stderr tail:
-  call :tail "%RECEIVER_STDERR%" 30
+  powershell -NoProfile -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 30 }"
+) else (
+  echo [INFO] Warmup confirmed (nonzero actor updates detected). First measured run should be clean.
 )
 
-echo [ERROR] Warmup failed (no actor updates observed).
-echo [INFO] receiver_stderr tail:
-call :tail "%RECEIVER_STDERR%" 80
-echo [INFO] receiver_stdout tail:
-call :tail "%RECEIVER_STDOUT%" 40
-goto :cleanup
-
-:warmup_done
-
 REM ==========================================================
-REM Sweep runs (receiver stays; streamer+sender per Ts)
-REM   sender: ALWAYS full send
+REM Sweep runs (receiver stays)
+REM   For each (N, Ts):
+REM     - start streamer
+REM     - run sender (full frames, but max-actors=N)
+REM     - stop streamer
 REM ==========================================================
-for %%T in (%TS_LIST%) do (
-  set "TAG=Ts%%T"
-  set "RUNDIR=%OUTDIR%\!TAG!"
-  mkdir "!RUNDIR!" 2>nul
+for /L %%N in (%N_START%,%N_STEP%,%N_END%) do (
+  for %%T in (%TS_LIST%) do (
 
-  set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
-  set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
-  set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
-  set "STREAMER_STDOUT=!RUNDIR!\streamer_stdout_!TAG!.log"
-  set "STREAMER_STDERR=!RUNDIR!\streamer_stderr_!TAG!.log"
+    set "TAG=N%%N_Ts%%T"
+    set "RUNDIR=%OUTDIR%\!TAG!"
+    mkdir "!RUNDIR!" 2>nul
 
-  echo ============================================================
-  echo [RUN] !TAG!
-  echo [DIR] !RUNDIR!
+    set "STREAM_CSV=!RUNDIR!\replay_state_!TAG!.csv"
+    set "STREAM_TIMING_CSV=!RUNDIR!\stream_timing_!TAG!.csv"
+    set "SENDER_LOG=!RUNDIR!\sender_!TAG!.log"
+    set "STREAMER_STDOUT=!RUNDIR!\streamer_stdout.log"
+    set "STREAMER_STDERR=!RUNDIR!\streamer_stderr.log"
 
-  type nul > "!STREAMER_STDOUT!"
-  type nul > "!STREAMER_STDERR!"
-  set "STREAMER_PID="
+    echo ============================================================
+    echo [RUN] !TAG!
+    echo [DIR] !RUNDIR!
 
-  for /f "usebackq delims=" %%P in (`
+    type nul > "!STREAMER_STDOUT!"
+    type nul > "!STREAMER_STDERR!"
+
+    REM start streamer (python -u)
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
       "$ErrorActionPreference='Stop';" ^
-      "try{" ^
-      "  $args=@(" ^
-      "    '%STREAMER%'," ^
-      "    '--host','%CARLA_HOST%'," ^
-      "    '--port','%CARLA_PORT%'," ^
-      "    '--mode','wait'," ^
-      "    '--role-prefix','udp_replay:'," ^
-      "    '--include-velocity'," ^
-      "    '--frame-elapsed'," ^
-      "    '--wall-clock'," ^
-      "    '--include-object-id'," ^
-      "    '--include-monotonic'," ^
-      "    '--include-tick-wall-dt'," ^
-      "    '--output','!STREAM_CSV!'," ^
-      "    '--timing-output','!STREAM_TIMING_CSV!'," ^
-      "    '--timing-flush-every','10'" ^
-      "  );" ^
-      "  $p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR!';" ^
-      "  Start-Sleep -Milliseconds 300;" ^
-      "  if($p.HasExited){ 'START_FAILED: exited early. ExitCode=' + $p.ExitCode; exit 0 }" ^
-      "  $p.Id" ^
-      "} catch { 'START_FAILED: ' + $_.Exception.Message }"
-  `) do set "STREAMER_PID=%%P"
+      "$args=@(" ^
+      "  '-u'," ^
+      "  '%STREAMER%'," ^
+      "  '--host','%CARLA_HOST%'," ^
+      "  '--port','%CARLA_PORT%'," ^
+      "  '--mode','wait'," ^
+      "  '--role-prefix','udp_replay:'," ^
+      "  '--include-velocity'," ^
+      "  '--frame-elapsed'," ^
+      "  '--wall-clock'," ^
+      "  '--include-object-id'," ^
+      "  '--include-monotonic'," ^
+      "  '--include-tick-wall-dt'," ^
+      "  '--output','!STREAM_CSV!'," ^
+      "  '--timing-output','!STREAM_TIMING_CSV!'," ^
+      "  '--timing-flush-every','10'" ^
+      ");" ^
+      "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR%';" ^
+      "Start-Sleep -Milliseconds 400;" ^
+      "if($p.HasExited){ throw ('streamer exited early. ExitCode=' + $p.ExitCode) }" ^
+      >nul 2>>"!STREAMER_STDERR!"
 
-  echo [INFO] streamer start result: !STREAMER_PID!
-  echo !STREAMER_PID!| findstr /r "^[0-9][0-9]*$" >nul
-  if errorlevel 1 (
-    echo [ERROR] Failed to start streamer. Reason:
-    echo !STREAMER_PID!
-    echo [ERROR] streamer_stderr:
-    call :tail "!STREAMER_STDERR!" 120
-    echo [ERROR] streamer_stdout:
-    call :tail "!STREAMER_STDOUT!" 80
-    goto :cleanup
+    if errorlevel 1 (
+      echo [ERROR] Failed to start streamer. streamer_stderr tail:
+      powershell -NoProfile -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 40 }"
+      goto :cleanup
+    )
+
+    timeout /t 1 /nobreak >nul
+
+    echo [INFO] Sending... N=%%N Ts=%%T (sender sends full frames; limits actor count per frame)
+    "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
+      --host "%UDP_HOST%" --port "%UDP_PORT%" ^
+      --interval %%T ^
+      --max-actors %%N ^
+      > "!SENDER_LOG!" 2>&1
+
+    findstr /i /c:"Sent 0 frames" "!SENDER_LOG!" >nul 2>&1
+    if !errorlevel! EQU 0 (
+      echo [ERROR] Sender sent 0 frames for !TAG!. Check sender log:
+      type "!SENDER_LOG!"
+      goto :cleanup
+    )
+
+    REM stop streamer (kill by cmd substring; no PID needed)
+    call :kill_python_by_cmd "vehicle_state_stream.py"
+
+    timeout /t %COOLDOWN_SEC% /nobreak >nul
+    echo [DONE] !TAG!
   )
-
-  timeout /t 1 /nobreak >nul
-
-  echo [INFO] Sending... Ts=%%T
-  "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" ^
-    --host "%UDP_HOST%" --port "%UDP_PORT%" ^
-    --interval %%T ^
-    > "!SENDER_LOG!" 2>&1
-
-  if errorlevel 1 (
-    echo [ERROR] sender failed. Tail:
-    call :tail "!SENDER_LOG!" 200
-    goto :cleanup
-  )
-
-  findstr /i /c:"Sent 0 frames" "!SENDER_LOG!" >nul 2>&1
-  if !errorlevel! EQU 0 (
-    echo [ERROR] sender sent 0 frames. Tail:
-    call :tail "!SENDER_LOG!" 120
-    goto :cleanup
-  )
-
-  taskkill /PID !STREAMER_PID! /T /F >nul 2>&1
-  timeout /t %COOLDOWN_SEC% /nobreak >nul
-  echo [DONE] !TAG!
 )
 
 echo [INFO] Stopping receiver...
-if defined RECEIVER_PID taskkill /PID %RECEIVER_PID% /T /F >nul 2>&1
+call :kill_python_by_cmd "replay_from_udp.py"
 
 echo [ALL DONE] %OUTDIR%
 popd
@@ -298,7 +266,6 @@ exit /b 0
 echo [CLEANUP]
 call :kill_python_by_cmd "vehicle_state_stream.py"
 call :kill_python_by_cmd "replay_from_udp.py"
-if defined RECEIVER_PID taskkill /PID %RECEIVER_PID% /T /F >nul 2>&1
 popd
 endlocal
 exit /b 1
@@ -317,34 +284,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
 endlocal & exit /b 0
 
-:tail
-REM %1 path, %2 lines
+:wait_for_actor_updates
+REM %1 log_path, %2 timeout_sec, %3 poll_sec
 setlocal
-set "P=%~1"
-set "N=%~2"
+set "LOG=%~1"
+set "TMO=%~2"
+set "POLL=%~3"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "if(Test-Path '%P%'){ Get-Content -Tail %N% '%P%' }" 2>nul
-endlocal & exit /b 0
-
-:wait_actor_updates_tail
-REM args: %1 stdout_path, %2 stderr_path, %3 timeout_sec, %4 interval_sec
-setlocal EnableDelayedExpansion
-set "OUTP=%~1"
-set "ERRP=%~2"
-set "TMO=%~3"
-set "INT=%~4"
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$out='%OUTP%'; $err='%ERRP%'; $timeout=%TMO%; $interval=%INT%;" ^
-  "$sw=[Diagnostics.Stopwatch]::StartNew();" ^
+  "$path='%LOG%'; $timeout=[int]%TMO%; $poll=[int]%POLL%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
   "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
-  "  $txt='';" ^
-  "  if(Test-Path $out){ $txt += (Get-Content -Tail 200 -Raw -ErrorAction SilentlyContinue $out) }" ^
-  "  if(Test-Path $err){ $txt += (Get-Content -Tail 200 -Raw -ErrorAction SilentlyContinue $err) }" ^
-  "  if($txt -match '\(([1-9][0-9]*) actor updates\)'){ exit 0 }" ^
-  "  Start-Sleep -Seconds $interval" ^
+  "  if(Test-Path $path){" ^
+  "    $tail = Get-Content -LiteralPath $path -Tail 200 -ErrorAction SilentlyContinue;" ^
+  "    foreach($line in $tail){" ^
+  "      if($line -match '\(([1-9][0-9]*) actor updates\)'){ exit 0 }" ^
+  "    }" ^
+  "  }" ^
+  "  Start-Sleep -Seconds $poll" ^
   "}" ^
   "exit 1" >nul
-
 set "RC=%errorlevel%"
 endlocal & exit /b %RC%
