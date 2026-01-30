@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 pushd "%~dp0"
 
 REM ==========================================================
-REM Executables
+REM Paths / executables (NO embedded quotes)
 REM ==========================================================
 set "ROOT=%~dp0"
 set "PYTHON_EXE=python"
@@ -14,14 +14,14 @@ if errorlevel 1 (
   goto :cleanup
 )
 
-set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-if not exist "%PS%" (
-  set "PS=pwsh"
-  where "%PS%" >nul 2>&1
+set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PS_EXE%" (
+  where pwsh >nul 2>&1
   if errorlevel 1 (
     echo [ERROR] PowerShell not found. (powershell.exe / pwsh)
     goto :cleanup
   )
+  set "PS_EXE=pwsh"
 )
 
 REM ==========================================================
@@ -39,7 +39,7 @@ set "SENDER=%ROOT%send_data\send_udp_frames_from_csv.py"
 set "RECEIVER=%ROOT%scripts\udp_replay\replay_from_udp.py"
 set "STREAMER=%ROOT%scripts\vehicle_state_stream.py"
 
-REM normalize accidental quotes (safety)
+REM sanitize accidental quotes
 set "CSV_PATH=%CSV_PATH:"=%"
 set "SENDER=%SENDER:"=%"
 set "RECEIVER=%RECEIVER:"=%"
@@ -56,7 +56,7 @@ REM ==========================================================
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
-REM Warmup: first actor spawn can trigger map compile (long)
+REM Warmup: first spawn may trigger long map compile
 set "WARMUP_INTERVAL=0.1"
 set "WARMUP_WAIT_SEC=2"
 set "WARMUP_CHECK_TIMEOUT_SEC=900"
@@ -71,9 +71,25 @@ set "N_STEP=10"
 set "COOLDOWN_SEC=3"
 
 REM ==========================================================
-REM OUTDIR (use PowerShell to avoid locale DATE/TIME junk)
+REM OUTDIR timestamp (via temp file, avoids for/f quoting traps)
 REM ==========================================================
-for /f "usebackq delims=" %%i in (`"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Date -Format yyyyMMdd_HHmmss_fff"`) do set "DT_TAG=%%i"
+set "DT_FILE=%ROOT%__dt.txt"
+del /q "%DT_FILE%" >nul 2>&1
+call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Date -Format yyyyMMdd_HHmmss_fff | Out-File -Encoding ascii '%DT_FILE%'" >nul 2>nul
+set "DT_TAG="
+if exist "%DT_FILE%" set /p DT_TAG=<"%DT_FILE%"
+del /q "%DT_FILE%" >nul 2>&1
+
+if not defined DT_TAG (
+  REM fallback (no PS): DATE/TIME sanitized
+  set "DT_TAG=%DATE%_%TIME%"
+  set "DT_TAG=%DT_TAG:/=%"
+  set "DT_TAG=%DT_TAG:-=%"
+  set "DT_TAG=%DT_TAG:.=%"
+  set "DT_TAG=%DT_TAG: =0%"
+  set "DT_TAG=%DT_TAG::=%"
+)
+
 set "OUTDIR=%ROOT%sweep_results_%DT_TAG%"
 mkdir "%OUTDIR%" 2>nul
 
@@ -85,7 +101,7 @@ set "RECEIVER_EVAL_CSV=%OUTDIR%\eval_all.csv"
 
 echo [INFO] OUTDIR=%OUTDIR%
 echo [INFO] CSV=%CSV_PATH%
-echo [INFO] PS=%PS%
+echo [INFO] PS_EXE=%PS_EXE%
 
 REM ==========================================================
 REM Pre-clean
@@ -98,38 +114,50 @@ echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
 call :free_udp_port %UDP_PORT%
 
 REM ==========================================================
-REM Start receiver (python direct, separate stdout/stderr)
+REM Start receiver (python direct, stdout/stderr separate)
 REM ==========================================================
 echo [INFO] Starting receiver...
-
 type nul > "%RECEIVER_STDOUT%"
 type nul > "%RECEIVER_STDERR%"
 del /q "%RECEIVER_PID_FILE%" >nul 2>&1
 
-set "RECEIVER_PID="
-call :ps_start_python_pid RECEIVER_PID "%RECEIVER_STDOUT%" "%RECEIVER_STDERR%" "%ROOT%" ^
+call :ps_start_python_pid "%RECEIVER_PID_FILE%" "%ROOT%" "%RECEIVER_STDOUT%" "%RECEIVER_STDERR%" ^
   "%RECEIVER%" ^
-  "--carla-host|%CARLA_HOST%|--carla-port|%CARLA_PORT%|--listen-host|%LISTEN_HOST%|--listen-port|%UDP_PORT%|--fixed-delta|%FIXED_DELTA%|--stale-timeout|%STALE_TIMEOUT%|--measure-update-times|--timing-output|%RECEIVER_TIMING_CSV%|--eval-output|%RECEIVER_EVAL_CSV%"
+  "--carla-host" "%CARLA_HOST%" ^
+  "--carla-port" "%CARLA_PORT%" ^
+  "--listen-host" "%LISTEN_HOST%" ^
+  "--listen-port" "%UDP_PORT%" ^
+  "--fixed-delta" "%FIXED_DELTA%" ^
+  "--stale-timeout" "%STALE_TIMEOUT%" ^
+  "--measure-update-times" ^
+  "--timing-output" "%RECEIVER_TIMING_CSV%" ^
+  "--eval-output" "%RECEIVER_EVAL_CSV%"
 
-if not defined RECEIVER_PID (
+if errorlevel 1 (
   echo [ERROR] Failed to start receiver. receiver_stderr tail:
-  "%PS%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 80 }"
+  call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 80 }"
   goto :cleanup
 )
 
-echo %RECEIVER_PID%> "%RECEIVER_PID_FILE%"
+set "RECEIVER_PID="
+set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
+echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
+if errorlevel 1 (
+  echo [ERROR] Invalid receiver PID: %RECEIVER_PID%
+  goto :cleanup
+)
 echo [INFO] receiver PID=%RECEIVER_PID%
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup (discard): send once to trigger compile, wait actor updates
+REM Warmup (discard)
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
   echo [INFO] Warmup send interval=%WARMUP_INTERVAL% (discard)
 
   set "LOG_OFFSET=0"
-  for /f "usebackq delims=" %%S in (`"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ (Get-Item '%RECEIVER_STDERR%').Length } else { 0 }"`) do set "LOG_OFFSET=%%S"
+  for /f "usebackq delims=" %%S in (`call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ (Get-Item '%RECEIVER_STDERR%').Length } else { 0 }"`) do set "LOG_OFFSET=%%S"
 
   "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% > "%OUTDIR%\warmup_sender.log" 2>&1
 
@@ -149,7 +177,7 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   )
 
   echo [WARN] Warmup not confirmed yet. receiver_stderr tail:
-  "%PS%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 30 }"
+  call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 30 }"
 )
 
 echo [WARN] Warmup not confirmed, but continue anyway.
@@ -181,17 +209,35 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
     type nul > "!STREAMER_STDERR!"
     del /q "!STREAMER_PID_FILE!" >nul 2>&1
 
-    set "STREAMER_PID="
-    call :ps_start_python_pid STREAMER_PID "!STREAMER_STDOUT!" "!STREAMER_STDERR!" "%ROOT%" ^
+    call :ps_start_python_pid "!STREAMER_PID_FILE!" "%ROOT%" "!STREAMER_STDOUT!" "!STREAMER_STDERR!" ^
       "%STREAMER%" ^
-      "--host|%CARLA_HOST%|--port|%CARLA_PORT%|--mode|wait|--role-prefix|udp_replay:|--include-velocity|--frame-elapsed|--wall-clock|--include-object-id|--include-monotonic|--include-tick-wall-dt|--output|!STREAM_CSV!|--timing-output|!STREAM_TIMING_CSV!|--timing-flush-every|10"
+      "--host" "%CARLA_HOST%" ^
+      "--port" "%CARLA_PORT%" ^
+      "--mode" "wait" ^
+      "--role-prefix" "udp_replay:" ^
+      "--include-velocity" ^
+      "--frame-elapsed" ^
+      "--wall-clock" ^
+      "--include-object-id" ^
+      "--include-monotonic" ^
+      "--include-tick-wall-dt" ^
+      "--output" "!STREAM_CSV!" ^
+      "--timing-output" "!STREAM_TIMING_CSV!" ^
+      "--timing-flush-every" "10"
 
-    if not defined STREAMER_PID (
+    if errorlevel 1 (
       echo [ERROR] Failed to start streamer. streamer_stderr tail:
-      "%PS%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 80 }"
+      call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 80 }"
       goto :cleanup
     )
-    echo !STREAMER_PID!> "!STREAMER_PID_FILE!"
+
+    set "STREAMER_PID="
+    set /p STREAMER_PID=<"!STREAMER_PID_FILE!"
+    echo !STREAMER_PID!| findstr /r "^[0-9][0-9]*$" >nul
+    if errorlevel 1 (
+      echo [ERROR] Invalid streamer PID: !STREAMER_PID!
+      goto :cleanup
+    )
 
     timeout /t 1 /nobreak >nul
 
@@ -201,7 +247,7 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
     findstr /i /c:"Sent 0 frames" "!SENDER_LOG!" >nul 2>&1
     if !errorlevel! EQU 0 (
       echo [ERROR] sender sent 0 frames. sender log tail:
-      "%PS%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Content '!SENDER_LOG!' -Tail 60"
+      call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Content '!SENDER_LOG!' -Tail 60"
       goto :cleanup
     )
 
@@ -236,7 +282,7 @@ REM ==========================================================
 REM %1 substring in CommandLine; kill python and wrappers
 setlocal EnableExtensions
 set "SUB=%~1"
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command ^
+call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
   "$sub='%SUB%';" ^
   "$procs=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like ('*'+$sub+'*')) };" ^
   "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
@@ -246,7 +292,7 @@ endlocal & exit /b 0
 REM %1 port
 setlocal EnableExtensions
 set "PORT=%~1"
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command ^
+call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
   "$p=[int]%PORT%; for($i=0;$i -lt 5;$i++){" ^
   "  $eps=Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue;" ^
   "  if(-not $eps){ exit 0 }" ^
@@ -257,31 +303,40 @@ set "PORT=%~1"
 endlocal & exit /b 0
 
 :ps_start_python_pid
-REM args:
-REM   %1 outvar(PID) %2 stdout %3 stderr %4 workdir %5 script %6 argpipe(--a|v|--b|v|flag)
-setlocal EnableExtensions DisableDelayedExpansion
-set "OUTVAR=%~1"
-set "%OUTVAR%="
-set "STDOUT=%~2"
-set "STDERR=%~3"
-set "WORK=%~4"
+REM usage:
+REM   call :ps_start_python_pid <pid_file> <workdir> <stdout> <stderr> <script> <args...>
+setlocal EnableExtensions
+set "PID_FILE=%~1"
+set "WORKDIR=%~2"
+set "STDOUT=%~3"
+set "STDERR=%~4"
 set "SCRIPT=%~5"
-set "ARGPIPE=%~6"
+shift /5
 
-REM Capture PID by printing only PID from PowerShell
-for /f "usebackq delims=" %%P in (`
-  "%PS%" -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ErrorActionPreference='Stop';" ^
-    "$args = @('%SCRIPT%') + ('%ARGPIPE%'.Split('|') | Where-Object { $_ -ne '' });" ^
-    "$p = Start-Process -PassThru -NoNewWindow -WorkingDirectory '%WORK%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%STDOUT%' -RedirectStandardError '%STDERR%';" ^
-    "Start-Sleep -Milliseconds 400;" ^
-    "if($p.HasExited){ throw ('exited early. ExitCode=' + $p.ExitCode) }" ^
-    "$p.Id"
-`) do (
-  endlocal & set "%OUTVAR=%%P" & exit /b 0
+REM Build a PS array literal from remaining args (already separated)
+set "PSARGS="
+:psargs_loop
+if "%~1"=="" goto :psargs_done
+set "A=%~1"
+REM escape single quotes for PowerShell single-quoted strings
+set "A=%A:'=''%"
+set "PSARGS=%PSARGS%,'%A%'"
+shift /1
+goto :psargs_loop
+:psargs_done
+
+call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='Stop';" ^
+  "$args=@('%SCRIPT%'%PSARGS%);" ^
+  "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%WORKDIR%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%STDOUT%' -RedirectStandardError '%STDERR%';" ^
+  "Start-Sleep -Milliseconds 400;" ^
+  "if($p.HasExited){ throw ('exited early. ExitCode=' + $p.ExitCode) }" ^
+  "$p.Id | Out-File -Encoding ascii '%PID_FILE%'" >nul 2>nul
+
+if errorlevel 1 (
+  endlocal & exit /b 1
 )
-
-endlocal & exit /b 1
+endlocal & exit /b 0
 
 :wait_actor_updates_in_log
 REM args: %1 log_path, %2 offset_bytes, %3 timeout_sec, %4 interval_sec
@@ -291,7 +346,7 @@ set "OFF=%~2"
 set "TMO=%~3"
 set "INT=%~4"
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command ^
+call "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
   "$path='%LOG%'; $off=[int64]%OFF%; $timeout=%TMO%; $interval=%INT%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
   "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
   "  if(Test-Path $path){" ^
@@ -305,7 +360,7 @@ set "INT=%~4"
   "  }" ^
   "  Start-Sleep -Seconds $interval" ^
   "}" ^
-  "exit 1" >nul
+  "exit 1" >nul 2>nul
 
 set "RC=%errorlevel%"
 endlocal & exit /b %RC%
