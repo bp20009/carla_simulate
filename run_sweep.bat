@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 pushd "%~dp0"
 
 REM ==========================================================
-REM Paths / executables
+REM Executables
 REM ==========================================================
 set "ROOT=%~dp0"
 set "PYTHON_EXE=python"
@@ -14,17 +14,11 @@ if errorlevel 1 (
   goto :cleanup
 )
 
-REM --- Resolve PowerShell to FULL PATH ---
 set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-if exist "%PS_EXE%" goto :ps_ok
-set "PS_EXE="
-for /f "delims=" %%I in ('where pwsh 2^>nul') do (
-  set "PS_EXE=%%I"
-  goto :ps_ok
+if not exist "%PS_EXE%" (
+  echo [ERROR] PowerShell not found: %PS_EXE%
+  goto :cleanup
 )
-echo [ERROR] PowerShell not found. (powershell.exe / pwsh)
-goto :cleanup
-:ps_ok
 echo [INFO] PS_EXE=%PS_EXE%
 
 REM ==========================================================
@@ -42,16 +36,28 @@ set "SENDER=%ROOT%send_data\send_udp_frames_from_csv.py"
 set "RECEIVER=%ROOT%scripts\udp_replay\replay_from_udp.py"
 set "STREAMER=%ROOT%scripts\vehicle_state_stream.py"
 
-REM remove accidental quotes
+REM strip accidental quotes
 set "CSV_PATH=%CSV_PATH:"=%"
 set "SENDER=%SENDER:"=%"
 set "RECEIVER=%RECEIVER:"=%"
 set "STREAMER=%STREAMER:"=%"
 
-if not exist "%CSV_PATH%"    ( echo [ERROR] CSV not found: %CSV_PATH% & goto :cleanup )
-if not exist "%SENDER%"      ( echo [ERROR] sender not found: %SENDER% & goto :cleanup )
-if not exist "%RECEIVER%"    ( echo [ERROR] receiver not found: %RECEIVER% & goto :cleanup )
-if not exist "%STREAMER%"    ( echo [ERROR] streamer not found: %STREAMER% & goto :cleanup )
+if not exist "%CSV_PATH%" (
+  echo [ERROR] CSV not found: %CSV_PATH%
+  goto :cleanup
+)
+if not exist "%SENDER%" (
+  echo [ERROR] sender not found: %SENDER%
+  goto :cleanup
+)
+if not exist "%RECEIVER%" (
+  echo [ERROR] receiver not found: %RECEIVER%
+  goto :cleanup
+)
+if not exist "%STREAMER%" (
+  echo [ERROR] streamer not found: %STREAMER%
+  goto :cleanup
+)
 
 REM ==========================================================
 REM Policy
@@ -59,12 +65,11 @@ REM ==========================================================
 set "FIXED_DELTA=0.05"
 set "STALE_TIMEOUT=2.0"
 
-REM Warmup: map compile can take 1-2 min, so keep receiver alive and wait long
+REM Warmup: map compile can be long -> wait up to 900s for nonzero actor updates
 set "WARMUP_INTERVAL=0.1"
-set "WARMUP_WAIT_SEC=2"
+set "WARMUP_MAX_ATTEMPTS=2"
 set "WARMUP_CHECK_TIMEOUT_SEC=900"
 set "WARMUP_CHECK_INTERVAL_SEC=5"
-set "WARMUP_MAX_ATTEMPTS=2"
 
 REM Sweep
 set "TS_LIST=0.10 1.00"
@@ -74,7 +79,7 @@ set "N_STEP=10"
 set "COOLDOWN_SEC=3"
 
 REM ==========================================================
-REM OUTDIR (bat-only safe timestamp, no ':' )
+REM OUTDIR (safe, no ':' )
 REM ==========================================================
 set "DT_TAG=%DATE%"
 set "DT_TAG=%DT_TAG:/=%"
@@ -100,17 +105,15 @@ echo [INFO] CSV=%CSV_PATH%
 
 REM ==========================================================
 REM Pre-clean
+REM   - free UDP port (avoid WinError 10048)
+REM   - do NOT rely on wmic (24H2)
 REM ==========================================================
-echo [INFO] Cleaning stale processes (receiver/streamer)...
-call :kill_by_cmdline "replay_from_udp.py"
-call :kill_by_cmdline "vehicle_state_stream.py"
-
 echo [INFO] Freeing UDP port %UDP_PORT% if occupied...
-call :free_udp_port %UDP_PORT%
+call :free_udp_port_netstat %UDP_PORT%
 
 REM ==========================================================
-REM Start receiver (Start-Process, PID -> file, separate stdout/stderr)
-REM   NOTE: receiver args include --enable-completion (requested)
+REM Start receiver (PID written to file, stdout/stderr separated)
+REM   IMPORTANT: no extra args injected
 REM ==========================================================
 echo [INFO] Starting receiver...
 type nul > "%RECEIVER_STDOUT%"
@@ -134,18 +137,12 @@ del /q "%RECEIVER_PID_FILE%" >nul 2>&1
   ");" ^
   "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '%RECEIVER_STDOUT%' -RedirectStandardError '%RECEIVER_STDERR%';" ^
   "Start-Sleep -Milliseconds 500;" ^
-  "if($p.HasExited){ ('receiver exited early. ExitCode=' + $p.ExitCode) | Add-Content -Encoding utf8 '%RECEIVER_STDERR%'; exit 2 }" ^
+  "if($p.HasExited){ exit 2 }" ^
   "$p.Id | Out-File -Encoding ascii '%RECEIVER_PID_FILE%'; exit 0" >nul 2>nul
-
-if errorlevel 1 (
-  echo [ERROR] Failed to start receiver. receiver_stderr tail:
-  "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 120 }"
-  goto :cleanup
-)
 
 if not exist "%RECEIVER_PID_FILE%" (
   echo [ERROR] receiver_pid.txt not created. receiver_stderr tail:
-  "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 120 }"
+  type "%RECEIVER_STDERR%"
   goto :cleanup
 )
 
@@ -154,21 +151,23 @@ set /p RECEIVER_PID=<"%RECEIVER_PID_FILE%"
 echo %RECEIVER_PID%| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
   echo [ERROR] Invalid receiver PID: %RECEIVER_PID%
+  echo [ERROR] receiver_stderr:
+  type "%RECEIVER_STDERR%"
   goto :cleanup
 )
-
 echo [INFO] receiver PID=%RECEIVER_PID%
+
+REM give it a moment
 timeout /t 2 /nobreak >nul
 
 REM ==========================================================
-REM Warmup (discard): send once, wait until "(>=1 actor updates)" appears
+REM Warmup (discard run)
+REM   - send once
+REM   - wait until receiver_stderr contains NONZERO "actor updates"
 REM ==========================================================
 for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
   echo [INFO] Warmup attempt %%A/%WARMUP_MAX_ATTEMPTS%
   echo [INFO] Warmup send interval=%WARMUP_INTERVAL% (discard)
-
-  set "LOG_OFFSET=0"
-  for /f "usebackq delims=" %%S in (`"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ (Get-Item '%RECEIVER_STDERR%').Length } else { 0 }"`) do set "LOG_OFFSET=%%S"
 
   "%PYTHON_EXE%" "%SENDER%" "%CSV_PATH%" --host "%UDP_HOST%" --port "%UDP_PORT%" --interval %WARMUP_INTERVAL% > "%OUTDIR%\warmup_sender.log" 2>&1
 
@@ -179,20 +178,17 @@ for /L %%A in (1,1,%WARMUP_MAX_ATTEMPTS%) do (
     goto :cleanup
   )
 
-  if %WARMUP_WAIT_SEC% GTR 0 timeout /t %WARMUP_WAIT_SEC% /nobreak >nul
-
-  call :wait_actor_updates_in_log "%RECEIVER_STDERR%" !LOG_OFFSET! %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
+  call :wait_nonzero_actor_updates "%RECEIVER_STDERR%" %WARMUP_CHECK_TIMEOUT_SEC% %WARMUP_CHECK_INTERVAL_SEC%
   if !errorlevel! EQU 0 (
-    echo [INFO] Warmup confirmed (actor updates detected).
+    echo [INFO] Warmup confirmed (nonzero actor updates detected).
     goto :warmup_done
   )
 
   echo [WARN] Warmup not confirmed yet. receiver_stderr tail:
-  "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '%RECEIVER_STDERR%'){ Get-Content '%RECEIVER_STDERR%' -Tail 40 }"
+  type "%RECEIVER_STDERR%"
 )
 
-echo [WARN] Warmup not confirmed, but continue anyway.
-echo [WARN] First sweep run may include map compile overhead.
+echo [WARN] Warmup not confirmed, continue anyway (first run may include compile overhead).
 :warmup_done
 
 REM ==========================================================
@@ -239,19 +235,13 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
       "  '--timing-flush-every','10'" ^
       ");" ^
       "$p=Start-Process -PassThru -NoNewWindow -WorkingDirectory '%ROOT%' -FilePath '%PYTHON_EXE%' -ArgumentList $args -RedirectStandardOutput '!STREAMER_STDOUT!' -RedirectStandardError '!STREAMER_STDERR%';" ^
-      "Start-Sleep -Milliseconds 400;" ^
-      "if($p.HasExited){ ('streamer exited early. ExitCode=' + $p.ExitCode) | Add-Content -Encoding utf8 '!STREAMER_STDERR%'; exit 2 }" ^
+      "Start-Sleep -Milliseconds 500;" ^
+      "if($p.HasExited){ exit 2 }" ^
       "$p.Id | Out-File -Encoding ascii '!STREAMER_PID_FILE!'; exit 0" >nul 2>nul
 
-    if errorlevel 1 (
-      echo [ERROR] Failed to start streamer. streamer_stderr tail:
-      "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 120 }"
-      goto :cleanup
-    )
-
     if not exist "!STREAMER_PID_FILE!" (
-      echo [ERROR] streamer_pid file not created. streamer_stderr tail:
-      "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "if(Test-Path '!STREAMER_STDERR!'){ Get-Content '!STREAMER_STDERR!' -Tail 120 }"
+      echo [ERROR] streamer_pid not created. streamer_stderr:
+      type "!STREAMER_STDERR!"
       goto :cleanup
     )
 
@@ -270,8 +260,8 @@ for /L %%N in (%N_MIN%,%N_STEP%,%N_MAX%) do (
 
     findstr /i /c:"Sent 0 frames" "!SENDER_LOG!" >nul 2>&1
     if !errorlevel! EQU 0 (
-      echo [ERROR] sender sent 0 frames. sender log tail:
-      "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "Get-Content '!SENDER_LOG!' -Tail 120"
+      echo [ERROR] sender sent 0 frames. sender log:
+      type "!SENDER_LOG!"
       goto :cleanup
     )
 
@@ -291,8 +281,6 @@ exit /b 0
 
 :cleanup
 echo [CLEANUP]
-call :kill_by_cmdline "vehicle_state_stream.py"
-call :kill_by_cmdline "replay_from_udp.py"
 if defined RECEIVER_PID taskkill /PID %RECEIVER_PID% /T /F >nul 2>&1
 popd
 endlocal
@@ -302,52 +290,48 @@ REM ==========================================================
 REM Subroutines
 REM ==========================================================
 
-:kill_by_cmdline
-REM %1 substring in CommandLine; kill python and wrappers
-setlocal EnableExtensions
-set "SUB=%~1"
-"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$sub='%SUB%';" ^
-  "$procs=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like ('*'+$sub+'*')) };" ^
-  "foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} }" >nul 2>nul
-endlocal & exit /b 0
-
-:free_udp_port
+:free_udp_port_netstat
 REM %1 port
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 set "PORT=%~1"
-"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p=[int]%PORT%; for($i=0;$i -lt 10;$i++){" ^
-  "  $eps=Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue;" ^
-  "  if(-not $eps){ exit 0 }" ^
-  "  $pids=$eps | Select-Object -ExpandProperty OwningProcess -Unique;" ^
-  "  foreach($pid in $pids){ try{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }catch{} }" ^
-  "  Start-Sleep -Milliseconds 700" ^
-  "} exit 0" >nul 2>nul
+
+for /L %%K in (1,1,10) do (
+  set "FOUND=0"
+  for /f "tokens=1-5" %%a in ('netstat -ano -p udp ^| findstr /r /c:":%PORT% *"') do (
+    REM netstat UDP line: Proto LocalAddr ForeignAddr State PID  (UDP has no State)
+    REM For UDP, tokens often: UDP 0.0.0.0:5005 *:* 1234
+    set "FOUND=1"
+    set "PID=%%e"
+    echo [INFO] UDP :%PORT% owned by PID=!PID!. Killing...
+    taskkill /PID !PID! /T /F >nul 2>&1
+  )
+  if "!FOUND!"=="0" goto :freed_done
+  timeout /t 1 /nobreak >nul
+)
+:freed_done
 endlocal & exit /b 0
 
-:wait_actor_updates_in_log
-REM args: %1 log_path, %2 offset_bytes, %3 timeout_sec, %4 interval_sec
+:wait_nonzero_actor_updates
+REM %1 log_file, %2 timeout_sec, %3 interval_sec
 setlocal EnableDelayedExpansion
 set "LOG=%~1"
-set "OFF=%~2"
-set "TMO=%~3"
-set "INT=%~4"
+set "TMO=%~2"
+set "INT=%~3"
 
-"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$path='%LOG%'; $off=[int64]%OFF%; $timeout=%TMO%; $interval=%INT%; $sw=[Diagnostics.Stopwatch]::StartNew();" ^
-  "while($sw.Elapsed.TotalSeconds -lt $timeout){" ^
-  "  if(Test-Path $path){" ^
-  "    $len=(Get-Item $path).Length;" ^
-  "    if($len -gt $off){" ^
-  "      $fs=[System.IO.File]::Open($path,'Open','Read','ReadWrite');" ^
-  "      try{ $fs.Seek($off,[System.IO.SeekOrigin]::Begin)|Out-Null; $buf=New-Object byte[] ($len-$off); [void]$fs.Read($buf,0,$buf.Length); $txt=[Text.Encoding]::UTF8.GetString($buf) } finally { $fs.Close() }" ^
-  "      if($txt -match '\(([1-9][0-9]*) actor updates\)'){ exit 0 }" ^
-  "      $off=$len" ^
-  "    }" ^
-  "  }" ^
-  "  Start-Sleep -Seconds $interval" ^
-  "} exit 1" >nul 2>nul
+set /a ELAPSED=0
+:wait_loop
+if %ELAPSED% GEQ %TMO% (
+  endlocal & exit /b 1
+)
 
-set "RC=%errorlevel%"
-endlocal & exit /b %RC%
+if exist "%LOG%" (
+  REM find any "... (1 actor updates)" or "(12 actor updates)" etc
+  findstr /r /c:"[1-9][0-9]* actor updates" "%LOG%" >nul 2>&1
+  if !errorlevel! EQU 0 (
+    endlocal & exit /b 0
+  )
+)
+
+timeout /t %INT% /nobreak >nul
+set /a ELAPSED+=%INT%
+goto :wait_loop
