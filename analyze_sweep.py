@@ -597,8 +597,8 @@ def plot_timing_pdf(
 
     label_fs = 22 if paper else None
     tick_fs = 20 if paper else None
-    ax.set_xlabel(t_label, fontsize=label_fs)
-    ax.set_ylabel(y_label, fontsize=label_fs)
+    ax.set_xlabel("経過フレーム", fontsize=label_fs)
+    ax.set_ylabel("処理時間 [ms]", fontsize=label_fs)
 
     if tick_fs:
         ax.tick_params(labelsize=tick_fs, direction="in")
