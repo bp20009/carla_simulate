@@ -1,550 +1,631 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Analyze CARLA sweep results.
+Analyze sweep results.
 
-What it generates (PDF only):
-- Run trajectories per run (no color split, blue-ish)
-- Reference trajectories for N=10..100 step 10 (separate figures, not overlaid)
-- RMSE per actor_id and per run (shape-based, NOT frame-based)
-- Per-run "frame time" time-series plot (elapsed from 0) + summary stats
+Expected structure:
+  <outdir>/
+    receiver_*.log ...
+    N10_Ts0.10/
+      replay_state.csv
+      stream_timing.csv
+      sender.log
+      ...
+    N20_Ts0.10/
+      ...
 
-RMSE matching policy:
-- Do NOT align by frame or wall time.
-- Align by trajectory arc-length (normalized 0..1) and resample to fixed points.
+Reference CSV (example):
+  frame  id  type  x  y  z
+
+This script generates a NEW analysis directory under --outdir and writes:
+  - per-run trajectory PDFs (single color)
+  - reference trajectory PDFs per N (separate, not overlaid)
+  - per-run timing plots and summary stats
+  - per-run RMSE (overall + per-actor), matching by id (NOT by frame)
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import math
+import logging
 import re
-from dataclasses import dataclass
+import sys
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib import font_manager
 
-
-# ---------- plotting defaults ----------
+# Embed TrueType fonts in PDF (important for papers)
 mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
 
 
-def pick_font(prefer_biz_udp: bool = True) -> str:
-    """
-    Pick an installed font name to avoid findfont spam.
-    Priority: BIZ UDP Gothic -> Arial -> DejaVu Sans
-    """
-    installed = {f.name for f in font_manager.fontManager.ttflist}
-    if prefer_biz_udp:
-        for cand in ["BIZ UDP Gothic", "BIZ UDPゴシック"]:
-            if cand in installed:
-                return cand
-    for cand in ["Arial", "DejaVu Sans"]:
-        if cand in installed:
-            return cand
-    # last resort: let matplotlib decide
-    return "sans-serif"
+# ----------------------------
+# CSV helpers (robust encoding)
+# ----------------------------
+def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
+    for line in lines:
+        yield line.replace("\x00", "")
 
 
-def configure_paper_fonts() -> None:
-    font = pick_font(prefer_biz_udp=True)
-    mpl.rcParams["font.family"] = font
-    # Keep it explicit for reproducibility
-    print(f"[INFO] Using font: {font}")
-
-
-# ---------- IO helpers ----------
 def read_csv_flexible(path: Path) -> pd.DataFrame:
-    """
-    Read CSV with robust encoding fallback and NUL stripping.
-    """
-    # Try encodings in order
-    encodings = ["utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp932"]
-    last_err: Optional[Exception] = None
-    raw: Optional[str] = None
-
+    encodings = ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp932")
+    last_exc: Optional[Exception] = None
     for enc in encodings:
         try:
-            raw = path.read_text(encoding=enc, errors="strict")
-            break
-        except Exception as e:
-            last_err = e
-
-    if raw is None:
-        raise RuntimeError(f"Failed to read {path} with encodings {encodings}: {last_err}")
-
-    raw = raw.replace("\x00", "")
-    # Use pandas via StringIO
-    from io import StringIO
-    return pd.read_csv(StringIO(raw))
-
-
-def ensure_columns(df: pd.DataFrame, required: Iterable[str], label: str) -> None:
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"{label}: missing columns {missing}. columns={list(df.columns)}")
+            with path.open("r", encoding=enc, newline="") as fh:
+                reader = csv.reader(_strip_null_bytes(fh))
+                rows = list(reader)
+            if not rows:
+                return pd.DataFrame()
+            header = rows[0]
+            data = rows[1:]
+            return pd.DataFrame(data, columns=header)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise RuntimeError(f"Failed to read CSV with fallback encodings: {path}") from last_exc
 
 
-# ---------- trajectory + RMSE ----------
-@dataclass
-class Traj:
-    x: np.ndarray
-    y: np.ndarray
-
-    def valid(self) -> bool:
-        return len(self.x) >= 2 and len(self.y) == len(self.x)
+def to_numeric_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
 
-def traj_from_df(df: pd.DataFrame, xcol: str, ycol: str) -> Traj:
-    x = df[xcol].to_numpy(dtype=float)
-    y = df[ycol].to_numpy(dtype=float)
-    # drop NaN pairs
-    m = np.isfinite(x) & np.isfinite(y)
-    x = x[m]
-    y = y[m]
-    return Traj(x=x, y=y)
+# ----------------------------
+# Column normalization
+# ----------------------------
+def normalize_ref(df: pd.DataFrame) -> pd.DataFrame:
+    # Expect columns: frame,id,type,x,y,z (as user wrote)
+    # Keep only needed and coerce numeric
+    required_any = {"frame", "id", "type"}
+    if not required_any.issubset(set(df.columns)):
+        raise ValueError(f"ref missing required columns {required_any}. got={list(df.columns)}")
+
+    # x,y can be named x,y or location_x,location_y
+    if "x" not in df.columns and "location_x" in df.columns:
+        df = df.rename(columns={"location_x": "x"})
+    if "y" not in df.columns and "location_y" in df.columns:
+        df = df.rename(columns={"location_y": "y"})
+    if "z" not in df.columns and "location_z" in df.columns:
+        df = df.rename(columns={"location_z": "z"})
+
+    df = to_numeric_df(df, ["frame", "id", "x", "y", "z"])
+    df = df.dropna(subset=["id", "x", "y"])
+    df["id"] = df["id"].astype(int)
+
+    # Filter vehicles by default (type column: 'vehicle' etc.)
+    df["type"] = df["type"].astype(str)
+    return df
 
 
-def resample_by_arclength(traj: Traj, n_points: int = 200) -> Traj:
+def normalize_run(df: pd.DataFrame) -> pd.DataFrame:
+    # replay_state.csv is produced by vehicle_state_stream.py
+    # Try to map common column names.
+    colmap = {}
+
+    # id
+    if "id" in df.columns:
+        colmap["id"] = "id"
+    elif "actor_id" in df.columns:
+        colmap["actor_id"] = "id"
+    elif "carla_actor_id" in df.columns:
+        colmap["carla_actor_id"] = "id"
+
+    # type
+    if "type" in df.columns:
+        colmap["type"] = "type"
+    elif "actor_type" in df.columns:
+        colmap["actor_type"] = "type"
+
+    # frame
+    if "frame" in df.columns:
+        colmap["frame"] = "frame"
+    elif "timestamp" in df.columns:
+        colmap["timestamp"] = "frame"  # fallback meaning
+
+    # position
+    if "location_x" in df.columns:
+        colmap["location_x"] = "x"
+    elif "x" in df.columns:
+        colmap["x"] = "x"
+
+    if "location_y" in df.columns:
+        colmap["location_y"] = "y"
+    elif "y" in df.columns:
+        colmap["y"] = "y"
+
+    if "location_z" in df.columns:
+        colmap["location_z"] = "z"
+    elif "z" in df.columns:
+        colmap["z"] = "z"
+
+    df = df.rename(columns=colmap)
+
+    required = {"id", "x", "y"}
+    if not required.issubset(set(df.columns)):
+        raise ValueError(f"run CSV missing required columns {required}. got={list(df.columns)}")
+
+    # frame is optional (we sort by it if present)
+    num_cols = ["id", "x", "y"]
+    if "frame" in df.columns:
+        num_cols.append("frame")
+    if "z" in df.columns:
+        num_cols.append("z")
+
+    df = to_numeric_df(df, num_cols)
+    df = df.dropna(subset=["id", "x", "y"])
+    df["id"] = df["id"].astype(int)
+
+    if "type" in df.columns:
+        df["type"] = df["type"].astype(str)
+    else:
+        df["type"] = "unknown"
+
+    if "frame" in df.columns:
+        df = df.sort_values(["id", "frame"])
+    else:
+        df = df.sort_values(["id"])
+    return df
+
+
+# ----------------------------
+# Trajectory extraction
+# ----------------------------
+def trajectories_by_id(df: pd.DataFrame, kind: str = "vehicle") -> Dict[int, np.ndarray]:
     """
-    Resample a polyline by normalized arc-length in [0,1].
+    Return dict: id -> array[[x,y], ...] ordered.
+    kind: filter by df['type'] prefix match (vehicle/walker) if present.
     """
-    x, y = traj.x, traj.y
-    if len(x) < 2:
-        return traj
+    if "type" in df.columns and kind:
+        sub = df[df["type"].astype(str).str.startswith(f"{kind}")]
+    else:
+        sub = df
 
-    dx = np.diff(x)
-    dy = np.diff(y)
-    seg = np.hypot(dx, dy)
-    s = np.concatenate([[0.0], np.cumsum(seg)])
-    total = float(s[-1])
-
-    if total <= 1e-12:
-        # no movement: keep as constant
-        xx = np.full(n_points, x[0], dtype=float)
-        yy = np.full(n_points, y[0], dtype=float)
-        return Traj(xx, yy)
-
-    u = s / total
-    u_new = np.linspace(0.0, 1.0, n_points)
-
-    x_new = np.interp(u_new, u, x)
-    y_new = np.interp(u_new, u, y)
-    return Traj(x_new, y_new)
+    trajs: Dict[int, np.ndarray] = {}
+    for aid, g in sub.groupby("id", sort=True):
+        # Keep only finite points
+        pts = g[["x", "y"]].to_numpy(dtype=float)
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if len(pts) >= 2:
+            trajs[int(aid)] = pts
+    return trajs
 
 
-def rmse_xy(a: Traj, b: Traj) -> Tuple[float, float, float]:
+# ----------------------------
+# RMSE (id match, time-normalized alignment)
+# ----------------------------
+def rmse_time_normalized(ref_xy: np.ndarray, run_xy: np.ndarray, samples: int = 200) -> Tuple[float, float, float]:
     """
-    Returns (rmse_x, rmse_y, rmse_xy) where rmse_xy is RMSE over Euclidean distance.
+    Align by normalized progress t in [0,1] with interpolation, then compute RMSE.
+    Returns (rmse_2d, rmse_x, rmse_y).
     """
-    if len(a.x) != len(b.x):
-        raise ValueError("rmse_xy: trajectories must be same length after resampling")
+    m = len(ref_xy)
+    n = len(run_xy)
+    if m < 2 or n < 2:
+        return (float("nan"), float("nan"), float("nan"))
 
-    dx = a.x - b.x
-    dy = a.y - b.y
+    t_ref = np.linspace(0.0, 1.0, m)
+    t_run = np.linspace(0.0, 1.0, n)
+    t = np.linspace(0.0, 1.0, samples)
+
+    ref_x = np.interp(t, t_ref, ref_xy[:, 0])
+    ref_y = np.interp(t, t_ref, ref_xy[:, 1])
+    run_x = np.interp(t, t_run, run_xy[:, 0])
+    run_y = np.interp(t, t_run, run_xy[:, 1])
+
+    dx = run_x - ref_x
+    dy = run_y - ref_y
+
     rmse_x = float(np.sqrt(np.mean(dx * dx)))
     rmse_y = float(np.sqrt(np.mean(dy * dy)))
-    rmse_e = float(np.sqrt(np.mean(dx * dx + dy * dy)))
-    return rmse_x, rmse_y, rmse_e
+    rmse_2d = float(np.sqrt(np.mean(dx * dx + dy * dy)))
+    return rmse_2d, rmse_x, rmse_y
 
 
-# ---------- time-series (frame time) ----------
-def discover_frame_time_series(run_dir: Path) -> Optional[pd.DataFrame]:
-    """
-    Try to discover a per-frame time series to plot.
-    Priority:
-      1) stream_timing_*.csv (vehicle_state_stream --timing-output)
-      2) receiver_stderr.log within run_dir (if you have per-run logs)
-    Output DataFrame columns: elapsed_s, frame_time_ms
-    """
-    # 1) stream_timing_*.csv
-    timing = None
-    cand = list(run_dir.glob("stream_timing_*.csv"))
-    if cand:
-        # choose the largest one (most samples)
-        cand.sort(key=lambda p: p.stat().st_size, reverse=True)
-        try:
-            timing = read_csv_flexible(cand[0])
-        except Exception:
-            timing = None
-
-    if timing is not None and not timing.empty:
-        # Heuristics: pick a time step column
-        cols = list(timing.columns)
-
-        # elapsed: prefer monotonic or elapsed columns if exist
-        time_candidates = [
-            "elapsed_s", "elapsed", "frame_elapsed", "wall_clock", "wall_time",
-            "monotonic", "t", "time", "timestamp"
-        ]
-        tcol = next((c for c in time_candidates if c in cols), None)
-
-        # frame-time candidates in seconds or ms
-        ms_candidates = [c for c in cols if re.search(r"(ms|msec)", c, re.IGNORECASE)]
-        dt_candidates = [c for c in cols if re.search(r"(dt|delta)", c, re.IGNORECASE)]
-
-        ycol = None
-        scale = 1.0  # to ms
-
-        if ms_candidates:
-            # pick something that looks like processing or tick
-            preferred = [c for c in ms_candidates if re.search(r"(tick|loop|frame|proc|step)", c, re.IGNORECASE)]
-            ycol = preferred[0] if preferred else ms_candidates[0]
-            scale = 1.0
-        elif dt_candidates:
-            preferred = [c for c in dt_candidates if re.search(r"(tick|wall|loop|frame)", c, re.IGNORECASE)]
-            ycol = preferred[0] if preferred else dt_candidates[0]
-            # guess unit: if median < 2.0, assume seconds -> ms
-            med = float(np.nanmedian(pd.to_numeric(timing[ycol], errors="coerce")))
-            scale = 1000.0 if med < 2.0 else 1.0
-
-        if ycol is not None:
-            y = pd.to_numeric(timing[ycol], errors="coerce") * scale
-            if tcol is not None:
-                t = pd.to_numeric(timing[tcol], errors="coerce")
-                t = t - float(np.nanmin(t))
-            else:
-                # fallback: build elapsed from cumulative dt if available
-                if "tick_wall_dt" in cols:
-                    dt = pd.to_numeric(timing["tick_wall_dt"], errors="coerce").fillna(0.0)
-                    t = dt.cumsum()
-                else:
-                    # assume 1 step index
-                    t = pd.Series(np.arange(len(y), dtype=float))
-            out = pd.DataFrame({"elapsed_s": t, "frame_time_ms": y})
-            out = out.replace([np.inf, -np.inf], np.nan).dropna()
-            if len(out) >= 5:
-                return out
-
-    # 2) per-run receiver_stderr.log style parsing (optional)
-    log = run_dir / "receiver_stderr.log"
-    if log.exists():
-        txt = log.read_text(encoding="utf-8", errors="ignore")
-        # Extract "Frame processed in XX ms"
-        vals = [float(m.group(1)) for m in re.finditer(r"Frame processed in\s+([0-9.]+)\s*ms", txt)]
-        if len(vals) >= 5:
-            y = np.array(vals, dtype=float)
-            # elapsed = index * median_dt (unknown) -> just index-based seconds
-            x = np.arange(len(y), dtype=float)
-            # normalize x to start 0, treat as seconds-ish
-            out = pd.DataFrame({"elapsed_s": x, "frame_time_ms": y})
-            return out
-
-    return None
+def compute_rmse_per_actor(ref_trajs: Dict[int, np.ndarray], run_trajs: Dict[int, np.ndarray]) -> pd.DataFrame:
+    rows = []
+    common_ids = sorted(set(ref_trajs.keys()) & set(run_trajs.keys()))
+    for aid in common_ids:
+        ref_xy = ref_trajs[aid]
+        run_xy = run_trajs[aid]
+        rmse_2d, rmse_x, rmse_y = rmse_time_normalized(ref_xy, run_xy, samples=200)
+        rows.append(
+            {
+                "id": aid,
+                "rmse_2d": rmse_2d,
+                "rmse_x": rmse_x,
+                "rmse_y": rmse_y,
+                "n_ref": len(ref_xy),
+                "n_run": len(run_xy),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("id")
+    return df
 
 
-# ---------- plotting ----------
-def save_traj_pdf(path: Path, trajs: Dict[int, Traj], title: str, color: str, paper: bool) -> None:
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    for actor_id in sorted(trajs.keys()):
-        tr = trajs[actor_id]
-        if not tr.valid():
-            continue
-        ax.plot(tr.x, tr.y, linewidth=1.6 if paper else 1.2, alpha=0.85)
-
-    ax.set_xlabel("X [m]", fontsize=22 if paper else None)
-    ax.set_ylabel("Y [m]", fontsize=22 if paper else None)
-    ax.tick_params(labelsize=20 if paper else None)
-    ax.tick_params(direction="in")
-    ax.set_aspect("equal")
-    ax.grid(True, linestyle="--", alpha=0.35)
-    if not paper:
-        ax.set_title(title)
-
-    # Set a single artist color after plotting (color cycle override)
-    for line in ax.lines:
-        line.set_color(color)
-
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-
-
-def save_frame_time_pdf(path: Path, df: pd.DataFrame, title: str, paper: bool) -> Dict[str, float]:
-    """
-    df: columns elapsed_s, frame_time_ms
-    returns summary stats
-    """
-    x = df["elapsed_s"].to_numpy(dtype=float)
-    y = df["frame_time_ms"].to_numpy(dtype=float)
-
-    # Ensure x starts at 0
-    x = x - float(np.min(x))
-
-    stats = {
-        "n": float(len(y)),
-        "mean_ms": float(np.mean(y)),
-        "median_ms": float(np.median(y)),
-        "p90_ms": float(np.quantile(y, 0.90)),
-        "p99_ms": float(np.quantile(y, 0.99)),
-        "max_ms": float(np.max(y)),
+def compute_rmse_overall(per_actor: pd.DataFrame) -> Dict[str, float]:
+    if per_actor.empty:
+        return {"rmse_2d_mean": float("nan"), "rmse_2d_median": float("nan")}
+    vals = per_actor["rmse_2d"].to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return {"rmse_2d_mean": float("nan"), "rmse_2d_median": float("nan")}
+    return {
+        "rmse_2d_mean": float(np.mean(vals)),
+        "rmse_2d_median": float(np.median(vals)),
     }
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(x, y, linewidth=1.4, alpha=0.9)
-    ax.set_xlabel("Elapsed time [s]", fontsize=20 if paper else None)
-    ax.set_ylabel("Frame time [ms]", fontsize=20 if paper else None)
-    ax.tick_params(labelsize=18 if paper else None)
-    ax.tick_params(direction="in")
-    ax.grid(True, linestyle="--", alpha=0.35)
-    if not paper:
+
+# ----------------------------
+# Timing parsing + plots
+# ----------------------------
+def load_timing_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    df = read_csv_flexible(path)
+    if df.empty:
+        return df
+    # Numeric coercion for all columns that look numeric
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="ignore")
+    # Try to coerce common time columns
+    for c in ("frame", "monotonic", "wall_clock", "tick_wall_dt", "tick_wall_dt_ms", "dt_ms", "elapsed_ms", "process_ms"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def pick_time_axes(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, str, str]:
+    """
+    Returns (t_sec_from0, frame_ms, t_label, y_label)
+    """
+    if df.empty:
+        return np.array([]), np.array([]), "elapsed [s]", "time [ms]"
+
+    # Choose elapsed time axis
+    if "monotonic" in df.columns and pd.api.types.is_numeric_dtype(df["monotonic"]):
+        t = df["monotonic"].to_numpy(dtype=float)
+        t = t - np.nanmin(t)
+        t_label = "elapsed [s]"
+    elif "wall_clock" in df.columns and pd.api.types.is_numeric_dtype(df["wall_clock"]):
+        t = df["wall_clock"].to_numpy(dtype=float)
+        t = t - np.nanmin(t)
+        t_label = "elapsed [s]"
+    else:
+        t = np.arange(len(df), dtype=float)
+        t_label = "index"
+
+    # Choose per-frame time metric (ms)
+    candidates_ms = [
+        "frame_processed_ms",
+        "process_ms",
+        "update_ms",
+        "dt_ms",
+        "elapsed_ms",
+        "frame_ms",
+        "tick_wall_dt_ms",
+    ]
+    for c in candidates_ms:
+        if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+            y = df[c].to_numpy(dtype=float)
+            return t, y, t_label, f"{c} [ms]"
+
+    # tick_wall_dt likely seconds
+    if "tick_wall_dt" in df.columns and pd.api.types.is_numeric_dtype(df["tick_wall_dt"]):
+        y = df["tick_wall_dt"].to_numpy(dtype=float) * 1000.0
+        return t, y, t_label, "tick_wall_dt [ms]"
+
+    # fallback: diff of monotonic
+    if "monotonic" in df.columns and pd.api.types.is_numeric_dtype(df["monotonic"]):
+        mono = df["monotonic"].to_numpy(dtype=float)
+        dm = np.diff(mono, prepend=mono[0])
+        y = dm * 1000.0
+        return t, y, t_label, "diff(monotonic) [ms]"
+
+    y = np.full_like(t, np.nan)
+    return t, y, t_label, "time [ms]"
+
+
+def timing_stats_ms(frame_ms: np.ndarray) -> Dict[str, float]:
+    v = frame_ms[np.isfinite(frame_ms)]
+    if len(v) == 0:
+        return {
+            "mean_ms": float("nan"),
+            "p50_ms": float("nan"),
+            "p90_ms": float("nan"),
+            "p95_ms": float("nan"),
+            "max_ms": float("nan"),
+            "n": 0.0,
+        }
+    return {
+        "mean_ms": float(np.mean(v)),
+        "p50_ms": float(np.percentile(v, 50)),
+        "p90_ms": float(np.percentile(v, 90)),
+        "p95_ms": float(np.percentile(v, 95)),
+        "max_ms": float(np.max(v)),
+        "n": float(len(v)),
+    }
+
+
+# ----------------------------
+# Plotting
+# ----------------------------
+def setup_paper_fonts():
+    # Reduce findfont spam, and keep fallback order.
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+
+    # Prefer Arial or BIZ UDP if available.
+    mpl.rcParams["font.family"] = [
+        "Arial",
+        "BIZ UDP Gothic",
+        "BIZ UDPゴシック",
+        "IPAexGothic",
+        "Yu Gothic",
+        "Meiryo",
+        "MS Gothic",
+        "sans-serif",
+    ]
+
+
+def plot_trajectories_pdf(
+    trajs: Dict[int, np.ndarray],
+    out_pdf: Path,
+    *,
+    color: str,
+    title: Optional[str],
+    paper: bool,
+):
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    for aid in sorted(trajs.keys()):
+        pts = trajs[aid]
+        ax.plot(
+            pts[:, 0],
+            pts[:, 1],
+            color=color,
+            linewidth=1.8 if paper else 1.2,
+            alpha=0.85 if paper else 0.9,
+        )
+
+    if title and not paper:
         ax.set_title(title)
 
+    label_fs = 22 if paper else None
+    tick_fs = 20 if paper else None
+
+    ax.set_xlabel("X [m]", fontsize=label_fs)
+    ax.set_ylabel("Y [m]", fontsize=label_fs)
+
+    if tick_fs:
+        ax.tick_params(labelsize=tick_fs, direction="in")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, linestyle="--", alpha=0.35)
+
     fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=200)
+    fig.savefig(out_pdf, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    return stats
 
 
-# ---------- sweep discovery ----------
-RUN_DIR_RE = re.compile(r"^N(?P<n>\d+)_Ts(?P<ts>[0-9.]+)$")
+def plot_timing_pdf(
+    t_sec: np.ndarray,
+    frame_ms: np.ndarray,
+    out_pdf: Path,
+    *,
+    title: Optional[str],
+    paper: bool,
+    t_label: str,
+    y_label: str,
+):
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(t_sec, frame_ms, linewidth=1.6 if paper else 1.2)
+
+    if title and not paper:
+        ax.set_title(title)
+
+    label_fs = 22 if paper else None
+    tick_fs = 20 if paper else None
+    ax.set_xlabel(t_label, fontsize=label_fs)
+    ax.set_ylabel(y_label, fontsize=label_fs)
+
+    if tick_fs:
+        ax.tick_params(labelsize=tick_fs, direction="in")
+    ax.grid(True, linestyle="--", alpha=0.35)
+
+    # Ensure x starts at 0 (user requirement)
+    if len(t_sec) > 0 and np.isfinite(t_sec).any():
+        ax.set_xlim(left=0.0)
+
+    fig.tight_layout()
+    fig.savefig(out_pdf, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
-def parse_run_tag(name: str) -> Optional[Tuple[int, float]]:
-    m = RUN_DIR_RE.match(name)
-    if not m:
-        return None
-    return int(m.group("n")), float(m.group("ts"))
+# ----------------------------
+# Sweep discovery
+# ----------------------------
+RUN_DIR_RE = re.compile(r"^N(?P<N>\d+)_Ts(?P<TS>[0-9.]+)$")
 
 
-def find_run_dirs(outdir: Path) -> List[Path]:
+def find_runs(outdir: Path) -> List[Tuple[str, Path, int, str]]:
     runs = []
     for p in outdir.iterdir():
-        if p.is_dir() and parse_run_tag(p.name) is not None:
-            runs.append(p)
-    runs.sort(key=lambda d: (parse_run_tag(d.name)[0], parse_run_tag(d.name)[1]))  # type: ignore
+        if not p.is_dir():
+            continue
+        m = RUN_DIR_RE.match(p.name)
+        if not m:
+            continue
+        n = int(m.group("N"))
+        ts = m.group("TS")
+        runs.append((p.name, p, n, ts))
+    runs.sort(key=lambda x: (x[2], float(x[3])))
     return runs
 
 
-def load_run_trajectories(run_dir: Path) -> Dict[int, Traj]:
-    """
-    Load replay_state_*.csv in run_dir.
-    Expect columns similar to vehicle_state_stream output:
-      - actor identifier: carla_actor_id or id
-      - location: location_x, location_y
-    """
-    cands = list(run_dir.glob("replay_state_*.csv"))
-    if not cands:
-        raise FileNotFoundError(f"No replay_state_*.csv in {run_dir}")
-    cands.sort(key=lambda p: p.stat().st_size, reverse=True)
-    df = read_csv_flexible(cands[0])
-
-    # Heuristic column mapping
-    id_col = "carla_actor_id" if "carla_actor_id" in df.columns else "id"
-    xcol = "location_x" if "location_x" in df.columns else ("x" if "x" in df.columns else None)
-    ycol = "location_y" if "location_y" in df.columns else ("y" if "y" in df.columns else None)
-    if xcol is None or ycol is None:
-        raise ValueError(f"{cands[0]}: cannot find x/y columns. columns={list(df.columns)}")
-
-    # Optional filter: vehicles only if 'type' exists
-    if "type" in df.columns:
-        df = df[df["type"].astype(str).str.startswith("vehicle")]
-
-    df[id_col] = pd.to_numeric(df[id_col], errors="coerce").astype("Int64")
-    df = df.dropna(subset=[id_col, xcol, ycol])
-    df = df.sort_values(by=[id_col])
-
-    trajs: Dict[int, Traj] = {}
-    for actor_id, g in df.groupby(id_col):
-        if pd.isna(actor_id):
-            continue
-        aid = int(actor_id)
-        tr = traj_from_df(g, xcol, ycol)
-        if tr.valid():
-            trajs[aid] = tr
-    return trajs
-
-
-def load_ref_trajectories(ref_csv: Path) -> Dict[int, Traj]:
-    """
-    Load reference exp_300.csv columns:
-      frame,id,type,x,y,z
-    """
-    df = read_csv_flexible(ref_csv)
-    ensure_columns(df, ["id", "x", "y"], "ref")
-    if "type" in df.columns:
-        df = df[df["type"].astype(str).str.startswith("vehicle")]
-
-    df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
-    df = df.dropna(subset=["id", "x", "y"])
-    df = df.sort_values(by=["id", "frame"] if "frame" in df.columns else ["id"])
-
-    trajs: Dict[int, Traj] = {}
-    for actor_id, g in df.groupby("id"):
-        if pd.isna(actor_id):
-            continue
-        aid = int(actor_id)
-        tr = traj_from_df(g, "x", "y")
-        if tr.valid():
-            trajs[aid] = tr
-    return trajs
-
-
-def compute_rmse_tables(
-    ref_trajs: Dict[int, Traj],
-    run_trajs: Dict[int, Traj],
-    n_points: int,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    rows = []
-    rmses = []
-
-    common_ids = sorted(set(ref_trajs.keys()) & set(run_trajs.keys()))
-    for aid in common_ids:
-        a = resample_by_arclength(ref_trajs[aid], n_points=n_points)
-        b = resample_by_arclength(run_trajs[aid], n_points=n_points)
-        rx, ry, re = rmse_xy(a, b)
-        rows.append(
-            {
-                "actor_id": aid,
-                "rmse_x": rx,
-                "rmse_y": ry,
-                "rmse_xy": re,
-                "ref_points": int(len(ref_trajs[aid].x)),
-                "run_points": int(len(run_trajs[aid].x)),
-            }
-        )
-        rmses.append(re)
-
-    per_actor = pd.DataFrame(rows)
-    summary = {
-        "n_common": float(len(common_ids)),
-        "rmse_xy_mean": float(np.mean(rmses)) if rmses else float("nan"),
-        "rmse_xy_median": float(np.median(rmses)) if rmses else float("nan"),
-        "rmse_xy_p90": float(np.quantile(rmses, 0.90)) if rmses else float("nan"),
-        "rmse_xy_max": float(np.max(rmses)) if rmses else float("nan"),
-    }
-    return per_actor, summary
-
-
-# ---------- main ----------
-def main() -> int:
+# ----------------------------
+# Main
+# ----------------------------
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--outdir", type=Path, required=True, help="sweep_results_... directory")
+    ap.add_argument("--outdir", type=Path, required=True, help="Sweep outdir (contains Nxx_TsYY subdirs)")
     ap.add_argument("--ref", type=Path, required=True, help="Reference CSV (exp_300.csv)")
-    ap.add_argument("--paper", action="store_true", help="Paper style + font selection")
-    ap.add_argument("--color", default="#2a7fb8", help="Single line color (e.g. blue-ish)")
-    ap.add_argument("--resample-points", type=int, default=200, help="Points for arc-length resampling")
-    ap.add_argument("--ref-n-min", type=int, default=10)
-    ap.add_argument("--ref-n-max", type=int, default=100)
-    ap.add_argument("--ref-n-step", type=int, default=10)
-    args = ap.parse_args()
+    ap.add_argument("--analysis-name", default=None, help="Optional analysis directory name (default: auto timestamp)")
+    ap.add_argument("--paper", action="store_true", help="Paper style fonts/sizes; PDF output")
+    ap.add_argument("--color", default="#3da5d9", help="Single trajectory color (e.g. light blue)")
+    ap.add_argument("--kind", default="vehicle", choices=["vehicle", "walker", "all"], help="Actor kind to plot/analyze")
+    ap.add_argument("--rmse-samples", type=int, default=200, help="Interpolation samples for RMSE")
+    return ap
 
-    outdir: Path = args.outdir
-    ref_csv: Path = args.ref
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    outdir = args.outdir
+    if not outdir.exists():
+        print(f"[ERROR] outdir not found: {outdir}")
+        return 2
 
     if args.paper:
-        configure_paper_fonts()
+        setup_paper_fonts()
 
-    if not outdir.exists():
-        raise FileNotFoundError(outdir)
-    if not ref_csv.exists():
-        raise FileNotFoundError(ref_csv)
+    # Create NEW analysis directory
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    analysis_name = args.analysis_name or f"analysis_{ts}"
+    analysis_dir = outdir / analysis_name
+    analysis_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load reference once
-    ref_trajs_all = load_ref_trajectories(ref_csv)
+    # Read reference
+    ref_raw = read_csv_flexible(args.ref)
+    ref = normalize_ref(ref_raw)
 
-    # Write ref plots N=10..100
-    ref_plot_dir = outdir / "plots_ref"
-    for n in range(args.ref_n_min, args.ref_n_max + 1, args.ref_n_step):
-        ids = [aid for aid in sorted(ref_trajs_all.keys()) if aid <= n]
-        trajs = {aid: ref_trajs_all[aid] for aid in ids}
-        save_traj_pdf(
-            ref_plot_dir / f"ref_N{n:03d}.pdf",
-            trajs,
-            title=f"Reference trajectories (N={n})",
+    kind = args.kind
+    kind_for_filter = None if kind == "all" else kind
+
+    ref_trajs_all = trajectories_by_id(ref, kind_for_filter or "vehicle")
+
+    # Generate reference plots for N=10..100 step10 (separate, no overlay)
+    ref_out = analysis_dir / "ref_trajectories"
+    ref_out.mkdir(parents=True, exist_ok=True)
+
+    # Determine ref ids order (sorted by id)
+    ref_ids_sorted = sorted(ref_trajs_all.keys())
+
+    for n in range(10, 101, 10):
+        picked_ids = [i for i in ref_ids_sorted if i <= n]  # ids are 1..N in your data
+        trajs_n = {i: ref_trajs_all[i] for i in picked_ids if i in ref_trajs_all}
+        if len(trajs_n) == 0:
+            continue
+        plot_trajectories_pdf(
+            trajs_n,
+            ref_out / f"ref_trajectories_N{n}.pdf",
             color=args.color,
+            title=f"Reference trajectories (N={n})",
             paper=args.paper,
         )
 
-    # Run analysis per run
-    runs = find_run_dirs(outdir)
+    # Runs
+    runs = find_runs(outdir)
     if not runs:
-        print("[WARN] No run directories found like N10_Ts0.10 under outdir.")
-        return 0
+        print(f"[ERROR] No run dirs like N10_Ts0.10 found under: {outdir}")
+        return 2
 
-    per_actor_rows = []
     summary_rows = []
 
-    run_plot_dir = outdir / "plots_run"
-    time_plot_dir = outdir / "plots_time"
+    for tag, run_path, n, ts_str in runs:
+        replay_csv = run_path / "replay_state.csv"
+        timing_csv = run_path / "stream_timing.csv"
 
-    for run_dir in runs:
-        tag = run_dir.name
-        parsed = parse_run_tag(tag)
-        assert parsed is not None
-        n, ts = parsed
+        if not replay_csv.exists():
+            print(f"[WARN] missing replay_state.csv: {replay_csv}")
+            continue
 
-        # Load run traj
-        run_trajs = load_run_trajectories(run_dir)
+        run_raw = read_csv_flexible(replay_csv)
+        run_df = normalize_run(run_raw)
+        run_trajs = trajectories_by_id(run_df, kind_for_filter or "vehicle")
 
-        # Plot run trajectories
-        save_traj_pdf(
-            run_plot_dir / f"{tag}_traj.pdf",
+        # Reference subset for this N (ids 1..N)
+        ref_sub_ids = [i for i in ref_ids_sorted if i <= n]
+        ref_sub_trajs = {i: ref_trajs_all[i] for i in ref_sub_ids if i in ref_trajs_all}
+
+        # RMSE per actor (id match, time-normalized)
+        per_actor = compute_rmse_per_actor(ref_sub_trajs, run_trajs)
+        rmse_overall = compute_rmse_overall(per_actor)
+
+        run_out = analysis_dir / "runs" / tag
+        run_out.mkdir(parents=True, exist_ok=True)
+
+        per_actor_path = run_out / f"per_actor_rmse_{tag}.csv"
+        per_actor.to_csv(per_actor_path, index=False)
+
+        # Trajectory plot (run only)
+        traj_pdf = run_out / f"trajectories_{tag}.pdf"
+        plot_trajectories_pdf(
             run_trajs,
-            title=f"Run trajectories ({tag})",
+            traj_pdf,
             color=args.color,
+            title=f"Run trajectories {tag}",
             paper=args.paper,
         )
 
-        # RMSE per actor (shape-based, id match)
-        per_actor, rmse_sum = compute_rmse_tables(
-            ref_trajs=ref_trajs_all,
-            run_trajs=run_trajs,
-            n_points=args.resample_points,
+        # Timing plot + stats
+        tdf = load_timing_csv(timing_csv)
+        t_sec, frame_ms, t_label, y_label = pick_time_axes(tdf)
+        stats = timing_stats_ms(frame_ms)
+
+        timing_pdf = run_out / f"timing_{tag}.pdf"
+        plot_timing_pdf(
+            t_sec,
+            frame_ms,
+            timing_pdf,
+            title=f"Timing {tag}",
+            paper=args.paper,
+            t_label=t_label,
+            y_label=y_label,
         )
-        if not per_actor.empty:
-            per_actor.insert(0, "run_tag", tag)
-            per_actor.insert(1, "N", n)
-            per_actor.insert(2, "Ts", ts)
-            per_actor_rows.append(per_actor)
 
-        # Frame time series
-        ts_df = discover_frame_time_series(run_dir)
-        time_stats = {}
-        if ts_df is not None:
-            time_stats = save_frame_time_pdf(
-                time_plot_dir / f"{tag}_frame_time.pdf",
-                ts_df,
-                title=f"Frame time ({tag})",
-                paper=args.paper,
-            )
+        summary_rows.append(
+            {
+                "tag": tag,
+                "N": n,
+                "Ts": float(ts_str),
+                "rmse_2d_mean": rmse_overall["rmse_2d_mean"],
+                "rmse_2d_median": rmse_overall["rmse_2d_median"],
+                "timing_mean_ms": stats["mean_ms"],
+                "timing_p50_ms": stats["p50_ms"],
+                "timing_p90_ms": stats["p90_ms"],
+                "timing_p95_ms": stats["p95_ms"],
+                "timing_max_ms": stats["max_ms"],
+                "timing_n": stats["n"],
+                "per_actor_csv": str(per_actor_path.relative_to(analysis_dir)),
+                "traj_pdf": str(traj_pdf.relative_to(analysis_dir)),
+                "timing_pdf": str(timing_pdf.relative_to(analysis_dir)),
+            }
+        )
 
-        # Summary row
-        row = {
-            "run_tag": tag,
-            "N": n,
-            "Ts": ts,
-            **rmse_sum,
-            **time_stats,
-        }
-        summary_rows.append(row)
+        print(f"[OK] {tag}: wrote trajectories/timing/RMSE into {run_out}")
 
-        print(f"[OK] {tag}: n_common={rmse_sum.get('n_common')} rmse_mean={rmse_sum.get('rmse_xy_mean')}")
+    summary_df = pd.DataFrame(summary_rows)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["N", "Ts"])
+    summary_path = analysis_dir / "summary_runs.csv"
+    summary_df.to_csv(summary_path, index=False)
 
-    # Write tables
-    summary_df = pd.DataFrame(summary_rows).sort_values(by=["N", "Ts"])
-    summary_path = outdir / "summary_runs.csv"
-    summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+    print(f"[OK] Analysis dir: {analysis_dir}")
     print(f"[OK] Wrote: {summary_path}")
-
-    if per_actor_rows:
-        per_actor_df = pd.concat(per_actor_rows, ignore_index=True)
-        per_actor_path = outdir / "rmse_per_actor.csv"
-        per_actor_df.to_csv(per_actor_path, index=False, encoding="utf-8-sig")
-        print(f"[OK] Wrote: {per_actor_path}")
-
-    print(f"[OK] Runs: {len(runs)}")
     return 0
 
 
