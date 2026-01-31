@@ -221,6 +221,7 @@ def timing_stats(s: Optional[pd.Series]) -> Dict[str, float]:
 def setup_fonts(paper: bool) -> None:
     if paper:
         mpl.rcParams["font.family"] = [
+            "Arial",
             "BIZ UDP Gothic",
             "BIZ UDPゴシック",
             "IPAexGothic",
