@@ -1,381 +1,501 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Analyze CARLA UDP replay sweep results.
+Analyze CARLA sweep results.
 
-Per run (e.g., N10_Ts0.10):
-  - Plot trajectories to PDF (single blue color, no color-coding)
-  - Compute RMSE vs reference (exp_300.csv)
-  - Summarize per-frame timing stats (from timing CSV if present)
-
-Expected directory layout:
-  sweep_results_XXXX/
-    update_timings_all.csv              (optional, global)
-    eval_all.csv                        (optional, global)
-    N10_Ts0.10/
-      replay_state_N10_Ts0.10.csv        (from vehicle_state_stream.py)
-      stream_timing_N10_Ts0.10.csv       (from vehicle_state_stream.py timing)
-      ...
+Outputs (under --outdir):
+- summary_runs.csv : per-run RMSE + timing
+- trajectories_<TAG>.pdf : XY trajectories per run (single color, blue-ish)
+- per_actor_rmse_<TAG>.csv : (optional) per-actor RMSE per run when --per-actor
 
 Usage:
-  python analyze_sweep.py --outdir sweep_results_20260130_17304234 --ref send_data/exp_300.csv --paper
+  python analyze_sweep.py --outdir sweep_results_20260130_18234773 --ref send_data\\exp_300.csv --paper
+  python analyze_sweep.py --outdir sweep_results_20260130_18234773 --ref send_data\\exp_300.csv --paper --per-actor
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple, List
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import pandas as pd
 
+# PDF text embedding
 mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
 
 
-# -----------------------------
-# Column heuristics
-# -----------------------------
-FRAME_CANDS = ["frame", "Frame", "pf", "payload_frame", "payloadFrame", "step"]
-ID_CANDS = ["carla_actor_id", "actor_id", "id", "object_id", "tracking_id", "track_id"]
-X_CANDS = ["location_x", "x", "pos_x", "px", "X"]
-Y_CANDS = ["location_y", "y", "pos_y", "py", "Y"]
-TYPE_CANDS = ["type", "actor_type", "kind", "category"]
-
-# timing candidates: pick first existing numeric column
-TIMING_CANDS = [
-    "frame_ms",
-    "elapsed_ms",
-    "process_ms",
-    "processing_ms",
-    "update_ms",
-    "tick_wall_dt_ms",
-    "tick_wall_dt",
-    "dt_ms",
-    "dt",
-]
+# ----------------------------
+# Robust CSV reading helpers
+# ----------------------------
+def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
+    for line in lines:
+        yield line.replace("\x00", "")
 
 
-def _pick_col(cols: Iterable[str], candidates: List[str]) -> Optional[str]:
-    cols_l = {c.lower(): c for c in cols}
-    for cand in candidates:
-        if cand.lower() in cols_l:
-            return cols_l[cand.lower()]
+def _read_csv_flexible(path: Path) -> pd.DataFrame:
+    """
+    Read CSV with encoding fallbacks and NUL stripping.
+    """
+    encodings = ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp932")
+    last_exc: Optional[Exception] = None
+
+    # Try pandas first
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception as exc:
+            last_exc = exc
+
+    # Fallback: python csv reader with NUL stripping -> DataFrame
+    for enc in encodings:
+        try:
+            with path.open("r", encoding=enc, newline="") as fh:
+                reader = csv.DictReader(_strip_null_bytes(fh))
+                rows = list(reader)
+            return pd.DataFrame(rows)
+        except Exception as exc:
+            last_exc = exc
+
+    raise RuntimeError(f"Failed to read CSV: {path} ({last_exc})")
+
+
+def _to_numeric(df: pd.DataFrame, cols: Iterable[str]) -> None:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+
+def _first_existing(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
     return None
 
 
-def _normalize_positions(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
-    """Return df with columns: actor_id(int), frame(int), x(float), y(float), type(optional str)."""
-    fcol = _pick_col(df.columns, FRAME_CANDS)
-    icol = _pick_col(df.columns, ID_CANDS)
-    xcol = _pick_col(df.columns, X_CANDS)
-    ycol = _pick_col(df.columns, Y_CANDS)
-    tcol = _pick_col(df.columns, TYPE_CANDS)
+# ----------------------------
+# Data model
+# ----------------------------
+@dataclass
+class RunFiles:
+    tag: str
+    run_dir: Path
+    state_csv: Path
+    timing_csv: Optional[Path]
 
-    missing = [k for k, v in [("frame", fcol), ("id", icol), ("x", xcol), ("y", ycol)] if v is None]
-    if missing:
+
+RUN_TAG_RE = re.compile(r"(?:^|\\|/)(N(?P<N>\d+)_Ts(?P<Ts>\d+(?:\.\d+)?))$", re.IGNORECASE)
+
+
+def discover_runs(outdir: Path) -> List[RunFiles]:
+    """
+    Find per-run replay_state_*.csv under outdir/**/ and infer tag from folder name.
+    """
+    runs: List[RunFiles] = []
+    for state_csv in sorted(outdir.rglob("replay_state_*.csv")):
+        run_dir = state_csv.parent
+        tag = run_dir.name
+
+        # Find timing file in same dir
+        timing = None
+        timing_candidates = list(run_dir.glob("stream_timing_*.csv"))
+        if timing_candidates:
+            timing = sorted(timing_candidates)[0]
+
+        runs.append(RunFiles(tag=tag, run_dir=run_dir, state_csv=state_csv, timing_csv=timing))
+
+    # If none found, also accept generic *.csv in run folders (optional)
+    if not runs:
+        for state_csv in sorted(outdir.rglob("*state*.csv")):
+            run_dir = state_csv.parent
+            tag = run_dir.name
+            runs.append(RunFiles(tag=tag, run_dir=run_dir, state_csv=state_csv, timing_csv=None))
+
+    # Unique by tag (keep earliest)
+    seen = set()
+    uniq: List[RunFiles] = []
+    for r in runs:
+        if r.tag in seen:
+            continue
+        seen.add(r.tag)
+        uniq.append(r)
+    return uniq
+
+
+def parse_tag(tag: str) -> Tuple[Optional[int], Optional[float]]:
+    m = RUN_TAG_RE.search(tag)
+    if not m:
+        return None, None
+    n = int(m.group("N"))
+    ts = float(m.group("Ts"))
+    return n, ts
+
+
+# ----------------------------
+# Normalization for RMSE
+# ----------------------------
+def normalize_ref(ref_path: Path) -> pd.DataFrame:
+    """
+    Load reference (sender input) CSV and return normalized columns:
+      actor_id, frame_key, x_ref, y_ref
+    """
+    df = _read_csv_flexible(ref_path)
+
+    frame_col = _first_existing(df, ["payload_frame", "frame", "pf", "step"])
+    id_col = _first_existing(df, ["object_id", "actor_id", "id", "track_id"])
+    x_col = _first_existing(df, ["location_x", "x", "pos_x"])
+    y_col = _first_existing(df, ["location_y", "y", "pos_y"])
+
+    if frame_col is None or id_col is None or x_col is None or y_col is None:
         raise ValueError(
-            f"{source_name}: required columns not found: {missing}. "
-            f"available={list(df.columns)}"
+            f"ref CSV columns not recognized.\n"
+            f"Needed frame/id/x/y. Found: {list(df.columns)}"
         )
 
-    out = pd.DataFrame()
-    out["frame"] = pd.to_numeric(df[fcol], errors="coerce")
-    out["actor_id"] = pd.to_numeric(df[icol], errors="coerce")
-    out["x"] = pd.to_numeric(df[xcol], errors="coerce")
-    out["y"] = pd.to_numeric(df[ycol], errors="coerce")
-    if tcol is not None:
-        out["type"] = df[tcol].astype(str)
-    else:
-        out["type"] = ""
+    _to_numeric(df, [frame_col, id_col, x_col, y_col])
 
-    out = out.dropna(subset=["frame", "actor_id", "x", "y"]).copy()
-    # frame is typically integer payload frame. keep int for safe merge
-    out["frame"] = out["frame"].round().astype(int)
-    out["actor_id"] = out["actor_id"].round().astype(int)
+    out = pd.DataFrame()
+    out["actor_id"] = df[id_col].astype("Int64")
+    out["frame_key"] = df[frame_col].round().astype("Int64")
+    out["x_ref"] = df[x_col].astype(float)
+    out["y_ref"] = df[y_col].astype(float)
+
+    out = out.dropna(subset=["actor_id", "frame_key", "x_ref", "y_ref"])
+    out["actor_id"] = out["actor_id"].astype(int)
+    out["frame_key"] = out["frame_key"].astype(int)
     return out
 
 
-def load_positions(csv_path: Path) -> pd.DataFrame:
-    # robust encoding
-    for enc in ["utf-8-sig", "utf-16", "utf-16-le", "utf-16-be"]:
-        try:
-            df = pd.read_csv(csv_path, encoding=enc)
-            return _normalize_positions(df, str(csv_path))
-        except UnicodeError:
-            continue
-    # last attempt: default
-    df = pd.read_csv(csv_path)
-    return _normalize_positions(df, str(csv_path))
+def normalize_run(run_state_csv: Path) -> pd.DataFrame:
+    """
+    Load run state CSV (vehicle_state_stream output) and return normalized columns:
+      actor_id, frame_key, x_run, y_run
+    """
+    df = _read_csv_flexible(run_state_csv)
+
+    frame_col = _first_existing(df, ["payload_frame", "frame", "pf", "step"])
+    # Prefer original object id if present (you used --include-object-id)
+    id_col = _first_existing(df, ["object_id", "actor_id", "carla_actor_id", "id", "track_id"])
+    x_col = _first_existing(df, ["location_x", "x", "pos_x"])
+    y_col = _first_existing(df, ["location_y", "y", "pos_y"])
+
+    if frame_col is None or id_col is None or x_col is None or y_col is None:
+        raise ValueError(
+            f"run CSV columns not recognized: {run_state_csv}\n"
+            f"Needed frame/id/x/y. Found: {list(df.columns)}"
+        )
+
+    _to_numeric(df, [frame_col, id_col, x_col, y_col])
+
+    out = pd.DataFrame()
+    out["actor_id"] = df[id_col].astype("Int64")
+    out["frame_key"] = df[frame_col].round().astype("Int64")
+    out["x_run"] = df[x_col].astype(float)
+    out["y_run"] = df[y_col].astype(float)
+
+    out = out.dropna(subset=["actor_id", "frame_key", "x_run", "y_run"])
+    out["actor_id"] = out["actor_id"].astype(int)
+    out["frame_key"] = out["frame_key"].astype(int)
+    return out
 
 
-def compute_rmse(ref: pd.DataFrame, run: pd.DataFrame) -> Tuple[float, float, float, int]:
+def compute_rmse(ref_norm: pd.DataFrame, run_norm: pd.DataFrame) -> Tuple[float, float, float, int]:
     """
-    RMSE_x, RMSE_y, RMSE_xy, n_samples
-    RMSE_xy uses sqrt(mean(dx^2 + dy^2)).
+    Overall RMSE for matched (actor_id, frame_key).
+    Returns: (rmse_xy, rmse_x, rmse_y, n_matched)
     """
-    merged = pd.merge(
-        ref[["actor_id", "frame", "x", "y"]],
-        run[["actor_id", "frame", "x", "y"]],
-        on=["actor_id", "frame"],
-        suffixes=("_ref", "_run"),
-        how="inner",
-    )
+    merged = pd.merge(ref_norm, run_norm, on=["actor_id", "frame_key"], how="inner")
     if merged.empty:
         return float("nan"), float("nan"), float("nan"), 0
-    dx = merged["x_run"] - merged["x_ref"]
-    dy = merged["y_run"] - merged["y_ref"]
-    rmse_x = math.sqrt(float((dx * dx).mean()))
-    rmse_y = math.sqrt(float((dy * dy).mean()))
-    rmse_xy = math.sqrt(float(((dx * dx + dy * dy)).mean()))
-    return rmse_x, rmse_y, rmse_xy, int(len(merged))
+
+    dx = merged["x_run"].to_numpy() - merged["x_ref"].to_numpy()
+    dy = merged["y_run"].to_numpy() - merged["y_ref"].to_numpy()
+
+    mse_xy = np.mean(dx * dx + dy * dy)
+    rmse_xy = float(np.sqrt(mse_xy))
+    rmse_x = float(np.sqrt(np.mean(dx * dx)))
+    rmse_y = float(np.sqrt(np.mean(dy * dy)))
+    return rmse_xy, rmse_x, rmse_y, int(len(merged))
 
 
-def compute_rmse_per_actor(ref: pd.DataFrame, run: pd.DataFrame) -> pd.DataFrame:
-    merged = pd.merge(
-        ref[["actor_id", "frame", "x", "y"]],
-        run[["actor_id", "frame", "x", "y"]],
-        on=["actor_id", "frame"],
-        suffixes=("_ref", "_run"),
-        how="inner",
-    )
+def compute_rmse_per_actor(ref_norm: pd.DataFrame, run_norm: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-actor RMSE for matched frames.
+    """
+    merged = pd.merge(ref_norm, run_norm, on=["actor_id", "frame_key"], how="inner")
     if merged.empty:
-        return pd.DataFrame(columns=["actor_id", "n", "rmse_x", "rmse_y", "rmse_xy"])
-    merged["dx2"] = (merged["x_run"] - merged["x_ref"]) ** 2
-    merged["dy2"] = (merged["y_run"] - merged["y_ref"]) ** 2
-    g = merged.groupby("actor_id", as_index=False).agg(
-        n=("frame", "count"),
-        mse_x=("dx2", "mean"),
-        mse_y=("dy2", "mean"),
-        mse_xy=(["dx2", "dy2"], "mean"),  # placeholder, overwritten below
-    )
-    # pandas gives multiindex for mse_xy; easier manual
-    per = []
-    for aid, grp in merged.groupby("actor_id"):
-        mse_x = float(grp["dx2"].mean())
-        mse_y = float(grp["dy2"].mean())
-        mse_xy = float((grp["dx2"] + grp["dy2"]).mean())
-        per.append(
+        return pd.DataFrame(columns=["actor_id", "n", "rmse_xy", "rmse_x", "rmse_y"])
+
+    merged["dx"] = merged["x_run"] - merged["x_ref"]
+    merged["dy"] = merged["y_run"] - merged["y_ref"]
+
+    def _rmse_xy(g: pd.DataFrame) -> float:
+        return float(np.sqrt(np.mean(g["dx"].to_numpy() ** 2 + g["dy"].to_numpy() ** 2)))
+
+    def _rmse_1d(arr: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(arr ** 2)))
+
+    rows = []
+    for aid, g in merged.groupby("actor_id"):
+        dx = g["dx"].to_numpy()
+        dy = g["dy"].to_numpy()
+        rows.append(
             {
                 "actor_id": int(aid),
-                "n": int(len(grp)),
-                "rmse_x": math.sqrt(mse_x),
-                "rmse_y": math.sqrt(mse_y),
-                "rmse_xy": math.sqrt(mse_xy),
+                "n": int(len(g)),
+                "rmse_xy": _rmse_xy(g),
+                "rmse_x": _rmse_1d(dx),
+                "rmse_y": _rmse_1d(dy),
             }
         )
-    return pd.DataFrame(per).sort_values(["actor_id"]).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["rmse_xy", "n"], ascending=[False, False]).reset_index(drop=True)
+    return out
 
 
-def load_timing_ms(timing_csv: Path) -> Optional[pd.Series]:
+# ----------------------------
+# Timing extraction
+# ----------------------------
+FRAME_MS_RE = re.compile(r"Frame processed in\s+([0-9.]+)\s*ms", re.IGNORECASE)
+
+
+def timing_from_stream_csv(timing_csv: Path) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+    """
+    Return (mean_ms, p50_ms, p95_ms, n) from stream_timing CSV.
+    Tries to detect a reasonable ms column.
+    """
+    df = _read_csv_flexible(timing_csv)
+    # Convert numeric candidates
+    for c in df.columns:
+        if "ms" in c.lower() or "dt" in c.lower() or "time" in c.lower():
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Prefer likely columns
+    prefer = ["tick_wall_dt_ms", "loop_ms", "frame_ms", "dt_ms", "elapsed_ms"]
+    ms_col = _first_existing(df, prefer)
+    if ms_col is None:
+        # fallback: any column containing 'ms' with numeric content
+        ms_candidates = [c for c in df.columns if "ms" in c.lower()]
+        for c in ms_candidates:
+            if df[c].notna().sum() > 0:
+                ms_col = c
+                break
+
+    if ms_col is None or df[ms_col].dropna().empty:
+        return None, None, None, 0
+
+    v = df[ms_col].dropna().to_numpy(dtype=float)
+    mean = float(np.mean(v))
+    p50 = float(np.percentile(v, 50))
+    p95 = float(np.percentile(v, 95))
+    return mean, p50, p95, int(len(v))
+
+
+def timing_from_receiver_stderr(receiver_stderr: Path) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+    """
+    Parse 'Frame processed in XX ms' lines.
+    """
+    if not receiver_stderr.exists():
+        return None, None, None, 0
+
+    vals: List[float] = []
     try:
-        df = pd.read_csv(timing_csv, encoding="utf-8-sig")
+        txt = receiver_stderr.read_text(encoding="utf-8", errors="ignore")
     except Exception:
-        try:
-            df = pd.read_csv(timing_csv)
-        except Exception:
-            return None
+        txt = receiver_stderr.read_text(encoding="cp932", errors="ignore")
 
-    col = _pick_col(df.columns, TIMING_CANDS)
-    if col is None:
-        # fallback: first numeric column
-        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        if not num_cols:
-            return None
-        col = num_cols[0]
+    for m in FRAME_MS_RE.finditer(txt):
+        vals.append(float(m.group(1)))
 
-    s = pd.to_numeric(df[col], errors="coerce").dropna()
-    if s.empty:
-        return None
+    if not vals:
+        return None, None, None, 0
 
-    # if unit seems seconds (very small), convert to ms
-    if s.median() < 0.5:
-        s = s * 1000.0
-    return s
+    arr = np.asarray(vals, dtype=float)
+    return float(np.mean(arr)), float(np.percentile(arr, 50)), float(np.percentile(arr, 95)), int(len(arr))
 
 
-def timing_stats(s: Optional[pd.Series]) -> Dict[str, float]:
-    if s is None or s.empty:
-        return {
-            "frame_time_ms_mean": float("nan"),
-            "frame_time_ms_p50": float("nan"),
-            "frame_time_ms_p90": float("nan"),
-            "frame_time_ms_p99": float("nan"),
-            "frame_time_ms_max": float("nan"),
-            "frame_time_n": 0.0,
-        }
-    return {
-        "frame_time_ms_mean": float(s.mean()),
-        "frame_time_ms_p50": float(s.quantile(0.50)),
-        "frame_time_ms_p90": float(s.quantile(0.90)),
-        "frame_time_ms_p99": float(s.quantile(0.99)),
-        "frame_time_ms_max": float(s.max()),
-        "frame_time_n": float(len(s)),
-    }
+# ----------------------------
+# Plotting
+# ----------------------------
+def setup_paper_fonts() -> None:
+    # Prefer Arial (Windows default), then your preferred JP fonts if installed
+    mpl.rcParams["font.family"] = [
+        "Arial",
+        "BIZ UDP Gothic",
+        "BIZ UDPゴシック",
+        "IPAexGothic",
+        "MS Gothic",
+        "sans-serif",
+    ]
 
 
-def setup_fonts(paper: bool) -> None:
-    if paper:
-        mpl.rcParams["font.family"] = [
-            "Arial",
-            "BIZ UDP Gothic",
-            "BIZ UDPゴシック",
-            "IPAexGothic",
-            "MS Gothic",
-            "sans-serif",
-        ]
-
-
-def plot_run_pdf(
-    ref: pd.DataFrame,
-    run: pd.DataFrame,
+def plot_run_trajectories_pdf(
     out_pdf: Path,
-    title: str,
+    tag: str,
+    ref_norm: pd.DataFrame,
+    run_norm: pd.DataFrame,
     paper: bool,
+    include_ref: bool = True,
 ) -> None:
-    setup_fonts(paper)
-
-    # single blue, no color-coding
-    blue = "#1f77b4"  # tab:blue
-    lw = 1.8 if paper else 1.5
-    alpha = 0.85 if paper else 1.0
+    """
+    Single-color (blue-ish) trajectories for all actors in a run.
+    If include_ref: overlay reference with dashed line (same color, lighter).
+    """
+    # Blue-ish as requested
+    run_color = (0.10, 0.55, 0.90, 0.85)   # water/sky blue
+    ref_color = (0.10, 0.55, 0.90, 0.35)
 
     fig, ax = plt.subplots(figsize=(10, 8))
 
-    # plot reference as dashed, same color
-    for aid, grp in ref.groupby("actor_id"):
-        grp = grp.sort_values("frame")
-        ax.plot(grp["x"], grp["y"], color=blue, linewidth=lw, alpha=0.35, linestyle="--")
+    # Plot run
+    for aid, g in run_norm.sort_values(["actor_id", "frame_key"]).groupby("actor_id"):
+        ax.plot(g["x_run"], g["y_run"], color=run_color, linewidth=1.6 if paper else 1.2)
 
-    # plot run as solid
-    for aid, grp in run.groupby("actor_id"):
-        grp = grp.sort_values("frame")
-        ax.plot(grp["x"], grp["y"], color=blue, linewidth=lw, alpha=alpha, linestyle="-")
+    # Plot ref
+    if include_ref:
+        for aid, g in ref_norm.sort_values(["actor_id", "frame_key"]).groupby("actor_id"):
+            ax.plot(g["x_ref"], g["y_ref"], color=ref_color, linewidth=1.2 if paper else 1.0, linestyle="--")
 
-    label_fs = 22 if paper else None
-    tick_fs = 20 if paper else None
+    label_fs = 22 if paper else 14
+    tick_fs = 20 if paper else 12
 
     ax.set_xlabel("X [m]", fontsize=label_fs)
     ax.set_ylabel("Y [m]", fontsize=label_fs)
-    if tick_fs:
-        ax.tick_params(labelsize=tick_fs)
-        ax.tick_params(direction="in")
-
+    ax.tick_params(labelsize=tick_fs)
+    ax.tick_params(direction="in")
     ax.set_aspect("equal")
     ax.grid(True, linestyle="--", alpha=0.35)
 
     if not paper:
-        ax.set_title(title)
+        ax.set_title(tag)
 
     fig.tight_layout()
-    out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_pdf, dpi=200)
+    fig.savefig(out_pdf, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def find_run_dirs(outdir: Path) -> List[Path]:
-    # match N10_Ts0.10 etc
-    runs = []
-    for p in outdir.iterdir():
-        if p.is_dir() and re.match(r"^N\d+_Ts\d+(\.\d+)?$", p.name):
-            runs.append(p)
-    return sorted(runs, key=lambda x: x.name)
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--outdir", type=Path, required=True, help="sweep_results_YYYY... directory")
-    ap.add_argument("--ref", type=Path, required=True, help="reference CSV, e.g., send_data/exp_300.csv")
-    ap.add_argument("--paper", action="store_true", help="paper styling and font setup")
-    ap.add_argument("--per-actor", action="store_true", help="also write per-actor RMSE CSV per run")
-    ap.add_argument("--no-pdf", action="store_true", help="skip PDF trajectory outputs")
-    return ap
+# ----------------------------
+# Main
+# ----------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--outdir", type=Path, required=True, help="Sweep results directory (e.g., sweep_results_YYYY...).")
+    p.add_argument("--ref", type=Path, required=True, help="Reference CSV (sender input, e.g., exp_300.csv).")
+    p.add_argument("--paper", action="store_true", help="Paper styling (fonts, sizes). Output is PDF.")
+    p.add_argument("--per-actor", action="store_true", help="Also output per-actor RMSE CSV per run.")
+    p.add_argument(
+        "--no-ref-overlay",
+        action="store_true",
+        help="Do not overlay reference trajectories (still computes RMSE).",
+    )
+    return p
 
 
 def main() -> int:
-    args = build_argparser().parse_args()
-    outdir: Path = args.outdir
-    ref_csv: Path = args.ref
+    args = build_parser().parse_args()
+    outdir = args.outdir
+    ref_path = args.ref
+
+    if args.paper:
+        setup_paper_fonts()
 
     if not outdir.exists():
-        raise SystemExit(f"outdir not found: {outdir}")
-    if not ref_csv.exists():
-        raise SystemExit(f"ref csv not found: {ref_csv}")
+        raise SystemExit(f"[ERROR] outdir not found: {outdir}")
+    if not ref_path.exists():
+        raise SystemExit(f"[ERROR] ref not found: {ref_path}")
 
-    ref = load_positions(ref_csv)
+    runs = discover_runs(outdir)
+    if not runs:
+        raise SystemExit(f"[ERROR] No run CSVs found under: {outdir}")
 
-    run_dirs = find_run_dirs(outdir)
-    if not run_dirs:
-        raise SystemExit(f"no run dirs found under: {outdir}")
+    # Normalize reference once
+    ref_norm = normalize_ref(ref_path)
 
-    rows = []
-    for rd in run_dirs:
-        tag = rd.name
+    # Timing fallback: receiver_stderr at top-level (if exists)
+    receiver_stderr = outdir / "receiver_stderr.log"
 
-        # locate run trajectory csv
-        cand_traj = sorted(rd.glob("replay_state_*.csv"))
-        if not cand_traj:
-            # fallback: any csv that looks like state stream output
-            cand_traj = sorted(rd.glob("*.csv"))
-        traj_csv = None
-        for c in cand_traj:
-            if "replay_state" in c.name:
-                traj_csv = c
-                break
-        if traj_csv is None and cand_traj:
-            traj_csv = cand_traj[0]
-        if traj_csv is None:
-            continue
+    summary_rows = []
 
-        run = load_positions(traj_csv)
+    for r in runs:
+        n, ts = parse_tag(r.tag)
 
-        # RMSE
-        rmse_x, rmse_y, rmse_xy, n = compute_rmse(ref, run)
+        run_norm = normalize_run(r.state_csv)
 
-        # timing (prefer per-run stream timing)
-        timing_csv = None
-        for c in sorted(rd.glob("stream_timing_*.csv")):
-            timing_csv = c
-            break
-        timing_s = load_timing_ms(timing_csv) if timing_csv else None
-        tstat = timing_stats(timing_s)
+        rmse_xy, rmse_x, rmse_y, n_match = compute_rmse(ref_norm, run_norm)
 
-        # PDF
-        pdf_path = rd / f"traj_{tag}.pdf"
-        if not args.no_pdf:
-            title = f"{tag}  RMSE_xy={rmse_xy:.3f} m  (n={n})"
-            plot_run_pdf(ref, run, pdf_path, title=title, paper=args.paper)
+        # timing: prefer per-run stream_timing
+        mean_ms = p50_ms = p95_ms = None
+        n_timing = 0
+        if r.timing_csv and r.timing_csv.exists():
+            mean_ms, p50_ms, p95_ms, n_timing = timing_from_stream_csv(r.timing_csv)
 
-        # per-actor RMSE
+        if (mean_ms is None) and receiver_stderr.exists():
+            # Fallback to receiver log (not per-run, but better than nothing)
+            mean_ms, p50_ms, p95_ms, n_timing = timing_from_receiver_stderr(receiver_stderr)
+
+        # Output trajectory PDF
+        out_pdf = r.run_dir / f"trajectories_{r.tag}.pdf"
+        plot_run_trajectories_pdf(
+            out_pdf=out_pdf,
+            tag=r.tag,
+            ref_norm=ref_norm,
+            run_norm=run_norm,
+            paper=args.paper,
+            include_ref=(not args.no_ref_overlay),
+        )
+
+        # Optional per-actor rmse
         if args.per_actor:
-            per = compute_rmse_per_actor(ref, run)
-            per.to_csv(rd / f"rmse_per_actor_{tag}.csv", index=False)
+            per = compute_rmse_per_actor(ref_norm, run_norm)
+            per_path = r.run_dir / f"per_actor_rmse_{r.tag}.csv"
+            per.to_csv(per_path, index=False, encoding="utf-8-sig")
 
-        rows.append(
+        summary_rows.append(
             {
-                "tag": tag,
-                "traj_csv": str(traj_csv),
-                "rmse_x_m": rmse_x,
-                "rmse_y_m": rmse_y,
-                "rmse_xy_m": rmse_xy,
-                "rmse_n": n,
-                "timing_csv": str(timing_csv) if timing_csv else "",
-                **tstat,
-                "pdf": str(pdf_path) if (not args.no_pdf) else "",
+                "tag": r.tag,
+                "N": n if n is not None else "",
+                "Ts": ts if ts is not None else "",
+                "state_csv": str(r.state_csv),
+                "timing_csv": str(r.timing_csv) if r.timing_csv else "",
+                "rmse_xy": rmse_xy,
+                "rmse_x": rmse_x,
+                "rmse_y": rmse_y,
+                "n_matched": n_match,
+                "frame_ms_mean": mean_ms if mean_ms is not None else "",
+                "frame_ms_p50": p50_ms if p50_ms is not None else "",
+                "frame_ms_p95": p95_ms if p95_ms is not None else "",
+                "n_timing": n_timing,
+                "traj_pdf": str(out_pdf),
             }
         )
 
-    summary = pd.DataFrame(rows).sort_values("tag")
-    summary_path = outdir / "summary_runs.csv"
-    summary.to_csv(summary_path, index=False)
+    summary = pd.DataFrame(summary_rows)
 
-    print(f"Wrote: {summary_path}")
-    if not args.no_pdf:
-        print("Per-run PDFs: traj_<TAG>.pdf under each run directory.")
+    # Sort nicely if N/Ts available
+    def _sort_key(v):
+        try:
+            return float(v)
+        except Exception:
+            return float("inf")
+
+    if "N" in summary.columns and "Ts" in summary.columns:
+        # Convert for sort (keep blank as inf)
+        summary["_N_sort"] = summary["N"].apply(_sort_key)
+        summary["_Ts_sort"] = summary["Ts"].apply(_sort_key)
+        summary = summary.sort_values(["_N_sort", "_Ts_sort", "tag"]).drop(columns=["_N_sort", "_Ts_sort"])
+
+    out_summary = outdir / "summary_runs.csv"
+    summary.to_csv(out_summary, index=False, encoding="utf-8-sig")
+
+    print(f"[OK] Wrote: {out_summary}")
+    print(f"[OK] Runs: {len(runs)}")
     return 0
 
 
