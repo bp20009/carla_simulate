@@ -16,26 +16,19 @@ Expected structure:
 Reference CSV (example):
   frame  id  type  x  y  z
 
-This script generates a NEW analysis directory under --outdir and writes:
-  - per-run trajectory PDFs (single color)
-  - reference trajectory PDFs per N (separate, not overlaid)
+Outputs under a NEW analysis directory:
+  - per-run trajectory PDFs
+  - reference trajectory PDFs per N (separate)
   - per-run timing plots and summary stats
-  - per-run RMSE (overall + per-actor), matching by id (NOT by frame)
+  - per-run per-actor metrics (RMSE + NN + coverage)
 
-Metrics:
-  (A) RMSE with time axis + best offset search.
-  (B) Nearest-neighbor error (NN) on the same ref window:
-      - run -> ref_window: nn_*
-      - ref_window -> run: nn_ref_* (symmetric)
-  (C) Coverage at distance thresholds tau (meters):
-      - cov_run_le_tau : fraction of run points within tau of ref_window
-      - cov_ref_le_tau : fraction of ref_window points within tau of run
+Key fix:
+  - Actor matching uses --match-key (default: external_id), NOT "id".
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 import re
 from datetime import datetime
@@ -48,13 +41,12 @@ import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-# Embed TrueType fonts in PDF (important for papers)
 mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
 
 
 # ----------------------------
-# CSV helpers (robust encoding)
+# CSV helpers
 # ----------------------------
 def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
     for line in lines:
@@ -62,22 +54,30 @@ def _strip_null_bytes(lines: Iterable[str]) -> Iterator[str]:
 
 
 def read_csv_flexible(path: Path) -> pd.DataFrame:
+    """
+    Robust CSV/TSV reader:
+      - tries common encodings
+      - uses pandas separator auto-detection (sep=None, engine='python')
+      - strips null bytes if needed
+    """
     encodings = ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp932")
     last_exc: Optional[Exception] = None
     for enc in encodings:
         try:
-            with path.open("r", encoding=enc, newline="") as fh:
-                reader = csv.reader(_strip_null_bytes(fh))
-                rows = list(reader)
-            if not rows:
-                return pd.DataFrame()
-            header = rows[0]
-            data = rows[1:]
-            return pd.DataFrame(data, columns=header)
+            # Use pandas sniffing for separators (handles CSV/TSV)
+            df = pd.read_csv(
+                path,
+                encoding=enc,
+                sep=None,
+                engine="python",
+            )
+            # Strip null bytes in column names if any
+            df.columns = [c.replace("\x00", "") for c in df.columns]
+            return df
         except Exception as exc:
             last_exc = exc
             continue
-    raise RuntimeError(f"Failed to read CSV with fallback encodings: {path}") from last_exc
+    raise RuntimeError(f"Failed to read CSV/TSV with fallback encodings: {path}") from last_exc
 
 
 def to_numeric_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -88,7 +88,7 @@ def to_numeric_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 
 
 # ----------------------------
-# Column normalization
+# Normalization
 # ----------------------------
 def normalize_ref(df: pd.DataFrame) -> pd.DataFrame:
     required_any = {"frame", "id", "type"}
@@ -103,27 +103,28 @@ def normalize_ref(df: pd.DataFrame) -> pd.DataFrame:
         df = df.rename(columns={"location_z": "z"})
 
     df = to_numeric_df(df, ["frame", "id", "x", "y", "z"])
-    df = df.dropna(subset=["id", "x", "y", "frame"])
+    df = df.dropna(subset=["frame", "id", "x", "y"])
     df["id"] = df["id"].astype(int)
     df["type"] = df["type"].astype(str)
     df = df.sort_values(["id", "frame"])
+
+    # unified match id
+    df["match_id"] = df["id"].astype(int)
     return df
 
 
 def normalize_run(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    replay_state.csv is produced by vehicle_state_stream.py (or similar).
-    We keep useful time columns such as monotonic_time/wall_time if present.
-    """
+    # map expected columns
     colmap = {}
 
-    # id
+    # stable internal id
     if "id" in df.columns:
         colmap["id"] = "id"
-    elif "actor_id" in df.columns:
-        colmap["actor_id"] = "id"
-    elif "carla_actor_id" in df.columns:
-        colmap["carla_actor_id"] = "id"
+
+    # match candidates
+    for c in ("external_id", "object_id", "carla_actor_id"):
+        if c in df.columns:
+            colmap[c] = c
 
     # type
     if "type" in df.columns:
@@ -131,21 +132,16 @@ def normalize_run(df: pd.DataFrame) -> pd.DataFrame:
     elif "actor_type" in df.columns:
         colmap["actor_type"] = "type"
 
-    # frame (CARLA frame index)
+    # frame
     if "frame" in df.columns:
         colmap["frame"] = "frame"
     elif "timestamp" in df.columns:
         colmap["timestamp"] = "frame"
 
-    # time axis candidates
-    if "monotonic_time" in df.columns:
-        colmap["monotonic_time"] = "monotonic_time"
-    if "wall_time" in df.columns:
-        colmap["wall_time"] = "wall_time"
-    if "frame_elapsed" in df.columns:
-        colmap["frame_elapsed"] = "frame_elapsed"
-    if "tick_wall_dt" in df.columns:
-        colmap["tick_wall_dt"] = "tick_wall_dt"
+    # time candidates
+    for c in ("monotonic_time", "wall_time", "frame_elapsed", "tick_wall_dt"):
+        if c in df.columns:
+            colmap[c] = c
 
     # position
     if "location_x" in df.columns:
@@ -165,34 +161,32 @@ def normalize_run(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns=colmap)
 
-    required = {"id", "x", "y"}
+    required = {"x", "y"}
     if not required.issubset(set(df.columns)):
         raise ValueError(f"run CSV missing required columns {required}. got={list(df.columns)}")
 
-    num_cols = ["id", "x", "y"]
-    for c in ("z", "frame", "monotonic_time", "wall_time", "frame_elapsed", "tick_wall_dt"):
+    num_cols = ["x", "y"]
+    for c in ("z", "frame", "id", "external_id", "object_id", "carla_actor_id", "monotonic_time", "wall_time", "frame_elapsed", "tick_wall_dt"):
         if c in df.columns:
             num_cols.append(c)
+
     df = to_numeric_df(df, num_cols)
-    df = df.dropna(subset=["id", "x", "y"])
-    df["id"] = df["id"].astype(int)
+    df = df.dropna(subset=["x", "y"])
 
     if "type" in df.columns:
         df["type"] = df["type"].astype(str)
     else:
         df["type"] = "unknown"
 
-    sort_cols = ["id"]
-    if "monotonic_time" in df.columns and df["monotonic_time"].notna().any():
-        sort_cols.append("monotonic_time")
-    elif "frame" in df.columns and df["frame"].notna().any():
-        sort_cols.append("frame")
-    df = df.sort_values(sort_cols)
+    # keep integer-ish ids
+    for c in ("id", "external_id", "object_id", "carla_actor_id"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
 # ----------------------------
-# Trajectory extraction
+# Kind filter
 # ----------------------------
 def _filter_kind(df: pd.DataFrame, kind: Optional[str]) -> pd.DataFrame:
     if not kind or kind == "all":
@@ -202,14 +196,37 @@ def _filter_kind(df: pd.DataFrame, kind: Optional[str]) -> pd.DataFrame:
     return df[df["type"].astype(str).str.startswith(kind)]
 
 
-def trajectories_xy_by_id(df: pd.DataFrame, kind: Optional[str] = "vehicle") -> Dict[int, np.ndarray]:
+# ----------------------------
+# Matching + trajectory extraction
+# ----------------------------
+def apply_match_id_run(df: pd.DataFrame, match_key: str) -> pd.DataFrame:
+    if match_key == "id":
+        if "id" not in df.columns:
+            raise ValueError("run missing id column for match-key=id")
+        df["match_id"] = df["id"]
+    else:
+        if match_key not in df.columns:
+            raise ValueError(f"run missing match key column: {match_key}")
+        df["match_id"] = df[match_key]
+
+    df = df.dropna(subset=["match_id"])
+    df["match_id"] = pd.to_numeric(df["match_id"], errors="coerce")
+    df = df.dropna(subset=["match_id"])
+    df["match_id"] = df["match_id"].astype(int)
+    return df
+
+
+def trajectories_xy_by_match_id(df: pd.DataFrame, kind: Optional[str]) -> Dict[int, np.ndarray]:
     sub = _filter_kind(df, kind)
+    if "match_id" not in sub.columns:
+        raise ValueError("missing match_id in df (did you call apply_match_id_run?)")
+
     trajs: Dict[int, np.ndarray] = {}
-    for aid, g in sub.groupby("id", sort=True):
+    for mid, g in sub.groupby("match_id", sort=True):
         pts = g[["x", "y"]].to_numpy(dtype=float)
         pts = pts[np.isfinite(pts).all(axis=1)]
         if len(pts) >= 2:
-            trajs[int(aid)] = pts
+            trajs[int(mid)] = pts
     return trajs
 
 
@@ -224,7 +241,7 @@ def choose_time_column(df: pd.DataFrame, preferred: str, fallbacks: List[str]) -
     return None
 
 
-def trajectories_time_xy_by_id(
+def trajectories_time_xy_by_match_id(
     df: pd.DataFrame,
     *,
     kind: Optional[str],
@@ -232,9 +249,11 @@ def trajectories_time_xy_by_id(
     time_scale: float = 1.0,
 ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
     sub = _filter_kind(df, kind)
+    if "match_id" not in sub.columns:
+        raise ValueError("missing match_id in df")
 
     trajs: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-    for aid, g in sub.groupby("id", sort=True):
+    for mid, g in sub.groupby("match_id", sort=True):
         if time_col not in g.columns:
             continue
         t = pd.to_numeric(g[time_col], errors="coerce").to_numpy(dtype=float) * float(time_scale)
@@ -252,12 +271,13 @@ def trajectories_time_xy_by_id(
 
         t = t - t[0]
 
+        # ensure non-decreasing
         keep = np.ones_like(t, dtype=bool)
         keep[1:] = t[1:] >= t[:-1]
         t = t[keep]
         xy = xy[keep]
 
-        # compress to unique times by taking last sample for each time
+        # unique times (keep last occurrence)
         if len(t) >= 2:
             t_rev = t[::-1]
             _, idx_rev = np.unique(t_rev, return_index=True)
@@ -267,107 +287,13 @@ def trajectories_time_xy_by_id(
             xy = xy[last_idx]
 
         if len(t) >= 2:
-            trajs[int(aid)] = (t, xy)
+            trajs[int(mid)] = (t, xy)
 
     return trajs
 
 
 # ----------------------------
-# Metrics helpers (NN error, coverage, path length)
-# ----------------------------
-def path_length_m(xy: np.ndarray) -> float:
-    if xy is None or len(xy) < 2:
-        return 0.0
-    d = np.diff(xy, axis=0)
-    seg = np.sqrt(d[:, 0] ** 2 + d[:, 1] ** 2)
-    return float(np.sum(seg))
-
-
-def slice_by_time(t: np.ndarray, xy: np.ndarray, t0: float, duration: float) -> np.ndarray:
-    if len(t) < 2 or len(xy) < 2 or duration <= 0:
-        return xy
-    t1 = t0 + duration
-    mask = (t >= t0) & (t <= t1) & np.isfinite(t)
-    out = xy[mask]
-    if out is None or len(out) < 2:
-        return xy
-    return out
-
-
-def nearest_neighbor_distances(run_xy: np.ndarray, ref_xy: np.ndarray, chunk_size: int = 256) -> np.ndarray:
-    """
-    For each point in run_xy, compute distance to the nearest point in ref_xy.
-    Chunked broadcasting to avoid huge memory.
-    """
-    if run_xy is None or ref_xy is None or len(run_xy) == 0 or len(ref_xy) == 0:
-        return np.array([], dtype=float)
-
-    run_xy = np.asarray(run_xy, dtype=float)
-    ref_xy = np.asarray(ref_xy, dtype=float)
-
-    run_xy = run_xy[np.isfinite(run_xy).all(axis=1)]
-    ref_xy = ref_xy[np.isfinite(ref_xy).all(axis=1)]
-    if len(run_xy) == 0 or len(ref_xy) == 0:
-        return np.array([], dtype=float)
-
-    out = np.empty(len(run_xy), dtype=float)
-    for i0 in range(0, len(run_xy), chunk_size):
-        i1 = min(len(run_xy), i0 + chunk_size)
-        chunk = run_xy[i0:i1]  # (K,2)
-        d2 = (chunk[:, None, 0] - ref_xy[None, :, 0]) ** 2 + (chunk[:, None, 1] - ref_xy[None, :, 1]) ** 2
-        out[i0:i1] = np.sqrt(np.min(d2, axis=1))
-    return out
-
-
-def nn_stats(run_xy: np.ndarray, ref_xy: np.ndarray, *, chunk_size: int) -> Dict[str, float]:
-    d = nearest_neighbor_distances(run_xy, ref_xy, chunk_size=chunk_size)
-    d = d[np.isfinite(d)]
-    if len(d) == 0:
-        return {
-            "nn_mean_m": float("nan"),
-            "nn_p50_m": float("nan"),
-            "nn_p90_m": float("nan"),
-            "nn_p95_m": float("nan"),
-            "nn_max_m": float("nan"),
-            "nn_end_m": float("nan"),
-        }
-    end_d = float(d[-1])
-    return {
-        "nn_mean_m": float(np.mean(d)),
-        "nn_p50_m": float(np.percentile(d, 50)),
-        "nn_p90_m": float(np.percentile(d, 90)),
-        "nn_p95_m": float(np.percentile(d, 95)),
-        "nn_max_m": float(np.max(d)),
-        "nn_end_m": end_d,
-    }
-
-
-def coverage_at_taus(dists: np.ndarray, taus_m: List[float], prefix: str) -> Dict[str, float]:
-    """
-    dists: distances for points (e.g., run->ref NN distances)
-    returns coverage columns: prefix_le_{tau}m
-    """
-    out: Dict[str, float] = {}
-    v = dists[np.isfinite(dists)]
-    for tau in taus_m:
-        key = f"{prefix}_le_{tau_to_key(tau)}m"
-        if len(v) == 0:
-            out[key] = float("nan")
-        else:
-            out[key] = float(np.mean(v <= float(tau)))
-    return out
-
-
-def tau_to_key(tau: float) -> str:
-    # 2.0 -> "2", 2.5 -> "2p5"
-    if abs(tau - round(tau)) < 1e-9:
-        return str(int(round(tau)))
-    s = f"{tau:.3f}".rstrip("0").rstrip(".")
-    return s.replace(".", "p")
-
-
-# ----------------------------
-# RMSE (id match, time-aligned)
+# RMSE (time best offset)
 # ----------------------------
 def rmse_on_grid(
     ref_t: np.ndarray,
@@ -407,26 +333,23 @@ def rmse_time_best_offset(
     samples: int,
     max_candidates: int,
     offset_step_sec: float,
-) -> Tuple[float, float, float, float, float]:
-    """
-    Returns (rmse_2d, rmse_x, rmse_y, best_offset_sec, duration_sec)
-    """
+) -> Tuple[float, float, float, float, float, float, float]:
     if len(ref_t) < 2 or len(run_t) < 2:
-        return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+        return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
 
     T_run = float(run_t.max())
     T_ref = float(ref_t.max())
     if not np.isfinite(T_run) or not np.isfinite(T_ref) or T_run <= 0 or T_ref <= 0:
-        return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+        return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), T_ref, T_run)
 
     duration = min(T_run, T_ref)
     if duration <= 0:
-        return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+        return (float("nan"), float("nan"), float("nan"), float("nan"), duration, T_ref, T_run)
 
     max_offset = max(0.0, T_ref - duration)
     if max_offset <= 0.0:
-        rmse_2d, rmse_x, rmse_y = rmse_on_grid(ref_t, ref_xy, run_t, run_xy, t0_ref=0.0, duration=duration, samples=samples)
-        return rmse_2d, rmse_x, rmse_y, 0.0, duration
+        r2, rx, ry = rmse_on_grid(ref_t, ref_xy, run_t, run_xy, t0_ref=0.0, duration=duration, samples=samples)
+        return r2, rx, ry, 0.0, duration, T_ref, T_run
 
     if offset_step_sec <= 0:
         offset_step_sec = max_offset / max(1, (max_candidates - 1))
@@ -436,143 +359,81 @@ def rmse_time_best_offset(
         idx = np.linspace(0, len(cand) - 1, max_candidates).round().astype(int)
         cand = cand[idx]
 
-    best = (float("inf"), float("nan"), float("nan"), float("nan"))  # rmse2d, rmsex, rmsey, offset
+    best = (float("inf"), float("nan"), float("nan"), float("nan"))
+    best_t0 = float("nan")
     for t0 in cand:
         r2, rx, ry = rmse_on_grid(ref_t, ref_xy, run_t, run_xy, t0_ref=float(t0), duration=duration, samples=samples)
         if np.isfinite(r2) and r2 < best[0]:
             best = (r2, rx, ry, float(t0))
+            best_t0 = float(t0)
 
     if not np.isfinite(best[0]):
-        return (float("nan"), float("nan"), float("nan"), float("nan"), duration)
-    return best[0], best[1], best[2], best[3], duration
-
-
-def compute_per_actor_metrics(
-    ref_trajs: Dict[int, Tuple[np.ndarray, np.ndarray]],
-    run_trajs: Dict[int, Tuple[np.ndarray, np.ndarray]],
-    *,
-    samples: int,
-    max_candidates: int,
-    offset_step_sec: float,
-    nn_chunk: int,
-    cov_taus_m: List[float],
-) -> pd.DataFrame:
-    rows = []
-    common_ids = sorted(set(ref_trajs.keys()) & set(run_trajs.keys()))
-    for aid in common_ids:
-        ref_t, ref_xy = ref_trajs[aid]
-        run_t, run_xy = run_trajs[aid]
-
-        rmse_2d, rmse_x, rmse_y, best_offset, duration = rmse_time_best_offset(
-            ref_t,
-            ref_xy,
-            run_t,
-            run_xy,
-            samples=samples,
-            max_candidates=max_candidates,
-            offset_step_sec=offset_step_sec,
-        )
-
-        # ref window selected by best offset and duration
-        t0 = float(best_offset) if np.isfinite(best_offset) else 0.0
-        dur = float(duration) if np.isfinite(duration) else 0.0
-        ref_win_xy = slice_by_time(ref_t, ref_xy, t0, dur)
-
-        # Directed NN distances
-        d_run_to_ref = nearest_neighbor_distances(run_xy, ref_win_xy, chunk_size=nn_chunk)
-        d_ref_to_run = nearest_neighbor_distances(ref_win_xy, run_xy, chunk_size=nn_chunk)
-
-        # NN stats
-        nn_run = nn_stats(run_xy, ref_win_xy, chunk_size=nn_chunk)  # run -> ref
-        nn_ref = nn_stats(ref_win_xy, run_xy, chunk_size=nn_chunk)  # ref -> run
-
-        # rename ref->run keys to avoid collision
-        nn_ref = {
-            "nn_ref_mean_m": nn_ref["nn_mean_m"],
-            "nn_ref_p50_m": nn_ref["nn_p50_m"],
-            "nn_ref_p90_m": nn_ref["nn_p90_m"],
-            "nn_ref_p95_m": nn_ref["nn_p95_m"],
-            "nn_ref_max_m": nn_ref["nn_max_m"],
-            "nn_ref_end_m": nn_ref["nn_end_m"],
-        }
-
-        # Coverage columns
-        cov_run = coverage_at_taus(d_run_to_ref, cov_taus_m, prefix="cov_run")
-        cov_ref = coverage_at_taus(d_ref_to_run, cov_taus_m, prefix="cov_ref")
-
-        rows.append(
-            {
-                "id": aid,
-                "rmse_2d": rmse_2d,
-                "rmse_x": rmse_x,
-                "rmse_y": rmse_y,
-                "best_offset_sec": best_offset,
-                "duration_sec": duration,
-                "t_ref_end_sec": float(ref_t.max()) if len(ref_t) else float("nan"),
-                "t_run_end_sec": float(run_t.max()) if len(run_t) else float("nan"),
-                "n_ref": int(len(ref_xy)),
-                "n_run": int(len(run_xy)),
-                "ref_path_len_m": path_length_m(ref_win_xy),
-                "run_path_len_m": path_length_m(run_xy),
-                **nn_run,
-                **nn_ref,
-                **cov_run,
-                **cov_ref,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("id")
-    return df
-
-
-def compute_overall_metrics(per_actor: pd.DataFrame, cov_taus_m: List[float]) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-
-    def finite(v: np.ndarray) -> np.ndarray:
-        v = np.asarray(v, dtype=float)
-        return v[np.isfinite(v)]
-
-    # RMSE overall
-    if per_actor.empty or "rmse_2d" not in per_actor.columns:
-        out["rmse_2d_mean"] = float("nan")
-        out["rmse_2d_median"] = float("nan")
-    else:
-        v = finite(per_actor["rmse_2d"].to_numpy(dtype=float))
-        out["rmse_2d_mean"] = float(np.mean(v)) if len(v) else float("nan")
-        out["rmse_2d_median"] = float(np.median(v)) if len(v) else float("nan")
-
-    # NN overall (actor-wise nn_p50)
-    for key in ("nn_p50_m", "nn_ref_p50_m"):
-        if per_actor.empty or key not in per_actor.columns:
-            out[f"{key}_mean"] = float("nan")
-            out[f"{key}_median"] = float("nan")
-            out[f"{key}_p90"] = float("nan")
-        else:
-            v = finite(per_actor[key].to_numpy(dtype=float))
-            out[f"{key}_mean"] = float(np.mean(v)) if len(v) else float("nan")
-            out[f"{key}_median"] = float(np.median(v)) if len(v) else float("nan")
-            out[f"{key}_p90"] = float(np.percentile(v, 90)) if len(v) else float("nan")
-
-    # Coverage overall (actor-wise mean/median)
-    for tau in cov_taus_m:
-        k_run = f"cov_run_le_{tau_to_key(tau)}m"
-        k_ref = f"cov_ref_le_{tau_to_key(tau)}m"
-        for k in (k_run, k_ref):
-            if per_actor.empty or k not in per_actor.columns:
-                out[f"{k}_mean"] = float("nan")
-                out[f"{k}_median"] = float("nan")
-            else:
-                v = finite(per_actor[k].to_numpy(dtype=float))
-                out[f"{k}_mean"] = float(np.mean(v)) if len(v) else float("nan")
-                out[f"{k}_median"] = float(np.median(v)) if len(v) else float("nan")
-
-    return out
+        return (float("nan"), float("nan"), float("nan"), float("nan"), duration, T_ref, T_run)
+    return best[0], best[1], best[2], best_t0, duration, T_ref, T_run
 
 
 # ----------------------------
-# Timing parsing + plots
+# Nearest-neighbor + coverage metrics
+# ----------------------------
+def path_length_m(xy: np.ndarray) -> float:
+    if xy is None or len(xy) < 2:
+        return 0.0
+    d = np.diff(xy, axis=0)
+    return float(np.sum(np.sqrt(np.sum(d * d, axis=1))))
+
+
+def nn_dist_series(a_xy: np.ndarray, b_xy: np.ndarray) -> np.ndarray:
+    """
+    For each point in a_xy, compute min distance to any point in b_xy.
+    O(N*M) but ok for typical sizes. If huge, optimize with KDTree.
+    """
+    if len(a_xy) == 0 or len(b_xy) == 0:
+        return np.array([], dtype=float)
+    # broadcast: (Na,1,2) - (1,Nb,2) -> (Na,Nb,2)
+    diff = a_xy[:, None, :] - b_xy[None, :, :]
+    dist = np.sqrt(np.sum(diff * diff, axis=2))
+    return np.min(dist, axis=1)
+
+
+def summarize_nn(dist: np.ndarray) -> Dict[str, float]:
+    if dist.size == 0:
+        return {
+            "nn_mean_m": float("nan"),
+            "nn_p50_m": float("nan"),
+            "nn_p90_m": float("nan"),
+            "nn_p95_m": float("nan"),
+            "nn_max_m": float("nan"),
+            "nn_end_m": float("nan"),
+        }
+    v = dist[np.isfinite(dist)]
+    if v.size == 0:
+        return {
+            "nn_mean_m": float("nan"),
+            "nn_p50_m": float("nan"),
+            "nn_p90_m": float("nan"),
+            "nn_p95_m": float("nan"),
+            "nn_max_m": float("nan"),
+            "nn_end_m": float("nan"),
+        }
+    return {
+        "nn_mean_m": float(np.mean(v)),
+        "nn_p50_m": float(np.percentile(v, 50)),
+        "nn_p90_m": float(np.percentile(v, 90)),
+        "nn_p95_m": float(np.percentile(v, 95)),
+        "nn_max_m": float(np.max(v)),
+        "nn_end_m": float(v[-1]),
+    }
+
+
+def coverage(dist: np.ndarray, tau_m: float) -> float:
+    v = dist[np.isfinite(dist)]
+    if v.size == 0:
+        return float("nan")
+    return float(np.mean(v <= float(tau_m)))
+
+
+# ----------------------------
+# Timing
 # ----------------------------
 def load_timing_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -604,15 +465,7 @@ def pick_time_axes(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, str, str]:
         t = np.arange(len(df), dtype=float)
         t_label = "index"
 
-    candidates_ms = [
-        "frame_processed_ms",
-        "process_ms",
-        "update_ms",
-        "dt_ms",
-        "elapsed_ms",
-        "frame_ms",
-        "tick_wall_dt_ms",
-    ]
+    candidates_ms = ["frame_processed_ms", "process_ms", "update_ms", "dt_ms", "elapsed_ms", "frame_ms", "tick_wall_dt_ms"]
     for c in candidates_ms:
         if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
             y = df[c].to_numpy(dtype=float)
@@ -635,14 +488,7 @@ def pick_time_axes(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, str, str]:
 def timing_stats_ms(frame_ms: np.ndarray) -> Dict[str, float]:
     v = frame_ms[np.isfinite(frame_ms)]
     if len(v) == 0:
-        return {
-            "mean_ms": float("nan"),
-            "p50_ms": float("nan"),
-            "p90_ms": float("nan"),
-            "p95_ms": float("nan"),
-            "max_ms": float("nan"),
-            "n": 0.0,
-        }
+        return {"mean_ms": float("nan"), "p50_ms": float("nan"), "p90_ms": float("nan"), "p95_ms": float("nan"), "max_ms": float("nan"), "n": 0.0}
     return {
         "mean_ms": float(np.mean(v)),
         "p50_ms": float(np.percentile(v, 50)),
@@ -658,74 +504,35 @@ def timing_stats_ms(frame_ms: np.ndarray) -> Dict[str, float]:
 # ----------------------------
 def setup_paper_fonts():
     logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
-    mpl.rcParams["font.family"] = [
-        "Arial",
-        "BIZ UDP Gothic",
-        "BIZ UDPゴシック",
-        "IPAexGothic",
-        "Yu Gothic",
-        "Meiryo",
-        "MS Gothic",
-        "sans-serif",
-    ]
+    mpl.rcParams["font.family"] = ["Arial", "BIZ UDP Gothic", "BIZ UDPゴシック", "IPAexGothic", "Yu Gothic", "Meiryo", "MS Gothic", "sans-serif"]
 
 
-def plot_trajectories_pdf(
-    trajs: Dict[int, np.ndarray],
-    out_pdf: Path,
-    *,
-    color: str,
-    title: Optional[str],
-    paper: bool,
-):
+def plot_trajectories_pdf(trajs: Dict[int, np.ndarray], out_pdf: Path, *, color: str, title: Optional[str], paper: bool):
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
-
     fig, ax = plt.subplots(figsize=(10, 8))
-
     for aid in sorted(trajs.keys()):
         pts = trajs[aid]
-        ax.plot(
-            pts[:, 0],
-            pts[:, 1],
-            color=color,
-            linewidth=1.8 if paper else 1.2,
-            alpha=0.85 if paper else 0.9,
-        )
-
+        ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1.8 if paper else 1.2, alpha=0.85 if paper else 0.9)
     if title and not paper:
         ax.set_title(title)
 
     label_fs = 22 if paper else None
     tick_fs = 20 if paper else None
-
     ax.set_xlabel("X [m]", fontsize=label_fs)
     ax.set_ylabel("Y [m]", fontsize=label_fs)
-
     if tick_fs:
         ax.tick_params(labelsize=tick_fs, direction="in")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, linestyle="--", alpha=0.35)
-
     fig.tight_layout()
     fig.savefig(out_pdf, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_timing_pdf(
-    t_sec: np.ndarray,
-    frame_ms: np.ndarray,
-    out_pdf: Path,
-    *,
-    title: Optional[str],
-    paper: bool,
-    t_label: str,
-    y_label: str,
-):
+def plot_timing_pdf(t_sec: np.ndarray, frame_ms: np.ndarray, out_pdf: Path, *, title: Optional[str], paper: bool, t_label: str, y_label: str):
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
-
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(t_sec, frame_ms, linewidth=1.6 if paper else 1.2)
-
     if title and not paper:
         ax.set_title(title)
 
@@ -733,14 +540,11 @@ def plot_timing_pdf(
     tick_fs = 20 if paper else None
     ax.set_xlabel("経過フレーム", fontsize=label_fs)
     ax.set_ylabel("処理時間 [ms]", fontsize=label_fs)
-
     if tick_fs:
         ax.tick_params(labelsize=tick_fs, direction="in")
     ax.grid(True, linestyle="--", alpha=0.35)
-
     if len(t_sec) > 0 and np.isfinite(t_sec).any():
         ax.set_xlim(left=0.0)
-
     fig.tight_layout()
     fig.savefig(out_pdf, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -768,75 +572,44 @@ def find_runs(outdir: Path) -> List[Tuple[str, Path, int, str]]:
 
 
 # ----------------------------
-# Main
+# CLI
 # ----------------------------
-def parse_float_list(s: str) -> List[float]:
-    out: List[float] = []
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        out.append(float(part))
-    if len(out) == 0:
-        raise ValueError("empty list")
-    return out
-
-
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--outdir", type=Path, required=True, help="Sweep outdir (contains Nxx_TsYY subdirs)")
-    ap.add_argument("--ref", type=Path, required=True, help="Reference CSV (exp_300.csv)")
-    ap.add_argument("--analysis-name", default=None, help="Optional analysis directory name (default: auto timestamp)")
-    ap.add_argument("--paper", action="store_true", help="Paper style fonts/sizes; PDF output")
-    ap.add_argument("--color", default="#3da5d9", help="Single trajectory color (e.g. light blue)")
-    ap.add_argument("--kind", default="vehicle", choices=["vehicle", "walker", "all"], help="Actor kind to plot/analyze")
+    ap.add_argument("--outdir", type=Path, required=True)
+    ap.add_argument("--ref", type=Path, required=True)
+    ap.add_argument("--analysis-name", default=None)
+    ap.add_argument("--paper", action="store_true")
+    ap.add_argument("--color", default="#3da5d9")
+    ap.add_argument("--kind", default="vehicle", choices=["vehicle", "walker", "all"])
+
+    # backward-compat (ignored)
+    ap.add_argument("--per-actor", action="store_true", help="(compat) ignored; per-actor CSV is always written")
+
+    # matching
+    ap.add_argument(
+        "--match-key",
+        default="external_id",
+        choices=["id", "external_id", "object_id", "carla_actor_id"],
+        help="Actor matching key for run. Default: external_id (recommended).",
+    )
 
     # RMSE controls
-    ap.add_argument("--rmse-samples", type=int, default=200, help="Interpolation samples for RMSE")
-    ap.add_argument(
-        "--run-time-col",
-        default="monotonic_time",
-        help="Preferred time column for run (default: monotonic_time). Fallbacks: wall_time, frame.",
-    )
-    ap.add_argument(
-        "--ref-time-col",
-        default="frame",
-        help="Time column for ref (default: frame). Usually frame.",
-    )
-    ap.add_argument(
-        "--ref-time-scale",
-        type=float,
-        default=None,
-        help="Scale applied to ref time column to get seconds. If omitted, uses Ts from run dir name.",
-    )
-    ap.add_argument(
-        "--rmse-offset-step",
-        type=float,
-        default=0.0,
-        help="Search step [sec] for best offset. 0 means auto.",
-    )
-    ap.add_argument(
-        "--rmse-max-candidates",
-        type=int,
-        default=200,
-        help="Max number of offset candidates per actor (cap for speed).",
-    )
+    ap.add_argument("--rmse-samples", type=int, default=200)
+    ap.add_argument("--run-time-col", default="monotonic_time")
+    ap.add_argument("--ref-time-col", default="frame")
+    ap.add_argument("--ref-time-scale", type=float, default=None)
+    ap.add_argument("--rmse-offset-step", type=float, default=0.0)
+    ap.add_argument("--rmse-max-candidates", type=int, default=200)
 
-    # NN + Coverage controls
-    ap.add_argument(
-        "--nn-chunk",
-        type=int,
-        default=256,
-        help="Chunk size for NN distance computation (memory control).",
-    )
-    ap.add_argument(
-        "--cov-taus",
-        default="1,2,5",
-        help="Coverage thresholds in meters, comma-separated (default: 1,2,5).",
-    )
+    # NN/Coverage thresholds
+    ap.add_argument("--cov-thresholds", default="1,2,3,5", help="comma-separated thresholds in meters for coverage")
     return ap
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main() -> int:
     args = build_parser().parse_args()
 
@@ -844,8 +617,6 @@ def main() -> int:
     if not outdir.exists():
         print(f"[ERROR] outdir not found: {outdir}")
         return 2
-
-    cov_taus_m = parse_float_list(args.cov_taus)
 
     if args.paper:
         setup_paper_fonts()
@@ -855,35 +626,29 @@ def main() -> int:
     analysis_dir = outdir / analysis_name
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read reference
-    ref_raw = read_csv_flexible(args.ref)
-    ref_df = normalize_ref(ref_raw)
+    # thresholds
+    cov_taus = [float(x) for x in str(args.cov_thresholds).split(",") if x.strip()]
+
+    # Read ref
+    ref_df = normalize_ref(read_csv_flexible(args.ref))
 
     kind = args.kind
     kind_for_filter: Optional[str] = None if kind == "all" else kind
 
-    # Reference trajectory plots (xy only)
-    ref_xy_all = trajectories_xy_by_id(ref_df, kind_for_filter or "vehicle")
-    ref_ids_sorted = sorted(ref_xy_all.keys())
+    # ref XY for plotting (match_id already in ref_df)
+    ref_xy_all = trajectories_xy_by_match_id(ref_df, kind_for_filter)
 
-    # Reference plots per N (separate, no overlay)
     ref_out = analysis_dir / "ref_trajectories"
     ref_out.mkdir(parents=True, exist_ok=True)
+    ref_ids_sorted = sorted(ref_xy_all.keys())
 
     for n in range(10, 101, 10):
-        picked_ids = [i for i in ref_ids_sorted if i <= n]  # assumes ids 1..N
-        trajs_n = {i: ref_xy_all[i] for i in picked_ids if i in ref_xy_all}
-        if len(trajs_n) == 0:
-            continue
-        plot_trajectories_pdf(
-            trajs_n,
-            ref_out / f"ref_trajectories_N{n}.pdf",
-            color=args.color,
-            title=f"Reference trajectories (N={n})",
-            paper=args.paper,
-        )
+        picked = [i for i in ref_ids_sorted if i <= n]
+        trajs_n = {i: ref_xy_all[i] for i in picked if i in ref_xy_all}
+        if trajs_n:
+            plot_trajectories_pdf(trajs_n, ref_out / f"ref_trajectories_N{n}.pdf", color=args.color, title=f"Reference trajectories (N={n})", paper=args.paper)
 
-    # Runs
+    # runs
     runs = find_runs(outdir)
     if not runs:
         print(f"[ERROR] No run dirs like N10_Ts0.10 found under: {outdir}")
@@ -894,59 +659,36 @@ def main() -> int:
     for tag, run_path, n, ts_str in runs:
         replay_csv = run_path / "replay_state.csv"
         timing_csv = run_path / "stream_timing.csv"
-
         if not replay_csv.exists():
             print(f"[WARN] missing replay_state.csv: {replay_csv}")
             continue
 
-        run_raw = read_csv_flexible(replay_csv)
-        run_df = normalize_run(run_raw)
+        Ts_run = float(ts_str)
 
-        # Plot trajectories (run only)
-        run_xy_plot = trajectories_xy_by_id(run_df, kind_for_filter or "vehicle")
+        run_df = normalize_run(read_csv_flexible(replay_csv))
+        run_df = apply_match_id_run(run_df, args.match_key)
+
         run_out = analysis_dir / "runs" / tag
         run_out.mkdir(parents=True, exist_ok=True)
 
+        # plot run trajectories
+        run_xy = trajectories_xy_by_match_id(run_df, kind_for_filter)
         traj_pdf = run_out / f"trajectories_{tag}.pdf"
-        plot_trajectories_pdf(
-            run_xy_plot,
-            traj_pdf,
-            color=args.color,
-            title=f"Run trajectories {tag}",
-            paper=args.paper,
-        )
+        plot_trajectories_pdf(run_xy, traj_pdf, color=args.color, title=f"Run trajectories {tag}", paper=args.paper)
 
-        # Timing plot + stats
+        # timing
         tdf = load_timing_csv(timing_csv)
         t_sec, frame_ms, t_label, y_label = pick_time_axes(tdf)
         stats = timing_stats_ms(frame_ms)
-
         timing_pdf = run_out / f"timing_{tag}.pdf"
-        plot_timing_pdf(
-            t_sec,
-            frame_ms,
-            timing_pdf,
-            title=f"Timing {tag}",
-            paper=args.paper,
-            t_label=t_label,
-            y_label=y_label,
-        )
+        plot_timing_pdf(t_sec, frame_ms, timing_pdf, title=f"Timing {tag}", paper=args.paper, t_label=t_label, y_label=y_label)
 
-        # ----------------------------
-        # Metrics (RMSE + NN symmetric + Coverage)
-        # ----------------------------
-        Ts_run = float(ts_str)
-
-        run_time_col = choose_time_column(
-            run_df,
-            preferred=args.run_time_col,
-            fallbacks=["wall_time", "frame"],
-        )
-
+        # RMSE preparation: time cols
+        run_time_col = choose_time_column(run_df, preferred=args.run_time_col, fallbacks=["wall_time", "frame"])
         if run_time_col is None:
-            print(f"[WARN] {tag}: no usable run time column; skip metrics")
             per_actor = pd.DataFrame()
-            overall = {}
+            rmse_mean = float("nan")
+            rmse_med = float("nan")
         else:
             ref_time_col = args.ref_time_col
             if ref_time_col not in ref_df.columns:
@@ -955,70 +697,119 @@ def main() -> int:
             ref_time_scale = float(args.ref_time_scale) if args.ref_time_scale is not None else Ts_run
             run_time_scale = Ts_run if run_time_col == "frame" else 1.0
 
-            ref_time_trajs_all = trajectories_time_xy_by_id(
-                ref_df,
-                kind=kind_for_filter or "vehicle",
-                time_col=ref_time_col,
-                time_scale=ref_time_scale,
-            )
-            run_time_trajs = trajectories_time_xy_by_id(
-                run_df,
-                kind=kind_for_filter or "vehicle",
-                time_col=run_time_col,
-                time_scale=run_time_scale,
-            )
+            ref_time_trajs_all = trajectories_time_xy_by_match_id(ref_df, kind=kind_for_filter, time_col=ref_time_col, time_scale=ref_time_scale)
+            run_time_trajs = trajectories_time_xy_by_match_id(run_df, kind=kind_for_filter, time_col=run_time_col, time_scale=run_time_scale)
 
+            # subset by N (assumes match ids are 1..N in ref)
             ref_sub_ids = [i for i in sorted(ref_time_trajs_all.keys()) if i <= n]
-            ref_sub_trajs = {i: ref_time_trajs_all[i] for i in ref_sub_ids if i in ref_time_trajs_all}
+            ref_sub = {i: ref_time_trajs_all[i] for i in ref_sub_ids}
 
+            # RMSE + NN + coverage per actor
+            rows = []
+            common = sorted(set(ref_sub.keys()) & set(run_time_trajs.keys()))
             offset_step = float(args.rmse_offset_step)
             if offset_step <= 0:
                 offset_step = max(Ts_run, 0.01)
 
-            per_actor = compute_per_actor_metrics(
-                ref_sub_trajs,
-                run_time_trajs,
-                samples=int(args.rmse_samples),
-                max_candidates=int(args.rmse_max_candidates),
-                offset_step_sec=offset_step,
-                nn_chunk=int(args.nn_chunk),
-                cov_taus_m=cov_taus_m,
-            )
-            overall = compute_overall_metrics(per_actor, cov_taus_m=cov_taus_m)
+            for mid in common:
+                ref_t, ref_xy = ref_sub[mid]
+                run_t, run_xy_t = run_time_trajs[mid]
 
-        per_actor_path = run_out / f"per_actor_rmse_{tag}.csv"
+                rmse_2d, rmse_x, rmse_y, best_offset, duration, t_ref_end, t_run_end = rmse_time_best_offset(
+                    ref_t, ref_xy, run_t, run_xy_t,
+                    samples=int(args.rmse_samples),
+                    max_candidates=int(args.rmse_max_candidates),
+                    offset_step_sec=offset_step,
+                )
+
+                # windowed ref for NN/coverage (same grid as rmse evaluation)
+                if np.isfinite(best_offset) and np.isfinite(duration) and duration > 0:
+                    t_grid = np.linspace(0.0, duration, int(args.rmse_samples))
+                    ref_win = np.column_stack([
+                        np.interp(best_offset + t_grid, ref_t, ref_xy[:, 0]),
+                        np.interp(best_offset + t_grid, ref_t, ref_xy[:, 1]),
+                    ])
+                    run_win = np.column_stack([
+                        np.interp(t_grid, run_t, run_xy_t[:, 0]),
+                        np.interp(t_grid, run_t, run_xy_t[:, 1]),
+                    ])
+                else:
+                    ref_win = np.empty((0, 2), dtype=float)
+                    run_win = np.empty((0, 2), dtype=float)
+
+                # NN distances both directions
+                d_run_to_ref = nn_dist_series(run_win, ref_win)
+                d_ref_to_run = nn_dist_series(ref_win, run_win)
+
+                nn_run = summarize_nn(d_run_to_ref)
+                nn_ref = summarize_nn(d_ref_to_run)
+
+                row = {
+                    "id": int(mid),
+                    "rmse_2d": rmse_2d,
+                    "rmse_x": rmse_x,
+                    "rmse_y": rmse_y,
+                    "best_offset_sec": best_offset,
+                    "duration_sec": duration,
+                    "t_ref_end_sec": t_ref_end,
+                    "t_run_end_sec": t_run_end,
+                    "n_ref": int(len(ref_xy)),
+                    "n_run": int(len(run_xy_t)),
+                    "ref_path_len_m": path_length_m(ref_xy),
+                    "run_path_len_m": path_length_m(run_xy_t),
+                    **nn_run,
+                    "nn_ref_mean_m": nn_ref["nn_mean_m"],
+                    "nn_ref_p50_m": nn_ref["nn_p50_m"],
+                    "nn_ref_p90_m": nn_ref["nn_p90_m"],
+                    "nn_ref_p95_m": nn_ref["nn_p95_m"],
+                    "nn_ref_max_m": nn_ref["nn_max_m"],
+                    "nn_ref_end_m": nn_ref["nn_end_m"],
+                }
+
+                # coverage
+                for tau in cov_taus:
+                    row[f"cov_run_le_{int(tau) if tau.is_integer() else tau}m"] = coverage(d_run_to_ref, tau)
+                    row[f"cov_ref_le_{int(tau) if tau.is_integer() else tau}m"] = coverage(d_ref_to_run, tau)
+
+                rows.append(row)
+
+            per_actor = pd.DataFrame(rows).sort_values("id") if rows else pd.DataFrame()
+            if per_actor.empty:
+                rmse_mean = float("nan")
+                rmse_med = float("nan")
+            else:
+                v = per_actor["rmse_2d"].to_numpy(dtype=float)
+                v = v[np.isfinite(v)]
+                rmse_mean = float(np.mean(v)) if v.size else float("nan")
+                rmse_med = float(np.median(v)) if v.size else float("nan")
+
+        per_actor_path = run_out / f"per_actor_metrics_{tag}.csv"
         per_actor.to_csv(per_actor_path, index=False)
 
-        common_ids_xy = sorted(set(ref_ids_sorted) & set(run_xy_plot.keys()))
+        summary_rows.append(
+            {
+                "tag": tag,
+                "N": n,
+                "Ts": Ts_run,
+                "match_key": args.match_key,
+                "run_time_col": run_time_col or "",
+                "rmse_2d_mean": rmse_mean,
+                "rmse_2d_median": rmse_med,
+                "timing_mean_ms": stats["mean_ms"],
+                "timing_p50_ms": stats["p50_ms"],
+                "timing_p90_ms": stats["p90_ms"],
+                "timing_p95_ms": stats["p95_ms"],
+                "timing_max_ms": stats["max_ms"],
+                "timing_n": stats["n"],
+                "per_actor_csv": str(per_actor_path.relative_to(analysis_dir)),
+                "traj_pdf": str(traj_pdf.relative_to(analysis_dir)),
+                "timing_pdf": str(timing_pdf.relative_to(analysis_dir)),
+            }
+        )
 
-        row = {
-            "tag": tag,
-            "N": n,
-            "Ts": float(ts_str),
-            "run_time_col": run_time_col or "",
-            "ref_time_scale_sec_per_unit": float(args.ref_time_scale) if args.ref_time_scale is not None else Ts_run,
-            "common_ids_xy_count": int(len(common_ids_xy)),
-            "timing_mean_ms": stats["mean_ms"],
-            "timing_p50_ms": stats["p50_ms"],
-            "timing_p90_ms": stats["p90_ms"],
-            "timing_p95_ms": stats["p95_ms"],
-            "timing_max_ms": stats["max_ms"],
-            "timing_n": stats["n"],
-            "per_actor_csv": str(per_actor_path.relative_to(analysis_dir)),
-            "traj_pdf": str(traj_pdf.relative_to(analysis_dir)),
-            "timing_pdf": str(timing_pdf.relative_to(analysis_dir)),
-        }
+        print(f"[OK] {tag}: wrote outputs into {run_out}")
 
-        # attach overall metrics (if any)
-        for k, v in overall.items():
-            row[k] = v
-
-        summary_rows.append(row)
-        print(f"[OK] {tag}: wrote trajectories/timing/metrics into {run_out}")
-
-    summary_df = pd.DataFrame(summary_rows)
-    if not summary_df.empty:
-        summary_df = summary_df.sort_values(["N", "Ts"])
+    summary_df = pd.DataFrame(summary_rows).sort_values(["N", "Ts"]) if summary_rows else pd.DataFrame()
     summary_path = analysis_dir / "summary_runs.csv"
     summary_df.to_csv(summary_path, index=False)
 
