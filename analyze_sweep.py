@@ -695,6 +695,8 @@ def main() -> int:
     analysis_name = args.analysis_name or f"analysis_{ts_now}"
     analysis_dir = outdir / analysis_name
     analysis_dir.mkdir(parents=True, exist_ok=True)
+    ref_plots_dir = analysis_dir / "ref_plots"
+    ref_plots_dir.mkdir(parents=True, exist_ok=True)
 
     cov_taus = [float(x) for x in str(args.cov_thresholds).split(",") if x.strip()]
 
@@ -741,7 +743,7 @@ def main() -> int:
         common_ids_xy = sorted(run_ids & ref_ids)
         ref_subset_xy = {mid: ref_xy_all[mid] for mid in common_ids_xy}
 
-        ref_subset_pdf = run_out / f"ref_subset_trajectories_{tag}.pdf"
+        ref_subset_pdf = ref_plots_dir / f"ref_subset_trajectories_{tag}.pdf"
         plot_trajectories_pdf(
             ref_subset_xy,
             ref_subset_pdf,
