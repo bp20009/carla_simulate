@@ -20,3 +20,8 @@ python exp_future/measure_time_acceleration.py \
 
 Use `--render-only` or `--no-render-only` to restrict rendering modes, and
 `--fixed-delta` to override the synchronous timestep if desired.
+
+### Batch runner (Windows)
+
+Run `exp_future/run_time_accel_benchmark.bat` after starting CARLA to execute
+one sweep and save the CSV to `results/time_accel_benchmark.csv`.
