@@ -1,12 +1,12 @@
 """Measure CARLA time acceleration across actor counts and rendering modes.
 
-Connects to a running CARLA server, optionally disables rendering, spawns
-vehicles, enables autopilot, and measures how much simulation time advances
+Connects to a running CARLA server, optionally disables rendering (no_rendering_mode),
+spawns vehicles, enables autopilot, and measures how much simulation time advances
 within a wall-clock budget. Results are printed and optionally saved to CSV.
 
 Example:
-    python exp_future/measure_time_acceleration.py --duration 15 --fixed-delta 0.05 \
-        --actor-counts 0:50:10 --output .\\results\\time_accel_benchmark.csv --debug-steps
+    python measure_time_acceleration.py --duration 15 --fixed-delta 0.05 \
+        --actor-counts 0:100:10 --debug-steps --output .\\results\\time_accel_benchmark.csv
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ class BenchmarkResult:
     sim_seconds: float
     real_seconds: float
     fixed_delta_actual: float | None
+    no_rendering_applied: bool
 
     @property
     def speedup(self) -> float:
@@ -77,7 +78,8 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "--fixed-delta",
         type=float,
-        help="Fixed delta seconds for synchronous mode (recommended).",
+        required=True,
+        help="Fixed delta seconds for synchronous mode (required).",
     )
     parser.add_argument(
         "--actor-counts",
@@ -111,7 +113,7 @@ def _log_step(enabled: bool, msg: str) -> None:
 
 
 def apply_sync_settings(
-    world: carla.World, no_rendering: bool, fixed_delta: float | None
+    world: carla.World, no_rendering: bool, fixed_delta: float
 ) -> Tuple[carla.WorldSettings, carla.WorldSettings]:
     """Return (original_settings, new_sync_settings).
 
@@ -122,18 +124,16 @@ def apply_sync_settings(
 
     new_settings.synchronous_mode = True
     new_settings.no_rendering_mode = no_rendering
+    new_settings.fixed_delta_seconds = fixed_delta
 
-    if fixed_delta is not None:
-        new_settings.fixed_delta_seconds = fixed_delta
-
-        # If substepping is enabled, ensure constraints hold:
-        # max_substep_delta_time * max_substeps >= fixed_delta
-        if getattr(new_settings, "substepping", False):
-            msdt = getattr(new_settings, "max_substep_delta_time", 0.01) or 0.01
-            mss = getattr(new_settings, "max_substeps", 10) or 10
-            if msdt * mss < fixed_delta:
-                needed = int((fixed_delta / msdt) + 0.999999)
-                new_settings.max_substeps = max(mss, needed)
+    # If substepping is enabled, ensure constraints hold:
+    # max_substep_delta_time * max_substeps >= fixed_delta
+    if getattr(new_settings, "substepping", False):
+        msdt = getattr(new_settings, "max_substep_delta_time", 0.01) or 0.01
+        mss = getattr(new_settings, "max_substeps", 10) or 10
+        if msdt * mss < fixed_delta:
+            needed = int((fixed_delta / msdt) + 0.999999)
+            new_settings.max_substeps = max(mss, needed)
 
     return original, new_settings
 
@@ -189,18 +189,24 @@ def disable_autopilot(actors: List[carla.Actor]) -> None:
             pass
 
 
-def destroy_actors_batch_sync(
-    client: carla.Client, actors: List[carla.Actor]
-) -> None:
+def destroy_actors_batch_sync(client: carla.Client, actors: List[carla.Actor]) -> None:
     if not actors:
         return
     commands = [carla.command.DestroyActor(a.id) for a in actors]
-    # True: do a synchronous batch so the server confirms completion.
     responses = client.apply_batch_sync(commands, True)
-    # If any response has error, raise a readable message.
     errors = [r.error for r in responses if r.error]
     if errors:
         raise RuntimeError("DestroyActor batch errors: " + " | ".join(errors))
+
+
+def _check_applied_settings(world: carla.World) -> bool:
+    s = world.get_settings()
+    print(
+        f"[CHECK] applied no_rendering_mode={getattr(s, 'no_rendering_mode', None)} "
+        f"sync={getattr(s, 'synchronous_mode', None)} fixed_delta={getattr(s, 'fixed_delta_seconds', None)}",
+        flush=True,
+    )
+    return bool(getattr(s, "no_rendering_mode", False))
 
 
 def run_benchmark(
@@ -209,7 +215,7 @@ def run_benchmark(
     traffic_manager: carla.TrafficManager,
     duration: float,
     no_rendering: bool,
-    fixed_delta: float | None,
+    fixed_delta: float,
     actor_count: int,
     warmup_ticks: int,
     rng: random.Random,
@@ -221,10 +227,14 @@ def run_benchmark(
 
     actors: List[carla.Actor] = []
     tm_sync_enabled = False
+    no_rendering_applied = False
 
     try:
         _log_step(debug_steps, "apply_settings(sync)")
         world.apply_settings(synced_settings)
+
+        # === CHECK: confirm applied settings ===
+        no_rendering_applied = _check_applied_settings(world)
 
         _log_step(debug_steps, "tick_after_settings")
         world.tick()
@@ -275,14 +285,7 @@ def run_benchmark(
         fixed_delta_actual = world.get_settings().fixed_delta_seconds
 
     finally:
-        # Cleanup order matters for stability:
-        # (1) stop autopilot
-        # (2) tick once to let server process mode changes
-        # (3) destroy actors via batch_sync
-        # (4) tick once more to flush
-        # (5) TM sync off (if enabled)
-        # (6) restore world settings, tick once
-
+        # Cleanup order matters for stability.
         _log_step(debug_steps, "cleanup_disable_autopilot")
         disable_autopilot(actors)
 
@@ -296,7 +299,6 @@ def run_benchmark(
         try:
             destroy_actors_batch_sync(client, actors)
         except RuntimeError:
-            # If destroy fails, continue cleanup to avoid leaving sim in bad state.
             pass
 
         _log_step(debug_steps, "cleanup_tick_after_destroy")
@@ -332,17 +334,23 @@ def run_benchmark(
         sim_seconds=sim_elapsed,
         real_seconds=real_elapsed,
         fixed_delta_actual=fixed_delta_actual,
+        no_rendering_applied=no_rendering_applied,
     )
 
 
 def print_results(results: Sequence[BenchmarkResult]) -> None:
-    print("Mode         | Actors(req/spawn) |   Sim [s] |  Real [s] | Ticks | Speedup | fixed_delta")
-    print("------------ | ----------------- | --------- | --------- | ----- | ------- | ----------")
+    print(
+        "Mode         | Actors(req/spawn) |   Sim [s] |  Real [s] | Ticks | Speedup | fixed_delta | applied_no_render"
+    )
+    print(
+        "------------ | ----------------- | --------- | --------- | ----- | ------- | ---------- | ---------------"
+    )
     for r in results:
         fd = "" if r.fixed_delta_actual is None else f"{r.fixed_delta_actual:.6f}"
         print(
             f"{r.rendering:>12} | {r.requested_actors:3d}/{r.spawned_actors:3d}         "
-            f"| {r.sim_seconds:9.2f} | {r.real_seconds:9.2f} | {r.ticks:5d} | {r.speedup:7.2f}x | {fd}"
+            f"| {r.sim_seconds:9.2f} | {r.real_seconds:9.2f} | {r.ticks:5d} | "
+            f"{r.speedup:7.2f}x | {fd:>10} | {str(r.no_rendering_applied):>15}"
         )
 
 
@@ -360,6 +368,7 @@ def write_csv(results: Sequence[BenchmarkResult], output_path: Path) -> None:
                 "real_seconds",
                 "speedup",
                 "fixed_delta_actual",
+                "no_rendering_applied",
             ]
         )
         for r in results:
@@ -373,6 +382,7 @@ def write_csv(results: Sequence[BenchmarkResult], output_path: Path) -> None:
                     f"{r.real_seconds:.6f}",
                     f"{r.speedup:.6f}",
                     "" if r.fixed_delta_actual is None else f"{r.fixed_delta_actual:.6f}",
+                    str(r.no_rendering_applied),
                 ]
             )
 
