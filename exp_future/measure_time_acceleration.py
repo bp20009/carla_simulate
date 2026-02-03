@@ -131,29 +131,19 @@ def apply_sync_settings(
 ) -> Tuple[carla.WorldSettings, carla.WorldSettings]:
     original = world.get_settings()
 
-    def _copy_if_exists(target: carla.WorldSettings, source: carla.WorldSettings, name: str) -> None:
-        if hasattr(target, name) and hasattr(source, name):
-            setattr(target, name, getattr(source, name))
-
-    new_settings = carla.WorldSettings()
-    for field in (
-        "substepping",
-        "max_substep_delta_time",
-        "max_substeps",
-        "max_culling_distance",
-        "deterministic_ragdolls",
-        "tile_stream_distance",
-        "actor_active_distance",
-        "spectator_as_ego",
-    ):
-        _copy_if_exists(new_settings, original, field)
+    # ベースは「現在設定のコピー」にする．新規 WorldSettings() は使わない．
+    new_settings = world.get_settings()
 
     new_settings.synchronous_mode = True
     new_settings.no_rendering_mode = no_rendering
+
+    # ベンチ用途なら固定を強く推奨．省略時も current を保持するか，デフォルト値を入れる．
     if fixed_delta is not None:
         new_settings.fixed_delta_seconds = fixed_delta
     else:
-        _copy_if_exists(new_settings, original, "fixed_delta_seconds")
+        # warning を避けたいならデフォルトを入れる（例: 0.05）
+        # new_settings.fixed_delta_seconds = 0.05
+        pass
 
     return original, new_settings
 
