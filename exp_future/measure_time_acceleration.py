@@ -1,13 +1,12 @@
 """Measure CARLA time acceleration across actor counts and rendering modes.
 
-This script connects to a running CARLA server, optionally disables rendering,
-spawns a configurable number of vehicles, enables autopilot, and measures how
-much simulation time advances within a wall-clock budget. Results are printed
-and optionally saved to CSV.
+Connects to a running CARLA server, optionally disables rendering, spawns
+vehicles, enables autopilot, and measures how much simulation time advances
+within a wall-clock budget. Results are printed and optionally saved to CSV.
 
 Example:
     python exp_future/measure_time_acceleration.py --duration 15 --fixed-delta 0.05 \
-        --actor-counts 0:50:10 --output .\\results\\time_accel_benchmark.csv
+        --actor-counts 0:50:10 --output .\\results\\time_accel_benchmark.csv --debug-steps
 """
 
 from __future__ import annotations
@@ -116,9 +115,7 @@ def apply_sync_settings(
 ) -> Tuple[carla.WorldSettings, carla.WorldSettings]:
     """Return (original_settings, new_sync_settings).
 
-    IMPORTANT: Do NOT create a fresh carla.WorldSettings() here.
-    Use world.get_settings() as a base to avoid undefined/unsupported fields
-    that can trigger aborts in native code.
+    Use world.get_settings() as a base (avoid fresh WorldSettings()).
     """
     original = world.get_settings()
     new_settings = world.get_settings()
@@ -129,7 +126,8 @@ def apply_sync_settings(
     if fixed_delta is not None:
         new_settings.fixed_delta_seconds = fixed_delta
 
-        # Guard: if substepping is enabled, ensure max_substep_delta_time * max_substeps >= fixed_delta
+        # If substepping is enabled, ensure constraints hold:
+        # max_substep_delta_time * max_substeps >= fixed_delta
         if getattr(new_settings, "substepping", False):
             msdt = getattr(new_settings, "max_substep_delta_time", 0.01) or 0.01
             mss = getattr(new_settings, "max_substeps", 10) or 10
@@ -183,7 +181,30 @@ def enable_autopilot(actors: List[carla.Actor], traffic_manager: carla.TrafficMa
         a.set_autopilot(True, tm_port)
 
 
+def disable_autopilot(actors: List[carla.Actor]) -> None:
+    for a in actors:
+        try:
+            a.set_autopilot(False)
+        except RuntimeError:
+            pass
+
+
+def destroy_actors_batch_sync(
+    client: carla.Client, actors: List[carla.Actor]
+) -> None:
+    if not actors:
+        return
+    commands = [carla.command.DestroyActor(a.id) for a in actors]
+    # True: do a synchronous batch so the server confirms completion.
+    responses = client.apply_batch_sync(commands, True)
+    # If any response has error, raise a readable message.
+    errors = [r.error for r in responses if r.error]
+    if errors:
+        raise RuntimeError("DestroyActor batch errors: " + " | ".join(errors))
+
+
 def run_benchmark(
+    client: carla.Client,
     world: carla.World,
     traffic_manager: carla.TrafficManager,
     duration: float,
@@ -205,17 +226,14 @@ def run_benchmark(
         _log_step(debug_steps, "apply_settings(sync)")
         world.apply_settings(synced_settings)
 
-        # Ensure settings are applied before we start spawning/autopilot.
         _log_step(debug_steps, "tick_after_settings")
         world.tick()
 
-        # Only enable TM sync when we actually use TM (actors > 0).
         if actor_count > 0:
             _log_step(debug_steps, "tm_sync_on")
             traffic_manager.set_synchronous_mode(True)
             tm_sync_enabled = True
 
-            # One more tick after TM sync to stabilize.
             _log_step(debug_steps, "tick_after_tm_sync")
             world.tick()
 
@@ -238,7 +256,6 @@ def run_benchmark(
             _log_step(debug_steps, "warmup_tick")
             world.tick()
 
-        # Timing
         _log_step(debug_steps, "start_timing")
         start_snapshot = world.get_snapshot()
         start_elapsed = start_snapshot.timestamp.elapsed_seconds
@@ -255,16 +272,38 @@ def run_benchmark(
         sim_elapsed = end_elapsed - start_elapsed
         real_elapsed = time.perf_counter() - start_wall
 
-        # Record actual fixed delta in effect (not just the CLI arg).
-        actual_fixed_delta = world.get_settings().fixed_delta_seconds
+        fixed_delta_actual = world.get_settings().fixed_delta_seconds
 
     finally:
-        _log_step(debug_steps, "cleanup_destroy_actors")
-        for actor in actors:
-            try:
-                actor.destroy()
-            except RuntimeError:
-                pass
+        # Cleanup order matters for stability:
+        # (1) stop autopilot
+        # (2) tick once to let server process mode changes
+        # (3) destroy actors via batch_sync
+        # (4) tick once more to flush
+        # (5) TM sync off (if enabled)
+        # (6) restore world settings, tick once
+
+        _log_step(debug_steps, "cleanup_disable_autopilot")
+        disable_autopilot(actors)
+
+        _log_step(debug_steps, "cleanup_tick_before_destroy")
+        try:
+            world.tick()
+        except RuntimeError:
+            pass
+
+        _log_step(debug_steps, "cleanup_destroy_actors_batch_sync")
+        try:
+            destroy_actors_batch_sync(client, actors)
+        except RuntimeError:
+            # If destroy fails, continue cleanup to avoid leaving sim in bad state.
+            pass
+
+        _log_step(debug_steps, "cleanup_tick_after_destroy")
+        try:
+            world.tick()
+        except RuntimeError:
+            pass
 
         if tm_sync_enabled:
             _log_step(debug_steps, "tm_sync_off")
@@ -279,6 +318,12 @@ def run_benchmark(
         except RuntimeError:
             pass
 
+        _log_step(debug_steps, "tick_after_restore")
+        try:
+            world.tick()
+        except RuntimeError:
+            pass
+
     return BenchmarkResult(
         rendering="no_rendering" if no_rendering else "rendering",
         requested_actors=actor_count,
@@ -286,7 +331,7 @@ def run_benchmark(
         ticks=ticks,
         sim_seconds=sim_elapsed,
         real_seconds=real_elapsed,
-        fixed_delta_actual=actual_fixed_delta,
+        fixed_delta_actual=fixed_delta_actual,
     )
 
 
@@ -353,6 +398,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"[RUN] no_rendering={no_rendering} actors={actor_count}", flush=True)
             results.append(
                 run_benchmark(
+                    client,
                     world,
                     traffic_manager,
                     duration=args.duration,
