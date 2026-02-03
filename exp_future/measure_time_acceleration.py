@@ -307,9 +307,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         render_modes.append(True)
 
     results: List[BenchmarkResult] = []
-    print(f"[RUN] no_rendering={no_rendering} actors={actor_count}", flush=True)
     for no_rendering in render_modes:
         for actor_count in args.actor_counts:
+            print(f"[RUN] no_rendering={no_rendering} actors={actor_count}", flush=True)
             results.append(
                 run_benchmark(
                     world,
