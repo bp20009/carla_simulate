@@ -131,21 +131,19 @@ def apply_sync_settings(
 ) -> Tuple[carla.WorldSettings, carla.WorldSettings]:
     original = world.get_settings()
 
-    # ベースは「現在設定のコピー」にする．新規 WorldSettings() は使わない．
+    # 0.10.0 では WorldSettings() を空で作ると危険．
+    # 現在設定をベースに必要項目だけ上書きする．
     new_settings = world.get_settings()
 
     new_settings.synchronous_mode = True
     new_settings.no_rendering_mode = no_rendering
 
-    # ベンチ用途なら固定を強く推奨．省略時も current を保持するか，デフォルト値を入れる．
     if fixed_delta is not None:
         new_settings.fixed_delta_seconds = fixed_delta
-    else:
-        # warning を避けたいならデフォルトを入れる（例: 0.05）
-        # new_settings.fixed_delta_seconds = 0.05
-        pass
+    # else: 省略時は現状維持
 
     return original, new_settings
+
 
 
 def spawn_autopilot_vehicles(
