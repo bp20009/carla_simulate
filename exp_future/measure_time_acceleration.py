@@ -1,12 +1,13 @@
 """Measure CARLA time acceleration across actor counts and rendering modes.
 
 This script connects to a running CARLA server, optionally disables rendering,
-spawns a configurable number of autopilot vehicles, and measures how much
-simulation time advances within a wall-clock budget. Results are printed and
-optionally saved to CSV.
+spawns a configurable number of vehicles, enables autopilot, and measures how
+much simulation time advances within a wall-clock budget. Results are printed
+and optionally saved to CSV.
 
 Example:
-    python exp_future/measure_time_acceleration.py --duration 15 --output accel.csv
+    python exp_future/measure_time_acceleration.py --duration 15 --fixed-delta 0.05 \
+        --actor-counts 0:50:10 --output .\\results\\time_accel_benchmark.csv
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ class BenchmarkResult:
     ticks: int
     sim_seconds: float
     real_seconds: float
-    fixed_delta: float | None
+    fixed_delta_actual: float | None
 
     @property
     def speedup(self) -> float:
@@ -52,7 +53,7 @@ def parse_actor_counts(value: str) -> List[int]:
             raise argparse.ArgumentTypeError("End must be >= start.")
         return list(range(start, end + 1, step))
 
-    counts = []
+    counts: List[int] = []
     for item in value.split(","):
         item = item.strip()
         if not item:
@@ -67,9 +68,7 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="localhost", help="CARLA server host")
     parser.add_argument("--port", default=2000, type=int, help="CARLA server port")
-    parser.add_argument(
-        "--timeout", default=10.0, type=float, help="Client connection timeout"
-    )
+    parser.add_argument("--timeout", default=10.0, type=float, help="Client timeout")
     parser.add_argument(
         "--duration",
         default=10.0,
@@ -79,10 +78,7 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "--fixed-delta",
         type=float,
-        help=(
-            "Optional fixed delta seconds for synchronous mode. If omitted, "
-            "the current world value is preserved."
-        ),
+        help="Fixed delta seconds for synchronous mode (recommended).",
     )
     parser.add_argument(
         "--actor-counts",
@@ -90,49 +86,41 @@ def parse_arguments(argv: Iterable[str]) -> argparse.Namespace:
         default=parse_actor_counts("0,10,20,30,40,50"),
         help="Comma-separated list (e.g. 0,10,20) or range start:end:step",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        help="Random seed for deterministic spawn selection",
-    )
-    parser.add_argument(
-        "--tm-port",
-        type=int,
-        default=8000,
-        help="Traffic Manager port",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Optional CSV output path",
-    )
+    parser.add_argument("--seed", type=int, help="Random seed")
+    parser.add_argument("--tm-port", type=int, default=8000, help="Traffic Manager port")
+    parser.add_argument("--output", type=Path, help="Optional CSV output path")
     parser.add_argument(
         "--warmup-ticks",
         type=int,
         default=1,
-        help="Ticks to advance after spawning before timing",
+        help="Ticks to advance after autopilot enable before timing",
+    )
+    parser.add_argument(
+        "--debug-steps",
+        action="store_true",
+        help="Print [STEP] logs for crash localization",
     )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--render-only",
-        action="store_true",
-        help="Run only the rendering-enabled benchmark",
-    )
-    group.add_argument(
-        "--no-render-only",
-        action="store_true",
-        help="Run only the no-rendering benchmark",
-    )
+    group.add_argument("--render-only", action="store_true", help="Rendering only")
+    group.add_argument("--no-render-only", action="store_true", help="No-render only")
     return parser.parse_args(list(argv))
+
+
+def _log_step(enabled: bool, msg: str) -> None:
+    if enabled:
+        print(f"[STEP] {msg}", flush=True)
 
 
 def apply_sync_settings(
     world: carla.World, no_rendering: bool, fixed_delta: float | None
 ) -> Tuple[carla.WorldSettings, carla.WorldSettings]:
-    original = world.get_settings()
+    """Return (original_settings, new_sync_settings).
 
-    # 0.10.0 では WorldSettings() を空で作ると危険．
-    # 現在設定をベースに必要項目だけ上書きする．
+    IMPORTANT: Do NOT create a fresh carla.WorldSettings() here.
+    Use world.get_settings() as a base to avoid undefined/unsupported fields
+    that can trigger aborts in native code.
+    """
+    original = world.get_settings()
     new_settings = world.get_settings()
 
     new_settings.synchronous_mode = True
@@ -140,16 +128,21 @@ def apply_sync_settings(
 
     if fixed_delta is not None:
         new_settings.fixed_delta_seconds = fixed_delta
-    # else: 省略時は現状維持
+
+        # Guard: if substepping is enabled, ensure max_substep_delta_time * max_substeps >= fixed_delta
+        if getattr(new_settings, "substepping", False):
+            msdt = getattr(new_settings, "max_substep_delta_time", 0.01) or 0.01
+            mss = getattr(new_settings, "max_substeps", 10) or 10
+            if msdt * mss < fixed_delta:
+                needed = int((fixed_delta / msdt) + 0.999999)
+                new_settings.max_substeps = max(mss, needed)
 
     return original, new_settings
 
 
-
-def spawn_autopilot_vehicles(
+def spawn_vehicles(
     world: carla.World,
     blueprint_library: carla.BlueprintLibrary,
-    traffic_manager: carla.TrafficManager,
     count: int,
     rng: random.Random,
 ) -> List[carla.Actor]:
@@ -160,27 +153,34 @@ def spawn_autopilot_vehicles(
     if not vehicle_blueprints:
         raise RuntimeError("No vehicle blueprints available in this map.")
 
-    spawn_points = world.get_map().get_spawn_points()
+    spawn_points = list(world.get_map().get_spawn_points())
     if not spawn_points:
         raise RuntimeError("No spawn points available in this map.")
 
-    spawn_points = list(spawn_points)
     rng.shuffle(spawn_points)
 
     actors: List[carla.Actor] = []
     for transform in spawn_points:
         if len(actors) >= count:
             break
+
         blueprint = rng.choice(vehicle_blueprints)
         if blueprint.has_attribute("role_name"):
             blueprint.set_attribute("role_name", "autopilot")
+
         actor = world.try_spawn_actor(blueprint, transform)
         if actor is None:
             continue
-        actor.set_autopilot(True, traffic_manager.get_port())
+
         actors.append(actor)
 
     return actors
+
+
+def enable_autopilot(actors: List[carla.Actor], traffic_manager: carla.TrafficManager) -> None:
+    tm_port = traffic_manager.get_port()
+    for a in actors:
+        a.set_autopilot(True, tm_port)
 
 
 def run_benchmark(
@@ -192,24 +192,54 @@ def run_benchmark(
     actor_count: int,
     warmup_ticks: int,
     rng: random.Random,
+    debug_steps: bool,
 ) -> BenchmarkResult:
     original_settings, synced_settings = apply_sync_settings(
         world, no_rendering=no_rendering, fixed_delta=fixed_delta
     )
-    world.apply_settings(synced_settings)
-    traffic_manager.set_synchronous_mode(True)
 
     actors: List[carla.Actor] = []
-    try:
-        blueprint_library = world.get_blueprint_library()
-        actors = spawn_autopilot_vehicles(
-            world, blueprint_library, traffic_manager, actor_count, rng
-        )
+    tm_sync_enabled = False
 
-        for _ in range(max(warmup_ticks, 0)):
+    try:
+        _log_step(debug_steps, "apply_settings(sync)")
+        world.apply_settings(synced_settings)
+
+        # Ensure settings are applied before we start spawning/autopilot.
+        _log_step(debug_steps, "tick_after_settings")
+        world.tick()
+
+        # Only enable TM sync when we actually use TM (actors > 0).
+        if actor_count > 0:
+            _log_step(debug_steps, "tm_sync_on")
+            traffic_manager.set_synchronous_mode(True)
+            tm_sync_enabled = True
+
+            # One more tick after TM sync to stabilize.
+            _log_step(debug_steps, "tick_after_tm_sync")
             world.tick()
 
+        blueprint_library = world.get_blueprint_library()
+
+        _log_step(debug_steps, f"spawn_vehicles(count={actor_count})")
+        actors = spawn_vehicles(world, blueprint_library, actor_count, rng)
+
+        _log_step(debug_steps, "tick_after_spawn")
         world.tick()
+
+        if actors:
+            _log_step(debug_steps, "enable_autopilot")
+            enable_autopilot(actors, traffic_manager)
+
+            _log_step(debug_steps, "tick_after_autopilot")
+            world.tick()
+
+        for _ in range(max(warmup_ticks, 0)):
+            _log_step(debug_steps, "warmup_tick")
+            world.tick()
+
+        # Timing
+        _log_step(debug_steps, "start_timing")
         start_snapshot = world.get_snapshot()
         start_elapsed = start_snapshot.timestamp.elapsed_seconds
         start_wall = time.perf_counter()
@@ -224,14 +254,30 @@ def run_benchmark(
         end_elapsed = latest_snapshot.timestamp.elapsed_seconds
         sim_elapsed = end_elapsed - start_elapsed
         real_elapsed = time.perf_counter() - start_wall
+
+        # Record actual fixed delta in effect (not just the CLI arg).
+        actual_fixed_delta = world.get_settings().fixed_delta_seconds
+
     finally:
+        _log_step(debug_steps, "cleanup_destroy_actors")
         for actor in actors:
             try:
                 actor.destroy()
             except RuntimeError:
                 pass
-        traffic_manager.set_synchronous_mode(False)
-        world.apply_settings(original_settings)
+
+        if tm_sync_enabled:
+            _log_step(debug_steps, "tm_sync_off")
+            try:
+                traffic_manager.set_synchronous_mode(False)
+            except RuntimeError:
+                pass
+
+        _log_step(debug_steps, "restore_world_settings")
+        try:
+            world.apply_settings(original_settings)
+        except RuntimeError:
+            pass
 
     return BenchmarkResult(
         rendering="no_rendering" if no_rendering else "rendering",
@@ -240,22 +286,18 @@ def run_benchmark(
         ticks=ticks,
         sim_seconds=sim_elapsed,
         real_seconds=real_elapsed,
-        fixed_delta=fixed_delta,
+        fixed_delta_actual=actual_fixed_delta,
     )
 
 
 def print_results(results: Sequence[BenchmarkResult]) -> None:
-    print(
-        "Mode         | Actors(req/spawn) |   Sim [s] |  Real [s] | Ticks | Speedup"
-    )
-    print(
-        "------------ | ----------------- | --------- | --------- | ----- | -------"
-    )
-    for result in results:
+    print("Mode         | Actors(req/spawn) |   Sim [s] |  Real [s] | Ticks | Speedup | fixed_delta")
+    print("------------ | ----------------- | --------- | --------- | ----- | ------- | ----------")
+    for r in results:
+        fd = "" if r.fixed_delta_actual is None else f"{r.fixed_delta_actual:.6f}"
         print(
-            f"{result.rendering:>12} | {result.requested_actors:3d}/{result.spawned_actors:3d} "
-            f"         | {result.sim_seconds:9.2f} | {result.real_seconds:9.2f} "
-            f"| {result.ticks:5d} | {result.speedup:7.2f}x"
+            f"{r.rendering:>12} | {r.requested_actors:3d}/{r.spawned_actors:3d}         "
+            f"| {r.sim_seconds:9.2f} | {r.real_seconds:9.2f} | {r.ticks:5d} | {r.speedup:7.2f}x | {fd}"
         )
 
 
@@ -272,27 +314,26 @@ def write_csv(results: Sequence[BenchmarkResult], output_path: Path) -> None:
                 "sim_seconds",
                 "real_seconds",
                 "speedup",
-                "fixed_delta",
+                "fixed_delta_actual",
             ]
         )
-        for result in results:
+        for r in results:
             writer.writerow(
                 [
-                    result.rendering,
-                    result.requested_actors,
-                    result.spawned_actors,
-                    result.ticks,
-                    f"{result.sim_seconds:.6f}",
-                    f"{result.real_seconds:.6f}",
-                    f"{result.speedup:.6f}",
-                    "" if result.fixed_delta is None else f"{result.fixed_delta:.6f}",
+                    r.rendering,
+                    r.requested_actors,
+                    r.spawned_actors,
+                    r.ticks,
+                    f"{r.sim_seconds:.6f}",
+                    f"{r.real_seconds:.6f}",
+                    f"{r.speedup:.6f}",
+                    "" if r.fixed_delta_actual is None else f"{r.fixed_delta_actual:.6f}",
                 ]
             )
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_arguments(argv or sys.argv[1:])
-
     rng = random.Random(args.seed)
 
     client = carla.Client(args.host, args.port)
@@ -302,9 +343,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     render_modes: List[bool] = []
     if not args.no_render_only:
-        render_modes.append(False)
+        render_modes.append(False)  # rendering enabled
     if not args.render_only:
-        render_modes.append(True)
+        render_modes.append(True)   # no_rendering
 
     results: List[BenchmarkResult] = []
     for no_rendering in render_modes:
@@ -320,6 +361,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     actor_count=actor_count,
                     warmup_ticks=args.warmup_ticks,
                     rng=rng,
+                    debug_steps=args.debug_steps,
                 )
             )
 
