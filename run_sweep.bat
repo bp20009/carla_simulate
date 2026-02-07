@@ -62,7 +62,7 @@ set "WARMUP_CHECK_INTERVAL_SEC=5"
 
 REM Sweep
 set "TS_LIST=0.10 1.00"
-set "N_MIN=10"
+set "N_MIN=100"
 set "N_MAX=100"
 set "N_STEP=10"
 set "COOLDOWN_SEC=3"
