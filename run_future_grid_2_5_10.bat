@@ -28,12 +28,12 @@ set "POST_SEC=30"
 set "PF_PER_SEC=10"
 set "POLL_INTERVAL=0.1"
 set "BUFFER_PF_AFTER=2"
-set "REPS=10"
+set "REPS=1"
 set "BASE_SEED=20009"
 set "STARTUP_DELAY=2"
 
 REM ==== RERUN target leads (only these) ====
-set "LEAD_LIST=2 5 10"
+set "LEAD_LIST=7"
 
 REM ==== methods to run ====
 set "METHODS=autopilot lstm"
