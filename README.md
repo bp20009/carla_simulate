@@ -295,3 +295,6 @@ CARLA Python APIが未導入の場合、`carla` をimportするスクリプト/�
 - CLIオプションの最新情報は `python <script> --help` を参照してください。
 - バッチが明示的に起動/停止しない限り、CARLAは事前起動しておいてください。
 - 再現性のため、`--seed` / `--tm-seed` / `--base-seed` を固定してください。
+
+- 何か不明点などあれば bp20009@shibaura-it.ac.jp まで
+- Contact us : bp20009@shibaura-it.ac.jp
