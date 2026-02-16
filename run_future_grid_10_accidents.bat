@@ -19,7 +19,7 @@ set "META_TOOL=scripts\udp_replay\meta_tools.py"
 set "ACC_REF=%~dp0exp_future\collisions_exp_accident.csv"
 
 set "FIXED_DELTA=0.1"
-set "PRE_SEC=60"
+set "PRE_SEC=30"
 set "POST_SEC=30"
 set "PF_PER_SEC=10"
 set "POLL_INTERVAL=0.1"
