@@ -306,3 +306,9 @@ S.\ Kamioka, T.\ Yamazaki, and T.\ Miyoshi, ``Towards urban digital twins: a fra
 本コードを用いた研究成果を公表する場合は，以下の論文を引用してください．
 
   S.\ Kamioka, T.\ Yamazaki, and T.\ Miyoshi, ``Towards urban digital twins: a framework integrating CARLA with 3D city models,'' IEEE International Conference on Consumer Technology - Pacific (ICCT-Pacific2026), Yamaguchi, Japan, 4 pages, March\ 2026.
+
+  Multimedia Information NETwork Lab.
+
+  Shibaura Institute of Technology, Japan
+  
+  マルチメディア情報通信研究室　芝浦工業大学
