@@ -290,6 +290,8 @@ CARLA Python APIが未導入の場合、`carla` をimportするスクリプト/�
 - Use `python <script> --help` for authoritative CLI options.
 - Keep CARLA running unless a batch script starts/stops it explicitly.
 - Set seeds (`--seed`, `--tm-seed`, `--base-seed`) for reproducibility.
+- Contact us : bp20009@shibaura-it.ac.jp
+
 
 **JA**
 - CLIオプションの最新情報は `python <script> --help` を参照してください。
@@ -297,4 +299,3 @@ CARLA Python APIが未導入の場合、`carla` をimportするスクリプト/�
 - 再現性のため、`--seed` / `--tm-seed` / `--base-seed` を固定してください。
 
 - 何か不明点などあれば bp20009@shibaura-it.ac.jp まで
-- Contact us : bp20009@shibaura-it.ac.jp
