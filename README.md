@@ -291,7 +291,8 @@ CARLA Python APIが未導入の場合、`carla` をimportするスクリプト/�
 - Keep CARLA running unless a batch script starts/stops it explicitly.
 - Set seeds (`--seed`, `--tm-seed`, `--base-seed`) for reproducibility.
 - Contact us : bp20009@shibaura-it.ac.jp
-
+If you use this code in your research, please cite:
+S.\ Kamioka, T.\ Yamazaki, and T.\ Miyoshi, ``Towards urban digital twins: a framework integrating CARLA with 3D city models,'' IEEE International Conference on Consumer Technology - Pacific (ICCT-Pacific2026), Yamaguchi, Japan, 4 pages, March\ 2026.
 
 **JA**
 - CLIオプションの最新情報は `python <script> --help` を参照してください。
@@ -299,3 +300,5 @@ CARLA Python APIが未導入の場合、`carla` をimportするスクリプト/�
 - 再現性のため、`--seed` / `--tm-seed` / `--base-seed` を固定してください。
 
 - 何か不明点などあれば bp20009@shibaura-it.ac.jp まで
+本コードを用いた研究成果を公表する場合は，以下の論文を引用してください．
+  S.\ Kamioka, T.\ Yamazaki, and T.\ Miyoshi, ``Towards urban digital twins: a framework integrating CARLA with 3D city models,'' IEEE International Conference on Consumer Technology - Pacific (ICCT-Pacific2026), Yamaguchi, Japan, 4 pages, March\ 2026.
