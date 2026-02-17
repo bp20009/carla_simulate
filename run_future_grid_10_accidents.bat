@@ -84,7 +84,7 @@ for %%A in (%ACCIDENT_PF_LIST%) do (
 
   echo =========================================================
   echo [ACCIDENT !ACC_IDX!/10] PF=!ACCIDENT_PF! TAG=!ACC_TAG!
-  echo [SENDER RANGE] !START_FRAME!..!END_FRAME!  (pre=%PRE_SEC%s post=%POST_SEC%s)
+  echo [SENDER RANGE] !START_FRAME!..!END_FRAME!  ^(pre=%PRE_SEC%s post=%POST_SEC%s^)
 
   for /f %%w in ('
     powershell -NoProfile -Command ^
