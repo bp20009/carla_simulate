@@ -70,7 +70,9 @@ echo LEADS=%LEAD_MIN%..%LEAD_MAX% REPS=%REPS% METHODS=autopilot,lstm
 set /a "ACC_IDX=0"
 for %%A in (%ACCIDENT_PF_LIST%) do (
   set /a "ACC_IDX+=1"
-  set "ACCIDENT_PF=%%A"
+  set "ACCIDENT_PF=%%~A"
+  REM Allow both space-separated and comma-separated list entries.
+  set "ACCIDENT_PF=!ACCIDENT_PF:,=!"
   set "ACC_TAG=accident_!ACC_IDX!_pf_!ACCIDENT_PF!"
   set "ACC_OUTDIR=%OUTDIR%\!ACC_TAG!"
 
