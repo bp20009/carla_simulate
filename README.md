@@ -227,12 +227,27 @@ python scripts/extract_future_accidents.py results_grid_accident \
 - `exp_future/batch_run_and_analyze_decel.py`
 - `exp_future/measure_time_acceleration.py`
 - `exp_future/train_traj_lstm.py`
+- `evaluation_accident/run_multi_accident_analysis.py` (one-shot analysis for `results_grid_accident_multi`)
 
 Windows batch wrappers / Windowsバッチ:
 - `run_future_grid.bat`
+- `run_future_grid_10_accidents.bat`
 - `run_decel_batch.bat`
 - `run_extract_future_accidents.bat`
 - `run_sweep.bat`
+
+**EN**
+- `run_future_grid_10_accidents.bat` runs multi-accident sweeps using `ACCIDENT_PF_LIST` (10 frames).
+- Current defaults run a symmetric sender window (`PRE_SEC=30`, `POST_SEC=30`) around each target frame.
+- CARLA restart timing is per-method block (every 10 reps), not after both methods combined.
+- `ACCIDENT_PF_LIST` tokens are normalized at runtime, so both space-separated and comma-mixed entries are accepted.
+
+**JA**
+- `run_future_grid_10_accidents.bat` は `ACCIDENT_PF_LIST`（10フレーム）を対象に複数事故のスイープを実行します。
+- 現在のデフォルトは、各対象フレームに対して対称ウィンドウ（`PRE_SEC=30`, `POST_SEC=30`）です。
+- CARLAの再起動タイミングは method 単位（10反復ごと）で、2method合算の20反復後ではありません。
+- `ACCIDENT_PF_LIST` は実行時に正規化されるため、スペース区切りだけでなくカンマ混在の記述も扱えます。
+- 複数事故結果の一括解析には `evaluation_accident/run_multi_accident_analysis.py` を使用できます。
 
 **EN Note**  
 `run_future_grid_2_5_10.bat` currently contains memo/instruction text mixed with script content, so treat it as reference text unless rewritten as a clean `.bat` file.
