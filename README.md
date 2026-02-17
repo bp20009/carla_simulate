@@ -37,22 +37,30 @@ Detailed execution and experiment procedures are available at:
 ## Requirements / 必要条件
 
 **EN**
-- Reachable CARLA server (tested around CARLA 0.10 / 0.9.x Python API compatibility).
+- Reachable CARLA server.
 - Python 3.9+ recommended.
 - Python dependencies:
-  - `carla>=0.9.13`
+  - `carla` (Python API version must match the running CARLA server version exactly)
   - `matplotlib` (plot/animation)
   - `pillow` (optional, GIF output)
   - `ffmpeg` on `PATH` (optional, MP4 output)
 
 **JA**
-- このマシンから接続可能なCARLAサーバ（CARLA 0.10 / 0.9系Python API互換を想定）
+- このマシンから接続可能なCARLAサーバ
 - Python 3.9以上推奨
 - Python依存関係:
-  - `carla>=0.9.13`
+  - `carla`（Python APIは実行中のCARLAサーバと同一バージョンである必要があります）
   - `matplotlib`（プロット/アニメーション）
   - `pillow`（任意、GIF出力）
   - `ffmpeg` を `PATH` 上に配置（任意、MP4出力）
+
+**EN**  
+Version rule: install the exact CARLA Python API that matches your server version.
+Example: CARLA server `0.9.13` requires `carla==0.9.13` (not `0.9.16`).
+
+**JA**  
+バージョン規則: CARLA Python APIはサーバ版と完全一致でインストールしてください。
+例: サーバが `0.9.13` の場合、`carla==0.9.13` が必要です（`0.9.16` は不可）。
 
 Install / インストール:
 
@@ -60,6 +68,8 @@ Install / インストール:
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+# install CARLA API with exact server version, e.g.:
+# pip install "carla==0.9.13"
 ```
 
 ## Quick Start / クイックスタート
@@ -295,6 +305,8 @@ pytest -q
 
 **EN**  
 If the CARLA Python API is missing, scripts/tests importing `carla` may fail.
+If the CARLA Python API version does not exactly match the CARLA server version,
+connection/runtime behavior can fail.
 For non-CARLA validation, integration tests with a mock UDP server and pseudo client are available:
 
 ```bash
@@ -303,6 +315,8 @@ pytest -q -k "udp_integration_mock or send_udp"
 
 **JA**  
 CARLA Python APIが未導入の場合、`carla` をimportするスクリプト/テストは失敗する可能性があります。
+また、CARLA Python APIとCARLAサーバのバージョンが一致しない場合、
+接続や実行時動作が失敗する可能性があります。
 CARLA不要で確認したい場合は、モックUDPサーバ＋擬似クライアントの統合テストを実行できます:
 
 ```bash
