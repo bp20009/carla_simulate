@@ -1,66 +1,57 @@
-# evaluation_accident
+# evaluation_accident / 事故評価ツール
 
-予測実験（autopilot / lstm）の評価・可視化用スクリプト群です。  
-`results_grid_accident` 系の実験ログを集計し、CSVとPDFを作成します。
+## Overview / 概要
 
-## 前提
+**EN**  
+This directory contains post-processing scripts for accident experiments (event extraction, risk estimation, and plotting).
 
-- 実験結果ディレクトリ（例: `results_grid_accident` または `results_grid_accident_multi`）
-- 各runに以下があること
-  - `logs/actor.csv`
-  - `logs/collisions.csv`
-  - （必要に応じて）`logs/meta.json`
-- baseline事故CSV（例: `exp_future/collisions_exp_accident.csv`）
+**JA**  
+このディレクトリには、事故実験の後処理スクリプト（イベント抽出、リスク推定、可視化）が含まれます。
 
-想定構造:
+## Inputs / 入力データ
 
-```text
-<base_dir>/
-  autopilot/
-    lead_1/rep_1/logs/{actor.csv,collisions.csv,meta.json}
-  lstm/
-    lead_1/rep_1/logs/{actor.csv,collisions.csv,meta.json}
-```
+**EN**
+- Experiment logs under `results_grid_accident` or `results_grid_accident_multi`
+- Per run: `logs/actor.csv`, `logs/collisions.csv`, optionally `logs/meta.json`
+- Baseline CSV: `exp_future/collisions_exp_accident.csv`
 
-または multi-accident の場合:
+**JA**
+- `results_grid_accident` または `results_grid_accident_multi` 配下の実験ログ
+- 各runに `logs/actor.csv`, `logs/collisions.csv`（必要に応じて `logs/meta.json`）
+- baseline CSV: `exp_future/collisions_exp_accident.csv`
 
-```text
-<base_dir>/
-  accident_1_pf_25411/
-    autopilot/lead_1/rep_1/logs/{actor.csv,collisions.csv,meta.json}
-    lstm/lead_1/rep_1/logs/{actor.csv,collisions.csv,meta.json}
-```
+## One-shot for Multi-Accident / 複数事故の一括解析
 
-## 典型ワークフロー
+**EN**  
+Run all accident directories (`accident_*_pf_*`) in one command.
 
-## results_grid_accident_multi を一発解析する
-
-事故ごとのサブディレクトリ（`accident_*_pf_*`）を自動検出して、
-イベント抽出→集計→predicted risk→要約図まで順番に実行します。
+**JA**  
+`accident_*_pf_*` を自動検出し、全事故を一括解析します。
 
 ```bash
-python evaluation_accident/run_multi_accident_analysis.py \
+python3 evaluation_accident/run_multi_accident_analysis.py \
   --multi-root results_grid_accident_multi \
   --baseline-csv exp_future/collisions_exp_accident.csv \
   --dt 0.1 \
   --risk-mode speed
 ```
 
-主な出力:
+Main outputs / 主な出力:
 - `results_grid_accident_multi/analysis_multi/analysis_index.csv`
-- `results_grid_accident_multi/analysis_multi/predicted_risk_summary_all_accidents.csv`
-- `results_grid_accident_multi/analysis_multi/near_miss_and_collisions_per_method_all_accidents.csv`
-- `results_grid_accident_multi/analysis_multi/predicted_risk_summary_global.csv`（全事故をmethod×leadで1つに集約）
-- `results_grid_accident_multi/analysis_multi/near_miss_and_collisions_summary_global.csv`（全事故をmethod×leadで1つに集約）
-- `results_grid_accident_multi/analysis_multi/fig_collision_summary_global.pdf`（全事故統合の衝突強度図）
-- `results_grid_accident_multi/analysis_multi/fig_risk_summary_global.pdf`（全事故統合の事故リスク図）
-- `results_grid_accident_multi/analysis_multi/<accident_tag>/...`（事故ごとの詳細PDF/CSV）
+- `results_grid_accident_multi/analysis_multi/predicted_risk_summary_global.csv`
+- `results_grid_accident_multi/analysis_multi/near_miss_and_collisions_summary_global.csv`
+- `results_grid_accident_multi/analysis_multi/fig_collision_summary_global.pdf`
+- `results_grid_accident_multi/analysis_multi/fig_risk_summary_global.pdf`
+- `results_grid_accident_multi/analysis_multi/<accident_tag>/...`
 
-補足:
-- `--risk-mode pair` を指定すると `predicted_risk_with_pair.py` を使います。
-- 失敗時に停止したい場合は `--fail-fast` を付けてください。
+Options / オプション:
+- `--risk-mode speed|pair`
+- `--methods autopilot lstm` (filter)
+- `--fail-fast`
 
-## 1) ニアミス・衝突イベントを抽出（イベントCSV生成）
+## Step-by-step Workflow / 手動ステップ実行
+
+### 1) Extract event CSVs / イベントCSV抽出
 
 ```bash
 python evaluation_accident/summarize_hotspots_with_nearmiss.py \
@@ -72,19 +63,14 @@ python evaluation_accident/summarize_hotspots_with_nearmiss.py \
   --include-collisions
 ```
 
-出力先（例）:
-- `out_hotspots_events_pairs_YYYYmmdd_HHMMSS/events_nearmiss.csv`
-- `out_hotspots_events_pairs_YYYYmmdd_HHMMSS/events_collision.csv`
-- `out_hotspots_events_pairs_YYYYmmdd_HHMMSS/events_all.csv`
-
-## 2) lead別平均回数を図化
+### 2) Plot mean events by lead / lead別平均回数図
 
 ```bash
 python evaluation_accident/plot_mean_events_by_lead.py \
   --events-dir out_hotspots_events_pairs_YYYYmmdd_HHMMSS
 ```
 
-## 3) run別散布図（必要ならmethod重ね描き）
+### 3) Scatter PDFs / 散布図PDF
 
 ```bash
 python evaluation_accident/plot_events_scatter_pdf.py \
@@ -93,9 +79,9 @@ python evaluation_accident/plot_events_scatter_pdf.py \
   --merged-target all
 ```
 
-## 4) 危険領域侵入率（predicted risk）を算出
+### 4) Predicted risk / 事故リスク推定
 
-軽量版（侵入率 + 速度プロット）:
+Speed variant / 速度版:
 
 ```bash
 python evaluation_accident/predicted_risk_with_speed.py \
@@ -109,7 +95,7 @@ python evaluation_accident/predicted_risk_with_speed.py \
   --out-summary predicted_risk_summary_3.csv
 ```
 
-拡張版（対象車両全員 + ペア車間距離まで）:
+Pair variant / ペア版:
 
 ```bash
 python evaluation_accident/predicted_risk_with_pair.py \
@@ -124,9 +110,7 @@ python evaluation_accident/predicted_risk_with_pair.py \
   --out-summary predicted_risk_summary_4.csv
 ```
 
-## 5) 論文用の要約図（衝突強度・侵入率）を出力
-
-`near_miss_and_collisions_per_method.csv` と `predicted_risk_summary_*.csv` を使います。
+### 5) Final summary figures / 要約図出力
 
 ```bash
 python evaluation_accident/plot_results_figures.py \
@@ -136,25 +120,23 @@ python evaluation_accident/plot_results_figures.py \
   --out-risk-pdf fig_risk_summary.pdf
 ```
 
-## 補助スクリプト
+## Script Map / スクリプト一覧
 
-- `analyze_collision_intensity.py`
-  - 強度分布の解析・閾値スイープ
-- `plot_intensity.py`
-  - 強度ヒストグラム可視化
-- `summarize_counts_mean_over_rep.py`
-  - rep平均（ニアミス/衝突）の集計
-- `plot_collision_opponents_after_switch.py`
-  - 切替後衝突相手の解析
-- `plot_switch_trajectories_from_actor_csvs.py`
-  - 切替前後の軌跡可視化
-- `plot_lane_deviation_fig.py`
-  - 車線逸脱系メトリクス可視化
-- `plot_speedup_from_summaries.py`
-  - time acceleration系summaryの比較図
+- `run_multi_accident_analysis.py`: one-shot pipeline for multi-accident / 複数事故一括実行
+- `summarize_hotspots_with_nearmiss.py`: near-miss/collision event extraction / イベント抽出
+- `summarize_near_miss_and_collisions_from_dirs.py`: per-run/per-method summary / run・手法集計
+- `predicted_risk_with_speed.py`: risk rate + speed plots / リスク率+速度
+- `predicted_risk_with_pair.py`: risk rate + speed/headway pairs / リスク率+速度/車間距離
+- `plot_results_figures.py`: paper-ready summary figures / 要約図
+- `plot_mean_events_by_lead.py`, `plot_events_scatter_pdf.py`: event visualization / 可視化
+- `analyze_collision_intensity.py`, `plot_intensity.py`: intensity analysis / 強度分析
 
-## 注意点
+## Notes / 注意
 
-- `--base-payload-frame` と `--dt` は実験時の設定に合わせてください。
-- multi-accident結果を評価する場合は、事故ごとのサブディレクトリ（例: `accident_1_pf_*`）単位で `--root` / `--base-dir` を切り替えるのが安全です。
-- 出力列名はスクリプトごとに異なるため、次段の入力CSV指定を必ず確認してください。
+**EN**
+- Keep `--dt` and frame assumptions aligned with experiment settings.
+- For multi-accident analysis, use global summary CSV/PDF for final comparison.
+
+**JA**
+- `--dt` とフレーム前提は実験時設定と揃えてください。
+- 複数事故比較の最終評価は global 集約CSV/PDF を参照してください。
