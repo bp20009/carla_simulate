@@ -295,9 +295,19 @@ pytest -q
 
 **EN**  
 If the CARLA Python API is missing, scripts/tests importing `carla` may fail.
+For non-CARLA validation, integration tests with a mock UDP server and pseudo client are available:
+
+```bash
+pytest -q -k "udp_integration_mock or send_udp"
+```
 
 **JA**  
 CARLA Python APIが未導入の場合、`carla` をimportするスクリプト/テストは失敗する可能性があります。
+CARLA不要で確認したい場合は、モックUDPサーバ＋擬似クライアントの統合テストを実行できます:
+
+```bash
+pytest -q -k "udp_integration_mock or send_udp"
+```
 
 ## Tips / 補足
 
