@@ -98,8 +98,11 @@ for /f "usebackq skip=1 tokens=1-12 delims=," %%a in ("%SUMMARY_IN%") do (
   set "SEED=%%g"
   set "SWITCH_PF=%%h"
   set "SRC_STATUS=%%l"
+  set "SRC_STATUS=!SRC_STATUS:"=!"
+  for /f "tokens=* delims= " %%S in ("!SRC_STATUS!") do set "SRC_STATUS=%%S"
 
-  if /I "!SRC_STATUS!"=="timeout" (
+  REM Prefix match handles trailing CR/LF or extra suffixes like timeout_xxx.
+  if /I "!SRC_STATUS:~0,7!"=="timeout" (
     set /a "TIMEOUT_ROWS+=1"
     echo ---------------------------------------------------------
     echo [RERUN !TIMEOUT_ROWS!] accident=!ACCIDENT_PF! tag=!ACC_TAG! method=!METHOD! lead=!LEAD! rep=!REP! seed=!SEED!
