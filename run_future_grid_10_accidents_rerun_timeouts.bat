@@ -87,25 +87,40 @@ set /a "TIMEOUT_ROWS=0"
 set /a "RERUN_OK=0"
 set /a "RERUN_FAIL=0"
 
-for /f "usebackq skip=1 tokens=1-12 delims=," %%a in ("%SUMMARY_IN%") do (
-  set /a "TOTAL_ROWS+=1"
-  set "ACC_IDX=%%a"
-  set "ACCIDENT_PF=%%b"
-  set "ACC_TAG=%%c"
-  set "METHOD=%%d"
-  set "LEAD=%%e"
-  set "REP=%%f"
-  set "SEED=%%g"
-  set "SWITCH_PF=%%h"
-  set "SRC_STATUS=%%l"
-  set "SRC_STATUS=!SRC_STATUS:"=!"
-  for /f "tokens=* delims= " %%S in ("!SRC_STATUS!") do set "SRC_STATUS=%%S"
+for /f %%n in ('
+  powershell -NoProfile -Command ^
+    "$rows = Import-Csv -LiteralPath '%SUMMARY_IN%';" ^
+    "if ($rows) { $rows.Count } else { 0 }"
+') do set "TOTAL_ROWS=%%n"
 
-  REM Prefix match handles trailing CR/LF or extra suffixes like timeout_xxx.
-  if /I "!SRC_STATUS:~0,7!"=="timeout" (
+set "TIMEOUT_LIST=%TEMP%\carla_timeout_rows_%RANDOM%_%RANDOM%.txt"
+del /q "%TIMEOUT_LIST%" >nul 2>&1
+
+powershell -NoProfile -Command ^
+  "$rows = Import-Csv -LiteralPath '%SUMMARY_IN%';" ^
+  "$hits = $rows | Where-Object { ($_.status -as [string]).Trim().ToLower().StartsWith('timeout') };" ^
+  "$hits | ForEach-Object {" ^
+  "  '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $_.accident_idx, $_.accident_payload_frame_ref, $_.accident_tag, $_.method, $_.lead_sec, $_.rep, $_.seed, $_.switch_payload_frame, $_.status" ^
+  "} | Set-Content -LiteralPath '%TIMEOUT_LIST%' -Encoding UTF8"
+
+if not exist "%TIMEOUT_LIST%" (
+  type nul > "%TIMEOUT_LIST%"
+)
+
+for /f "usebackq tokens=1-9 delims=|" %%a in ("%TIMEOUT_LIST%") do (
+  if not "%%a"=="" (
     set /a "TIMEOUT_ROWS+=1"
+    set "ACC_IDX=%%a"
+    set "ACCIDENT_PF=%%b"
+    set "ACC_TAG=%%c"
+    set "METHOD=%%d"
+    set "LEAD=%%e"
+    set "REP=%%f"
+    set "SEED=%%g"
+    set "SWITCH_PF=%%h"
+    set "SRC_STATUS=%%i"
     echo ---------------------------------------------------------
-    echo [RERUN !TIMEOUT_ROWS!] accident=!ACCIDENT_PF! tag=!ACC_TAG! method=!METHOD! lead=!LEAD! rep=!REP! seed=!SEED!
+    echo [RERUN !TIMEOUT_ROWS!] accident=!ACCIDENT_PF! tag=!ACC_TAG! method=!METHOD! lead=!LEAD! rep=!REP! seed=!SEED! status=!SRC_STATUS!
 
     set /a "START_FRAME=ACCIDENT_PF-(PRE_SEC*PF_PER_SEC)"
     set /a "END_FRAME=ACCIDENT_PF+(POST_SEC*PF_PER_SEC)"
@@ -200,6 +215,8 @@ for /f "usebackq skip=1 tokens=1-12 delims=," %%a in ("%SUMMARY_IN%") do (
     )
   )
 )
+
+del /q "%TIMEOUT_LIST%" >nul 2>&1
 
 echo =========================================================
 echo Total rows scanned   : %TOTAL_ROWS%
