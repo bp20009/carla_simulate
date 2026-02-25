@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 
 def classify_intensity(intensity: float) -> str:
@@ -85,7 +86,12 @@ def load_collisions(base_dir: Path) -> pd.DataFrame:
 
     dfs: List[pd.DataFrame] = []
     for method, lead_sec, rep, path in records:
-        df = pd.read_csv(path)
+        try:
+            df = pd.read_csv(path)
+        except EmptyDataError:
+            # 0-byte collisions.csv can appear in timed-out/edge runs.
+            # Treat it as no collision rows for this run.
+            continue
 
         # 想定カラムチェック（最低限 intensity と is_accident があるか）
         if "intensity" not in df.columns or "is_accident" not in df.columns:
@@ -101,6 +107,17 @@ def load_collisions(base_dir: Path) -> pd.DataFrame:
         df["rep"] = rep
 
         dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame(
+            columns=[
+                "intensity",
+                "is_accident",
+                "method",
+                "lead_sec",
+                "rep",
+            ]
+        )
 
     all_collisions = pd.concat(dfs, ignore_index=True)
     return all_collisions

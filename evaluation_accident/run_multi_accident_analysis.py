@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import subprocess
 import sys
@@ -81,8 +82,8 @@ def discover_targets(multi_root: Path) -> List[AccidentTarget]:
     return targets
 
 
-def run_cmd(args: Sequence[str], cwd: Path) -> None:
-    subprocess.run(list(args), cwd=str(cwd), check=True)
+def run_cmd(args: Sequence[str], cwd: Path, *, env: dict[str, str] | None = None) -> None:
+    subprocess.run(list(args), cwd=str(cwd), check=True, env=env)
 
 
 def aggregate_risk_global(per_run: pd.DataFrame) -> pd.DataFrame:
@@ -211,6 +212,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise FileNotFoundError(f"baseline csv not found: {baseline_csv}")
 
     out_root.mkdir(parents=True, exist_ok=True)
+    mpl_dir = out_root / "_mplconfig"
+    cache_dir = out_root / "_cache"
+    mpl_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    child_env = os.environ.copy()
+    child_env.setdefault("MPLBACKEND", "Agg")
+    child_env.setdefault("MPLCONFIGDIR", str(mpl_dir))
+    child_env.setdefault("XDG_CACHE_HOME", str(cache_dir))
 
     targets = discover_targets(multi_root)
     if not targets:
@@ -250,36 +260,44 @@ def main(argv: Iterable[str] | None = None) -> int:
             ]
             if args.methods:
                 cmd1 += ["--methods", *args.methods]
-            run_cmd(cmd1, repo_root)
+            run_cmd(cmd1, repo_root, env=child_env)
 
             # 2) mean events plot
-            run_cmd(
-                [
-                    sys.executable,
-                    str(eval_dir / "plot_mean_events_by_lead.py"),
-                    "--events-dir",
-                    str(events_out),
-                    "--outdir",
-                    str(mean_plot_out),
-                ],
-                repo_root,
-            )
+            try:
+                run_cmd(
+                    [
+                        sys.executable,
+                        str(eval_dir / "plot_mean_events_by_lead.py"),
+                        "--events-dir",
+                        str(events_out),
+                        "--outdir",
+                        str(mean_plot_out),
+                    ],
+                    repo_root,
+                    env=child_env,
+                )
+            except subprocess.CalledProcessError as plot_exc:
+                print(f"[WARN] mean-plot skipped for {t.tag}: {plot_exc}")
 
             # 3) scatter plots
-            run_cmd(
-                [
-                    sys.executable,
-                    str(eval_dir / "plot_events_scatter_pdf.py"),
-                    "--events-dir",
-                    str(events_out),
-                    "--outdir",
-                    str(scatter_out),
-                    "--make-merged-methods",
-                    "--merged-target",
-                    "all",
-                ],
-                repo_root,
-            )
+            try:
+                run_cmd(
+                    [
+                        sys.executable,
+                        str(eval_dir / "plot_events_scatter_pdf.py"),
+                        "--events-dir",
+                        str(events_out),
+                        "--outdir",
+                        str(scatter_out),
+                        "--make-merged-methods",
+                        "--merged-target",
+                        "all",
+                    ],
+                    repo_root,
+                    env=child_env,
+                )
+            except subprocess.CalledProcessError as scatter_exc:
+                print(f"[WARN] scatter-plot skipped for {t.tag}: {scatter_exc}")
 
             # 4) near miss + collisions summary
             per_run_csv = accident_out / "near_miss_and_collisions_per_run.csv"
@@ -298,6 +316,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     str(per_method_csv),
                 ],
                 repo_root,
+                env=child_env,
             )
 
             # 5) predicted risk
@@ -327,24 +346,28 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "--out-summary",
                 str(risk_summary_csv),
             ]
-            run_cmd(cmd5, repo_root)
+            run_cmd(cmd5, repo_root, env=child_env)
 
             # 6) summary figures
-            run_cmd(
-                [
-                    sys.executable,
-                    str(eval_dir / "plot_results_figures.py"),
-                    "--near-miss-collisions",
-                    str(per_method_csv),
-                    "--risk-summary",
-                    str(risk_summary_csv),
-                    "--out-collision-pdf",
-                    str(accident_out / "fig_collision_summary.pdf"),
-                    "--out-risk-pdf",
-                    str(accident_out / "fig_risk_summary.pdf"),
-                ],
-                repo_root,
-            )
+            try:
+                run_cmd(
+                    [
+                        sys.executable,
+                        str(eval_dir / "plot_results_figures.py"),
+                        "--near-miss-collisions",
+                        str(per_method_csv),
+                        "--risk-summary",
+                        str(risk_summary_csv),
+                        "--out-collision-pdf",
+                        str(accident_out / "fig_collision_summary.pdf"),
+                        "--out-risk-pdf",
+                        str(accident_out / "fig_risk_summary.pdf"),
+                    ],
+                    repo_root,
+                    env=child_env,
+                )
+            except subprocess.CalledProcessError as summary_plot_exc:
+                print(f"[WARN] summary-plot skipped for {t.tag}: {summary_plot_exc}")
 
             index_rows.append(
                 {
@@ -436,21 +459,25 @@ def main(argv: Iterable[str] | None = None) -> int:
     global_coll_csv = out_root / "near_miss_and_collisions_per_method_global.csv"
     global_risk_csv = out_root / "predicted_risk_summary_global.csv"
     if global_coll_csv.exists() and global_risk_csv.exists():
-        run_cmd(
-            [
-                sys.executable,
-                str(eval_dir / "plot_results_figures.py"),
-                "--near-miss-collisions",
-                str(global_coll_csv),
-                "--risk-summary",
-                str(global_risk_csv),
-                "--out-collision-pdf",
-                str(out_root / "fig_collision_summary_global.pdf"),
-                "--out-risk-pdf",
-                str(out_root / "fig_risk_summary_global.pdf"),
-            ],
-            repo_root,
-        )
+        try:
+            run_cmd(
+                [
+                    sys.executable,
+                    str(eval_dir / "plot_results_figures.py"),
+                    "--near-miss-collisions",
+                    str(global_coll_csv),
+                    "--risk-summary",
+                    str(global_risk_csv),
+                    "--out-collision-pdf",
+                    str(out_root / "fig_collision_summary_global.pdf"),
+                    "--out-risk-pdf",
+                    str(out_root / "fig_risk_summary_global.pdf"),
+                ],
+                repo_root,
+                env=child_env,
+            )
+        except subprocess.CalledProcessError as global_plot_exc:
+            print(f"[WARN] global summary plots skipped: {global_plot_exc}")
 
     print(f"[DONE] index -> {index_csv}")
     return 0
