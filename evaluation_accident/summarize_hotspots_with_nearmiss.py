@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 # -------------------------------------------------------
 # Discover: results_grid_accident/{method}/lead_*/rep_*/logs/{actor.csv, collisions.csv}
@@ -101,7 +102,21 @@ def load_actor_csv(actor_csv: Path) -> pd.DataFrame:
 #   payload_frame,x,y,actor_id,other_id
 # -------------------------------------------------------
 def load_collisions_csv(collisions_csv: Path) -> pd.DataFrame:
-    df = pd.read_csv(collisions_csv)
+    try:
+        df = pd.read_csv(collisions_csv)
+    except EmptyDataError:
+        # Some runs can produce an empty collisions.csv (0-byte). Treat as no events.
+        return pd.DataFrame(
+            columns=[
+                "payload_frame",
+                "x",
+                "y",
+                "actor_id",
+                "other_id",
+                "intensity",
+                "is_accident",
+            ]
+        )
     required = ["payload_frame", "x", "y", "actor_id", "other_id"]
     missing = [c for c in required if c not in df.columns]
     if missing:
